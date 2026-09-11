@@ -32,6 +32,8 @@ public interface TodoTaskMapper extends BaseMapper<TodoTask> {
                                @Param("keyword") String keyword,
                                @Param("threadId") String threadId);
 
-    @Select("SELECT * FROM todo_task WHERE status = #{status} AND due_date < #{date}")
-    List<TodoTask> findOverdue(@Param("status") String status, @Param("date") LocalDateTime date);
+    @Select("SELECT * FROM todo_task WHERE status = #{status} AND due_date < #{date} AND thread_id = #{threadId}")
+    List<TodoTask> findOverdue(@Param("status") String status,
+                               @Param("date") LocalDateTime date,
+                               @Param("threadId") String threadId);
 }

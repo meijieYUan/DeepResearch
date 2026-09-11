@@ -1,34 +1,47 @@
 package com.itajay.superassistant.prompt;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
-import com.alibaba.cloud.ai.graph.RunnableConfig;
-import com.alibaba.cloud.ai.graph.agent.hook.AgentHook;
-import com.alibaba.cloud.ai.graph.agent.hook.HookPosition;
+import com.alibaba.cloud.ai.graph.agent.interceptor.ModelCallHandler;
+import com.alibaba.cloud.ai.graph.agent.interceptor.ModelInterceptor;
+import com.alibaba.cloud.ai.graph.agent.interceptor.ModelRequest;
+import com.alibaba.cloud.ai.graph.agent.interceptor.ModelResponse;
 import com.itajay.superassistant.plan.PlanModeContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 
 /**
- * Dynamically assembles and injects system prompts before each agent invocation.
- * Handles: memory profile (from MEMORY.md), plan mode guidance (when enabled).
+ * Inject the dynamic system prompts (user memory profile, plan-mode guidance)
+ * into every model request, just before the model is called.
+ *
+ * <p>This is a {@link ModelInterceptor} (registered on the main agent via
+ * {@code Builder.interceptors(...)}), not a graph hook. The prompts are merged
+ * into the request's {@link ModelRequest#getSystemMessage() system message} and
+ * therefore <strong>never</strong> enter the {@code messages} list: they are not
+ * written to the checkpoint, not part of the renderable chat history, and cannot
+ * be duplicated by the {@code messages} key strategy (which appends).</p>
+ *
+ * <p>The prompts are rebuilt on every model call, so a memory update or a
+ * plan-mode toggle takes effect immediately — no staleness between turns.</p>
  */
 @Component
-public class PromptSubmitHook extends AgentHook {
+public class PromptSubmitHook extends ModelInterceptor {
 
     private static final Logger log = LoggerFactory.getLogger(PromptSubmitHook.class);
+
+    /** User memory file, maintained by {@code MemoryTool}. */
     private static final Path MEMORY_FILE = Path.of(".memory", "MEMORY.md");
+
+    /** Request-context key carrying the thread id (set by the chat controller). */
+    private static final String THREAD_ID_KEY = "threadId";
+
+    /** Hard cap on the memory section to keep the system prompt bounded. */
+    private static final int MEMORY_MAX_CHARS = 3_000;
 
     @Override
     public String getName() {
@@ -36,64 +49,64 @@ public class PromptSubmitHook extends AgentHook {
     }
 
     @Override
-    public HookPosition[] getHookPositions() {
-        return new HookPosition[]{HookPosition.BEFORE_AGENT};
+    public ModelResponse interceptModel(ModelRequest request, ModelCallHandler handler) {
+        String threadId = resolveThreadId(request);
+        String dynamicPrompt = buildDynamicPrompt(threadId);
+        if (dynamicPrompt == null || dynamicPrompt.isBlank()) {
+            return handler.call(request);
+        }
+
+        SystemMessage enhanced = enhanceSystemMessage(request.getSystemMessage(), dynamicPrompt);
+        ModelRequest updated = ModelRequest.builder(request).systemMessage(enhanced).build();
+        log.debug("PromptSubmitHook: injected dynamic system prompt for thread={}", threadId);
+        return handler.call(updated);
     }
 
-    @Override
-    public CompletableFuture<Map<String, Object>> beforeAgent(OverAllState state, RunnableConfig config) {
-        String threadId = config.threadId().orElse("unknown");
-        List<SystemMessage> prompts = new ArrayList<>();
+    private static String resolveThreadId(ModelRequest request) {
+        Map<String, Object> context = request.getContext();
+        if (context == null) {
+            return null;
+        }
+        Object value = context.get(THREAD_ID_KEY);
+        return value == null ? null : String.valueOf(value);
+    }
 
-        // 1. Memory profile — inject when MEMORY.md exists and is non-empty
+    private static String buildDynamicPrompt(String threadId) {
+        StringBuilder prompt = new StringBuilder();
         String memoryPrompt = buildMemoryPrompt();
         if (memoryPrompt != null) {
-            prompts.add(new SystemMessage(memoryPrompt));
-            log.debug("PromptSubmitHook: injected memory profile");
+            prompt.append(memoryPrompt);
         }
-
-        // 2. Plan mode guidance — inject when user has enabled plan mode
-        if (PlanModeContext.isEnabled(threadId)) {
-            prompts.add(new SystemMessage(buildPlanModePrompt()));
-            log.debug("PromptSubmitHook: injected plan mode prompt [thread={}]", threadId);
-        }
-
-        if (prompts.isEmpty()) {
-            return CompletableFuture.completedFuture(Map.of());
-        }
-
-        // Prepend prompts before existing messages
-        @SuppressWarnings("unchecked")
-        Optional<Object> msgs = state.value("messages");
-        List<Message> enhanced = new ArrayList<>(prompts);
-        if (msgs.isPresent() && msgs.get() instanceof List<?> list) {
-            for (Object m : list) {
-                if (m instanceof Message msg) enhanced.add(msg);
+        if (threadId != null && PlanModeContext.isEnabled(threadId)) {
+            if (!prompt.isEmpty()) {
+                prompt.append("\n\n");
             }
+            prompt.append(buildPlanModePrompt());
         }
-
-        log.debug("PromptSubmitHook: prepended {} prompt(s), total {} messages", prompts.size(), enhanced.size());
-        return CompletableFuture.completedFuture(Map.of("messages", enhanced));
+        return prompt.isEmpty() ? null : prompt.toString();
     }
 
-    // ---- private helpers ----
+    /** Append the dynamic prompt to the existing system message (if any). */
+    private static SystemMessage enhanceSystemMessage(SystemMessage existing, String extra) {
+        if (existing == null || existing.getText() == null || existing.getText().isBlank()) {
+            return new SystemMessage(extra);
+        }
+        return new SystemMessage(existing.getText() + "\n\n" + extra);
+    }
 
-    private String buildMemoryPrompt() {
+    private static String buildMemoryPrompt() {
         try {
-            if (!Files.exists(MEMORY_FILE)) return null;
-
-            String content = Files.readString(MEMORY_FILE).trim();
-            if (content.isBlank()) return null;
-
-            // Remove trailing auto-gen note
-            int cutoff = content.indexOf("---\n*This index is auto-generated");
-            if (cutoff > 0) content = content.substring(0, cutoff).trim();
-
-            // Limit size to avoid context bloat
-            if (content.length() > 3000) {
-                content = content.substring(0, 3000) + "\n\n[...truncated, use listMemories for full list]";
+            if (!Files.exists(MEMORY_FILE)) {
+                return null;
             }
-
+            String content = Files.readString(MEMORY_FILE).trim();
+            if (content.isBlank()) {
+                return null;
+            }
+            if (content.length() > MEMORY_MAX_CHARS) {
+                content = content.substring(0, MEMORY_MAX_CHARS)
+                        + "\n\n[...truncated, use listMemories for the full list]";
+            }
             return """
                     ## User Memory Profile
 
@@ -104,14 +117,14 @@ public class PromptSubmitHook extends AgentHook {
                     %s
                     """.formatted(content);
         } catch (IOException e) {
-            log.warn("Failed to read memory file", e);
+            log.warn("Failed to read memory file {}", MEMORY_FILE, e);
             return null;
         }
     }
 
-    private String buildPlanModePrompt() {
+    private static String buildPlanModePrompt() {
         return """
-                ## Plan Mode Active — RESTRICTED OPERATION
+                ## Plan Mode Active - RESTRICTED OPERATION
 
                 You are currently in Plan Mode. You have ONLY the following permissions:
                 - Read and analyze code/files

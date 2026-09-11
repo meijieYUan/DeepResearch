@@ -10,16 +10,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Stream;
 
 /**
- * Layer 1: Tool result budget management.
+ * Layer 1: tool-result budget management.
  *
- * When a tool result exceeds {@link CompactConfig#TOOL_RESULT_MAX_CHARS},
- * the full content is saved to disk at {@code .compact/tool_results/{threadId}/{id}_{timestamp}.txt},
- * and the in-context message is replaced with a truncated preview plus a pointer to the file.
- *
- * The readFile tool is exempt — users can always retrieve the full content via a dedicated read.
+ * <p>Oversized results are stored on disk and replaced with a token-bounded
+ * preview plus an explicit pointer to the full content. The storage directory
+ * is capped (see {@link CompactConfig#TOOL_RESULT_DIR_MAX_BYTES}): once the cap
+ * is exceeded the oldest truncated files are pruned so the directory does not
+ * grow without bound.</p>
  */
 public final class ToolResultTruncator {
 
@@ -27,117 +29,168 @@ public final class ToolResultTruncator {
 
     private ToolResultTruncator() {}
 
-    /**
-     * Scans messages and truncates oversized tool results.
-     *
-     * @param messages the full message list
-     * @param threadId used for organizing disk storage
-     * @return a new list with truncated tool results, or the same list if no truncation was needed
-     */
     public static List<Message> truncate(List<Message> messages, String threadId) {
-        if (messages == null || messages.isEmpty()) return messages;
+        return truncate(messages, threadId, CompactConfig.TOOL_RESULTS_DIR);
+    }
 
-        // Fast scan: is there any oversized result AND is total below the minimum?
-        long totalToolResultChars = 0;
+    static List<Message> truncate(List<Message> messages, String threadId, Path storageDir) {
+        if (messages == null || messages.isEmpty()) {
+            return messages;
+        }
+
+        long totalToolResultTokens = 0;
         boolean hasOversized = false;
-        for (Message msg : messages) {
-            if (msg instanceof ToolResponseMessage trm) {
-                for (var resp : trm.getResponses()) {
-                    String content = resp.responseData();
-                    if (content != null) {
-                        totalToolResultChars += content.length();
-                        if (content.length() > CompactConfig.TOOL_RESULT_MAX_CHARS) {
-                            hasOversized = true;
-                        }
+        for (Message message : messages) {
+            if (message instanceof ToolResponseMessage responseMessage) {
+                for (ToolResponseMessage.ToolResponse response : responseMessage.getResponses()) {
+                    int tokens = CompactConfig.estimateTokens(response.responseData());
+                    totalToolResultTokens += tokens;
+                    if (CompactConfig.shouldTruncate(response.responseData())) {
+                        hasOversized = true;
                     }
                 }
             }
         }
 
-        // Skip truncation if no oversized results or if total is below the minimum
-        if (!hasOversized || CompactConfig.belowTotalToolResultMin(totalToolResultChars)) {
+        if (!hasOversized) {
             return messages;
         }
 
         List<Message> result = new ArrayList<>(messages.size());
-        boolean anyTruncated = false;
-
-        for (Message msg : messages) {
-            if (msg instanceof ToolResponseMessage trm) {
-                List<ToolResponseMessage.ToolResponse> responses = trm.getResponses();
-                List<ToolResponseMessage.ToolResponse> newResponses = new ArrayList<>(responses.size());
-                boolean msgTruncated = false;
-
-                for (ToolResponseMessage.ToolResponse resp : responses) {
-                    String content = resp.responseData();
-                    if (CompactConfig.shouldTruncate(content)) {
-                        String savedPath = saveToDisk(threadId, resp.id(), content);
-                        String truncated = buildTruncatedContent(content, savedPath);
-                        newResponses.add(new ToolResponseMessage.ToolResponse(
-                                resp.id(), resp.name(), truncated));
-                        msgTruncated = true;
-                        log.info("Truncated tool result [id={}, name={}]: {} → {} chars → saved to {}",
-                                resp.id(), resp.name(), content.length(), truncated.length(), savedPath);
-                    } else {
-                        newResponses.add(resp);
-                    }
-                }
-
-                if (msgTruncated) {
-                    result.add(ToolResponseMessage.builder()
-                            .responses(newResponses)
-                            .metadata(trm.getMetadata())
-                            .build());
-                    anyTruncated = true;
-                } else {
-                    result.add(msg);
-                }
+        for (Message message : messages) {
+            if (message instanceof ToolResponseMessage responseMessage) {
+                result.add(truncateResponseMessage(responseMessage, threadId, storageDir));
             } else {
-                result.add(msg);
+                result.add(message);
             }
         }
 
-        log.info("ToolResultTruncator: truncated oversized results (total tool chars: {})", totalToolResultChars);
-        return result;
+        log.info("ToolResultTruncator: truncated oversized result(s); total tool tokens={}",
+                totalToolResultTokens);
+        return List.copyOf(result);
     }
 
-    // ── private helpers ──
+    private static ToolResponseMessage truncateResponseMessage(
+            ToolResponseMessage message, String threadId, Path storageDir) {
+        List<ToolResponseMessage.ToolResponse> responses = message.getResponses();
+        List<ToolResponseMessage.ToolResponse> replacements = new ArrayList<>(responses.size());
+        boolean changed = false;
 
-    private static String buildTruncatedContent(String fullContent, String savedPath) {
-        int previewLen = Math.min(CompactConfig.TOOL_RESULT_PREVIEW_CHARS, fullContent.length());
-        String preview = fullContent.substring(0, previewLen);
+        for (ToolResponseMessage.ToolResponse response : responses) {
+            if (!CompactConfig.shouldTruncate(response.responseData())) {
+                replacements.add(response);
+                continue;
+            }
 
-        return preview + "\n\n" +
-               "╔══════════════════════════════════════════════════════════════╗\n" +
-               "║  [Tool output truncated — full content saved to disk]       ║\n" +
-               "║  Original: " + String.format("%,d", fullContent.length()) + " characters                                   ║\n" +
-               "║  File: " + padRight(savedPath, 56) + "║\n" +
-               "║  Use readFile to retrieve the complete output.              ║\n" +
-               "╚══════════════════════════════════════════════════════════════╝";
+            String original = response.responseData();
+            String savedPath = saveToDisk(threadId, response.id(), original, storageDir);
+            if (savedPath == null) {
+                replacements.add(response);
+                continue;
+            }
+            String preview = TokenBudgets.previewWithinTokenBudget(
+                    original, CompactConfig.TOOL_RESULT_PREVIEW_TOKENS);
+            replacements.add(new ToolResponseMessage.ToolResponse(
+                    response.id(), response.name(),
+                    buildTruncatedContent(original, preview, savedPath)));
+            changed = true;
+            log.info("Truncated tool result [id={}, name={}]: {} -> {} estimated tokens; saved to {}",
+                    response.id(), response.name(),
+                    CompactConfig.estimateTokens(original),
+                    CompactConfig.estimateTokens(preview),
+                    savedPath);
+        }
+
+        if (!changed) {
+            return message;
+        }
+        return ToolResponseMessage.builder()
+                .responses(replacements)
+                .metadata(message.getMetadata())
+                .build();
     }
 
-    private static String saveToDisk(String threadId, String toolCallId, String content) {
+    private static String buildTruncatedContent(
+            String original, String preview, String savedPath) {
+        return preview
+                + "\n\n[Tool output truncated. Original estimated tokens: "
+                + CompactConfig.estimateTokens(original)
+                + ". Full content: " + savedPath + ".]";
+    }
+
+    private static String saveToDisk(
+            String threadId, String toolCallId, String content, Path storageDir) {
         try {
-            Path dir = CompactConfig.TOOL_RESULTS_DIR.resolve(sanitize(threadId));
+            Path dir = storageDir.resolve(sanitize(threadId));
             Files.createDirectories(dir);
-
-            String filename = sanitize(toolCallId) + "_" + Instant.now().toEpochMilli() + ".txt";
-            Path file = dir.resolve(filename);
+            Path file = dir.resolve(
+                    sanitize(toolCallId) + "_" + Instant.now().toEpochMilli() + ".txt");
             Files.writeString(file, content);
+            pruneOversized(storageDir);
             return file.toAbsolutePath().toString();
         } catch (IOException e) {
             log.error("Failed to save truncated tool result to disk", e);
-            return CompactConfig.TOOL_RESULTS_DIR.resolve(sanitize(threadId)).toAbsolutePath().toString()
-                    + " (save failed: " + e.getMessage() + ")";
+            return null;
         }
     }
 
-    private static String sanitize(String s) {
-        return s.replaceAll("[^a-zA-Z0-9._\\-]", "_");
+    /** Delete the oldest files once the storage directory exceeds the byte cap. */
+    private static void pruneOversized(Path storageDir) {
+        try {
+            long total = sizeOf(storageDir);
+            if (total <= CompactConfig.TOOL_RESULT_DIR_MAX_BYTES) {
+                return;
+            }
+            List<Path> files;
+            try (Stream<Path> stream = Files.walk(storageDir)) {
+                files = stream.filter(Files::isRegularFile)
+                        .sorted(Comparator.comparingLong(ToolResultTruncator::lastModifiedMillis))
+                        .toList();
+            }
+            for (Path file : files) {
+                if (total <= CompactConfig.TOOL_RESULT_DIR_MAX_BYTES) {
+                    break;
+                }
+                long size = Files.size(file);
+                Files.deleteIfExists(file);
+                total -= size;
+                log.info("Pruned truncated tool result {} ({} bytes)", file, size);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to prune truncated tool-result storage", e);
+        }
     }
 
-    private static String padRight(String s, int len) {
-        if (s.length() >= len) return s;
-        return s + " ".repeat(len - s.length());
+    private static long sizeOf(Path dir) {
+        try (Stream<Path> stream = Files.walk(dir)) {
+            return stream.filter(Files::isRegularFile)
+                    .mapToLong(ToolResultTruncator::safeSize)
+                    .sum();
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    private static long safeSize(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    private static long lastModifiedMillis(Path path) {
+        try {
+            return Files.getLastModifiedTime(path).toMillis();
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    private static String sanitize(String value) {
+        if (value == null || value.isBlank()) {
+            return "unknown";
+        }
+        return value.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 }

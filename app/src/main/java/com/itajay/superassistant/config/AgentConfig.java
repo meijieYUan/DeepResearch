@@ -20,6 +20,7 @@ import com.itajay.superassistant.workflow.ResearchWriteWorkflow;
 import com.itajay.superassistant.interceptor.PlanModeToolInterceptor;
 import com.itajay.superassistant.prompt.PromptSubmitHook;
 import com.itajay.superassistant.rag.RagAgent;
+import com.itajay.superassistant.rag.ModelMessagePersistenceHook;
 import com.itajay.superassistant.tool.FileOperationTool;
 import com.itajay.superassistant.tool.MemoryTool;
 import com.itajay.superassistant.tool.PlanTool;
@@ -51,7 +52,6 @@ public class AgentConfig {
             - **Task management**: decompose work into tracked todo tasks. Use the task tools to create, start, complete, and query tasks.
             - **Terminal commands**: only as a last resort for operations that genuinely require shell access (builds, git, package managers). Every terminal command requires human approval.
             - **Sub-agents**: delegate specialized work (research, writing, review, RAG queries) to the appropriate sub-agent. Do not try to do everything yourself.
-            - The framework provides exact tool names and parameters; use them as defined.
 
             ## Safety Rules (CRITICAL — violations are unacceptable)
             1. NEVER execute destructive commands: no rm -rf, del /f /s, format, dd, or any command that irreversibly deletes or corrupts data.
@@ -98,6 +98,7 @@ public class AgentConfig {
                                  ResearchWriteWorkflow researchWriteWorkflow,
                                  SkillsAgentHook skillsAgentHook,
                                  MysqlSaver mysqlSaver,
+                                 ModelMessagePersistenceHook modelMessagePersistenceHook,
                                  ModelCallLimitHook modelCallLimitHook,
                                  ModelCallGuardInterceptor modelCallGuardInterceptor,
                                  LoopGuardToolInterceptor loopGuardToolInterceptor,
@@ -132,8 +133,10 @@ public class AgentConfig {
                 .methodTools(todoTool, webSearchTool, fileOperationTool, memoryTool,
                              planTool, terminalTool, createAgentTool, researchWriteWorkflow)
                 .tools(ragTool, researchTool, writerTool, reviewerTool)
-                .hooks(compactHook, promptSubmitHook, skillsAgentHook, humanInTheLoopHook, modelCallLimitHook)
-                .interceptors(planModeToolInterceptor, modelCallGuardInterceptor,
+                .hooks(compactHook, skillsAgentHook, humanInTheLoopHook,
+                       modelCallLimitHook, modelMessagePersistenceHook)
+                .interceptors(promptSubmitHook,
+                              planModeToolInterceptor, modelCallGuardInterceptor,
                               loopGuardToolInterceptor, toolRetryInterceptor, toolErrorInterceptor)
                 .saver(mysqlSaver)
                 .outputKey("output");

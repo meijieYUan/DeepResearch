@@ -7,9 +7,7 @@ import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.util.StringUtils;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
@@ -20,49 +18,64 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
+/**
+ * JDBC repository for renderable chat history.
+ *
+ * The table stores message text rather than a full framework serialization.
+ * It is a frontend rendering fallback and must not be used to reconstruct the
+ * agent's model context; graph state remains owned by the checkpoint saver.
+ */
 public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
 
     private static final Logger log = LoggerFactory.getLogger(CustomJdbcChatMemoryRepository.class);
 
-    private static final String TABLE_NAME = "CUSTOM_CHAT_MEMORY";
+    private static final String TABLE_NAME = "custom_chat_memory";
 
-    private static final String CREATE_TABLE_SQL =
-            "CREATE TABLE IF NOT EXISTS " + TABLE_NAME + " (" +
-            "`conversation_id` VARCHAR(64) NOT NULL," +
-            "`content` TEXT NOT NULL," +
-            "`type` VARCHAR(20) NOT NULL," +
-            "`timestamp` TIMESTAMP NOT NULL," +
-            "`sequence_id` BIGINT  AUTO_INCREMENT," +
-            "INDEX `CUSTOM_CM_CONV_SEQ_IDX` (`conversation_id`, `sequence_id`)" +
-            ")";
+    private static final String CREATE_TABLE_SQL = """
+            CREATE TABLE IF NOT EXISTS custom_chat_memory (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                conversation_id VARCHAR(100) NOT NULL,
+                message_type VARCHAR(20) NOT NULL,
+                message_content TEXT NOT NULL,
+                metadata TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_custom_chat_memory_conversation (conversation_id),
+                INDEX idx_custom_chat_memory_created (conversation_id, created_at)
+            )
+            """;
 
     private static final String FIND_CONVERSATION_IDS_SQL =
             "SELECT DISTINCT conversation_id FROM " + TABLE_NAME;
 
-    private static final String FIND_BY_CONVERSATION_ID_SQL =
-            "SELECT content, type FROM " + TABLE_NAME +
-            " WHERE conversation_id = ? ORDER BY sequence_id ASC";
+    private static final String FIND_BY_CONVERSATION_ID_SQL = """
+            SELECT message_content, message_type FROM custom_chat_memory
+            WHERE conversation_id = ? ORDER BY id ASC
+            """;
 
-    private static final String FIND_LATEST_BY_CONVERSATION_ID_SQL =
-            "SELECT content, type FROM " + TABLE_NAME +
-            " WHERE conversation_id = ? ORDER BY sequence_id DESC LIMIT ?";
+    private static final String FIND_LATEST_BY_CONVERSATION_ID_SQL = """
+            SELECT message_content, message_type FROM custom_chat_memory
+            WHERE conversation_id = ? ORDER BY id DESC LIMIT ?
+            """;
 
-    private static final String INSERT_MESSAGE_SQL =
-            "INSERT INTO " + TABLE_NAME +
-            " (conversation_id, content, type, timestamp) VALUES (?, ?, ?, ?)";
+    private static final String INSERT_MESSAGE_SQL = """
+            INSERT INTO custom_chat_memory
+                (conversation_id, message_type, message_content, created_at)
+            VALUES (?, ?, ?, ?)
+            """;
 
     private static final String DELETE_BY_CONVERSATION_ID_SQL =
             "DELETE FROM " + TABLE_NAME + " WHERE conversation_id = ?";
 
-
     private final DataSource dataSource;
 
     public CustomJdbcChatMemoryRepository(DataSource dataSource) {
-        this.dataSource=dataSource;
+        this.dataSource = Objects.requireNonNull(dataSource, "dataSource must not be null");
+        initTable();
     }
-
 
     public static Builder builder() {
         return new Builder();
@@ -76,8 +89,6 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
             return this;
         }
 
-
-
         public CustomJdbcChatMemoryRepository build() {
             return new CustomJdbcChatMemoryRepository(dataSource);
         }
@@ -90,7 +101,7 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
             log.info("Custom chat memory table `{}` ready", TABLE_NAME);
         } catch (SQLException e) {
             log.error("Failed to initialize custom chat memory table", e);
-            throw new RuntimeException("Failed to initialize custom chat memory table", e);
+            throw new IllegalStateException("Failed to initialize custom chat memory table", e);
         }
     }
 
@@ -103,10 +114,10 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
             while (rs.next()) {
                 ids.add(rs.getString("conversation_id"));
             }
+            return ids;
         } catch (SQLException e) {
-            log.error("Error finding conversation ids", e);
+            throw new IllegalStateException("Failed to find conversation ids", e);
         }
-        return ids;
     }
 
     @NotNull
@@ -116,23 +127,36 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
     }
 
     @Override
-    public void saveAll( String conversationId,  List<Message> messages) {
+    public void saveAll(String conversationId, List<Message> messages) {
         if (messages == null || messages.isEmpty()) {
             return;
         }
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(INSERT_MESSAGE_SQL)) {
-            for (Message message : messages) {
-                ps.setString(1, conversationId);
-                ps.setString(2, message.getText());
-                ps.setString(3, message.getMessageType().name());
-                ps.setTimestamp(4, Timestamp.from(Instant.now()));
-                ps.addBatch();
+        Connection conn = null;
+        try {
+            conn = dataSource.getConnection();
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(INSERT_MESSAGE_SQL)) {
+                for (Message message : messages) {
+                    String content = message.getText();
+                    if (content == null) {
+                        continue;
+                    }
+                    ps.setString(1, conversationId);
+                    ps.setString(2, message.getMessageType().name());
+                    ps.setString(3, content);
+                    ps.setTimestamp(4, Timestamp.from(Instant.now()));
+                    ps.addBatch();
+                }
+                int[] counts = ps.executeBatch();
+                conn.commit();
+                log.debug("Saved {} messages to conversation `{}`", counts.length, conversationId);
             }
-            ps.executeBatch();
-            log.debug("Saved {} messages to conversation `{}`", messages.size(), conversationId);
         } catch (SQLException e) {
-            log.error("Error saving messages for conversation `{}`", conversationId, e);
+            rollback(conn);
+            throw new IllegalStateException(
+                    "Failed to save messages for conversation `" + conversationId + "`", e);
+        } finally {
+            close(conn);
         }
     }
 
@@ -144,16 +168,13 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
             int deleted = ps.executeUpdate();
             log.debug("Deleted {} messages from conversation `{}`", deleted, conversationId);
         } catch (SQLException e) {
-            log.error("Error deleting messages for conversation `{}`", conversationId, e);
+            throw new IllegalStateException(
+                    "Failed to delete messages for conversation `" + conversationId + "`", e);
         }
     }
 
     /**
-     * 窗口化查询：获取指定会话最新的 limit 条消息，按时间正序返回（最旧到最新）。
-     *
-     * @param conversationId 会话 ID
-     * @param limit          返回的消息数量上限
-     * @return 最新 N 条消息（正序）
+     * Returns the newest N renderable messages in chronological order.
      */
     public List<Message> findLatestByConversationId(String conversationId, int limit) {
         if (limit <= 0) {
@@ -161,16 +182,10 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
         }
         List<Message> messages = findByConversationIdInternal(
                 conversationId, FIND_LATEST_BY_CONVERSATION_ID_SQL, limit);
-        java.util.Collections.reverse(messages);
+        Collections.reverse(messages);
         return messages;
     }
 
-    /**
-     * 追加插入一条新消息到指定会话。
-     *
-     * @param conversationId 会话 ID
-     * @param message        要追加的消息
-     */
     public void appendMessage(String conversationId, Message message) {
         if (message == null) {
             return;
@@ -189,31 +204,50 @@ public class CustomJdbcChatMemoryRepository implements ChatMemoryRepository {
             }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String content = rs.getString("content");
-                    String type = rs.getString("type");
-                    messages.add(buildMessage(content, type));
+                    messages.add(buildMessage(
+                            rs.getString("message_content"),
+                            rs.getString("message_type")));
                 }
             }
+            return messages;
         } catch (SQLException e) {
-            log.error("Error finding messages for conversation `{}`", conversationId, e);
+            throw new IllegalStateException(
+                    "Failed to find messages for conversation `" + conversationId + "`", e);
         }
-        return messages;
     }
-
 
     private Message buildMessage(String content, String type) {
-        try {
-            return switch (type) {
-               case "USER" -> new UserMessage(content);
-               case "ASSISTANT" -> new AssistantMessage(content);
-               default -> new UserMessage(content);
-           };
-        } catch (Exception e) {
-            log.debug("JSON deserialization failed for type {}, falling back to text-only", type, e);
+        if (content == null) {
+            return null;
         }
-        return null;
+        return switch (type) {
+            case "ASSISTANT" -> new AssistantMessage(content);
+            case "SYSTEM" -> new SystemMessage(content);
+            // Tool messages are not reconstructed from text. This repository is
+            // only a rendering history, not a replacement for graph checkpoints.
+            default -> new UserMessage(content);
+        };
     }
 
+    private static void rollback(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.rollback();
+        } catch (SQLException e) {
+            log.warn("Failed to roll back chat memory transaction", e);
+        }
+    }
 
-
+    private static void close(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.close();
+        } catch (SQLException e) {
+            log.debug("Failed to close chat memory connection", e);
+        }
+    }
 }

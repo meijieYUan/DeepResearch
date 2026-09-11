@@ -8,13 +8,16 @@ import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Layer 3: MicroCompact — remove stale early tool call/result pairs.
+ * Layer 3: MicroCompact — replace stale early tool-result payloads.
  *
- * Inspired by Claude Code's microcompact: keep the most recent N pairs and drop older ones.
- * Dropped pairs are replaced with a compact notice.
+ * The recent tool transactions are retained verbatim. Older transactions keep
+ * their assistant calls and IDs, but their result payloads are replaced with a
+ * short marker so narrative history and tool-call integrity are preserved.
  */
 public final class MicroCompact {
 
@@ -23,59 +26,95 @@ public final class MicroCompact {
     private MicroCompact() {}
 
     /**
-     * Apply micro-compaction: keep only the most recent N tool-call/result pairs.
+     * Apply micro-compaction while preserving the original message sequence.
      */
     public static List<Message> compact(List<Message> messages) {
         if (messages == null || messages.isEmpty()) return messages;
 
         int keep = CompactConfig.MICROCOMPACT_KEEP_RECENT_TOOL_PAIRS;
-
-        // Scan backwards to count tool result messages
-        int toolResultCount = 0;
-        int earliestKeptResultIdx = messages.size();
-        for (int i = messages.size() - 1; i >= 0; i--) {
-            Message msg = messages.get(i);
-            if (msg instanceof ToolResponseMessage) {
-                toolResultCount++;
-                if (toolResultCount <= keep) {
-                    earliestKeptResultIdx = i;
-                }
-            }
-        }
-
-        if (toolResultCount <= keep) {
+        int cutoff = ToolCallIntegrity.recentTransactionStart(messages, keep);
+        if (cutoff <= 0) {
             return messages;
         }
 
-        // Find the cutoff: the AssistantMessage that pairs with the earliest kept result
-        int cutoffIdx = findPairStart(messages, earliestKeptResultIdx);
-        int removedPairs = toolResultCount - keep;
+        Map<String, Integer> assistantIndexesByCallId = buildCallIndex(messages);
+        List<Message> result = new ArrayList<>(messages.size() + 1);
+        int replacedResults = 0;
 
-        List<Message> result = new ArrayList<>();
-        if (cutoffIdx > 0) {
-            result.add(new SystemMessage(
-                    "[Context micro-compacted: " + removedPairs + " early tool pairs removed. "
-                    + keep + " most recent preserved.]"
-            ));
-        }
-        for (int i = cutoffIdx; i < messages.size(); i++) {
-            result.add(messages.get(i));
-        }
-
-        log.info("MicroCompact: removed {} pairs, kept {} ({} → {} messages)",
-                removedPairs, keep, messages.size(), result.size());
-        return result;
-    }
-
-    /** Find the preceding AssistantMessage with tool calls that pairs with the given result. */
-    private static int findPairStart(List<Message> messages, int resultIdx) {
-        for (int i = resultIdx - 1; i >= 0; i--) {
-            Message msg = messages.get(i);
-            if (msg instanceof AssistantMessage am
-                    && am.getToolCalls() != null && !am.getToolCalls().isEmpty()) {
-                return i;
+        for (Message message : messages) {
+            if (message instanceof ToolResponseMessage responseMessage) {
+                ToolResponseMessage replacement = replaceOldResponses(
+                        responseMessage, assistantIndexesByCallId, cutoff);
+                if (replacement != responseMessage) {
+                    replacedResults++;
+                    result.add(replacement);
+                } else {
+                    result.add(message);
+                }
+            } else {
+                result.add(message);
             }
         }
-        return resultIdx;
+
+        if (replacedResults == 0) {
+            return messages;
+        }
+
+        result.add(0, new SystemMessage(
+                "[MicroCompact: " + replacedResults
+                + " stale tool result payload(s) replaced. The most recent "
+                + keep + " tool transaction(s) are preserved.]"
+        ));
+        log.info("MicroCompact: replaced {} stale tool result payload(s), kept {} recent transactions",
+                replacedResults, keep);
+        return List.copyOf(result);
+    }
+
+    private static Map<String, Integer> buildCallIndex(List<Message> messages) {
+        Map<String, Integer> assistantIndexesByCallId = new HashMap<>();
+        for (int i = 0; i < messages.size(); i++) {
+            Message message = messages.get(i);
+            if (ToolCallIntegrity.isToolCall(message)) {
+                int assistantIndex = i;
+                AssistantMessage assistantMessage = (AssistantMessage) message;
+                assistantMessage.getToolCalls()
+                        .forEach(call -> assistantIndexesByCallId.putIfAbsent(call.id(), assistantIndex));
+            }
+        }
+        return assistantIndexesByCallId;
+    }
+
+    private static ToolResponseMessage replaceOldResponses(
+            ToolResponseMessage message,
+            Map<String, Integer> assistantIndexesByCallId,
+            int cutoff) {
+        List<ToolResponseMessage.ToolResponse> replacements = new ArrayList<>();
+        boolean changed = false;
+
+        for (ToolResponseMessage.ToolResponse response : message.getResponses()) {
+            Integer assistantIndex = assistantIndexesByCallId.get(response.id());
+            if (assistantIndex != null && assistantIndex < cutoff
+                    && !isCompacted(response.responseData())) {
+                replacements.add(new ToolResponseMessage.ToolResponse(
+                        response.id(), response.name(),
+                        "[MicroCompact: stale tool result payload removed. Original call id: "
+                                + response.id() + ".]"));
+                changed = true;
+            } else {
+                replacements.add(response);
+            }
+        }
+
+        if (!changed) {
+            return message;
+        }
+        return ToolResponseMessage.builder()
+                .responses(replacements)
+                .metadata(message.getMetadata())
+                .build();
+    }
+
+    private static boolean isCompacted(String content) {
+        return content != null && content.startsWith("[MicroCompact:");
     }
 }

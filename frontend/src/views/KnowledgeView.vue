@@ -1,6 +1,9 @@
 <template>
   <div class="view-container">
-    <div class="view-header"><h2>Knowledge Base</h2></div>
+    <div class="view-header">
+      <h2>Knowledge Base</h2>
+      <p class="view-sub">Upload documents to ground the assistant's answers.</p>
+    </div>
     <div class="upload-zone card" @dragover.prevent @drop.prevent="onDrop" @click="triggerFile">
       <input ref="fileInput" type="file" accept=".pdf,.md,.txt,.java,.py,.xml,.json" @change="onFile" hidden />
       <Upload :size="36" />
@@ -49,16 +52,19 @@ function doUpload(file) {
 </script>
 
 <style scoped>
-.view-container { max-width: 600px; margin: 0 auto; }
-.view-header h2 { font-size: 20px; margin-bottom: 20px; }
+.view-container { max-width: 620px; margin: 0 auto; }
+.view-header { margin-bottom: 24px; }
+.view-header h2 { font-size: 19px; font-weight: 650; letter-spacing: -.02em; }
+.view-sub { font-size: 13px; color: var(--text2); margin-top: 5px; }
 .upload-zone {
   display: flex; flex-direction: column; align-items: center; gap: 8px;
-  padding: 48px; border: 2px dashed var(--border); border-radius: 12px;
+  padding: 52px 24px; border: 2px dashed var(--border-strong); border-radius: 16px;
+  background: var(--bg2); color: var(--text2);
   cursor: pointer; transition: all .2s;
 }
-.upload-zone:hover { border-color: var(--accent); background: rgba(108,140,255,.04); }
-.upload-zone p { font-size: 14px; }
-.upload-hint { font-size: 12px; color: var(--text2); }
+.upload-zone:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.upload-zone p { font-size: 14px; font-weight: 500; }
+.upload-hint { font-size: 12px; font-weight: 400; color: var(--text2); }
 .upload-progress { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 13px; }
 .upload-error { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 13px; color: var(--red); }
 .upload-result { margin-top: 16px; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }

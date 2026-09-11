@@ -186,18 +186,39 @@ public class TodoService {
         todoTaskMapper.updateById(task);
     }
 
-    public List<TodoTask> queryTasks(String status, String priority, String keyword) { return queryTasks(status, priority, keyword, null); }
-
     public List<TodoTask> queryTasks(String status, String priority, String keyword, String threadId) {
+        requireThreadId(threadId);
         if (status != null && !status.isBlank()) status = status.toUpperCase(); else status = null;
         if (priority != null && !priority.isBlank()) priority = priority.toUpperCase(); else priority = null;
         if (keyword != null && keyword.isBlank()) keyword = null;
         return todoTaskMapper.searchTasks(status, priority, keyword, threadId);
     }
 
-    public List<TodoTask> getAllTasks() { return todoTaskMapper.selectList(null); }
-    public List<TodoTask> getPendingTasks() { return todoTaskMapper.selectList(new LambdaQueryWrapper<TodoTask>().eq(TodoTask::getStatus, "PENDING")); }
-    public List<TodoTask> getOverdueTasks() { return todoTaskMapper.findOverdue("PENDING", LocalDateTime.now()); }
+    public List<TodoTask> getTasksByThread(String threadId) {
+        requireThreadId(threadId);
+        return todoTaskMapper.selectList(new LambdaQueryWrapper<TodoTask>()
+                .eq(TodoTask::getThreadId, threadId)
+                .orderByAsc(TodoTask::getStepNo)
+                .orderByAsc(TodoTask::getId));
+    }
+
+    public List<TodoTask> getPendingTasks(String threadId) {
+        requireThreadId(threadId);
+        return todoTaskMapper.selectList(new LambdaQueryWrapper<TodoTask>()
+                .eq(TodoTask::getThreadId, threadId)
+                .eq(TodoTask::getStatus, "PENDING")
+                .orderByAsc(TodoTask::getStepNo)
+                .orderByAsc(TodoTask::getId));
+    }
+
+    public List<TodoTask> getOverdueTasks(String threadId) {
+        requireThreadId(threadId);
+        return todoTaskMapper.findOverdue("PENDING", LocalDateTime.now(), threadId);
+    }
+
+    private static void requireThreadId(String threadId) {
+        if (threadId == null || threadId.isBlank()) throw new IllegalArgumentException("Missing threadId");
+    }
     public TodoTask getById(Long id) { return todoTaskMapper.selectById(id); }
     public boolean update(TodoTask task) { return todoTaskMapper.updateById(task) > 0; }
     public boolean deleteById(Long id) { return todoTaskMapper.deleteById(id) > 0; }

@@ -1,47 +1,59 @@
 package com.itajay.superassistant.compact;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Tracks which files have been read during the current session, with timestamps.
+ * Tracks which files have been read or written during the current session,
+ * with timestamps.
  *
- * Used by {@link ContextCompactor} to determine which files to re-inject
- * after a full LLM compaction. Files are deduplicated and sorted by last access time.
+ * <p>The state is built from the <em>tool-call arguments</em> of
+ * {@code readFile}/{@code writeFile} (the {@code filePath} parameter), not from
+ * tool-response payloads — a read result is the file <em>content</em>, which is
+ * a wrong source for path extraction. It is used by {@link ContextCompactor} to
+ * decide which files to re-inject after a full LLM compaction.</p>
  */
 public class FileReadState {
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private final Map<String, Instant> accessTimes = new LinkedHashMap<>();
 
-    /** Record a file access from a tool response message. */
-    public void recordAccess(String filePath) {
+    /** Record a file access (used by callers that observe tool executions). */
+    public synchronized void recordAccess(String filePath) {
         if (filePath != null && !filePath.isBlank()) {
             accessTimes.put(normalize(filePath), Instant.now());
         }
     }
 
     /**
-     * Scan messages for file read/write operations and populate the state.
-     * Call this before compaction to build the cache from the message history.
+     * Scan messages for file read/write tool calls and rebuild the state.
+     * Call this before compaction so the cache reflects the latest history.
      */
-    public void scanMessages(List<Message> messages) {
+    public synchronized void scanMessages(List<Message> messages) {
+        if (messages == null) {
+            return;
+        }
         for (Message msg : messages) {
-            if (msg instanceof ToolResponseMessage trm) {
-                for (ToolResponseMessage.ToolResponse resp : trm.getResponses()) {
-                    String name = resp.name();
-                    if ("readFile".equals(name) || "writeFile".equals(name)) {
-                        String data = resp.responseData();
-                        if (data != null) {
-                            for (String path : extractPaths(data)) {
-                                accessTimes.putIfAbsent(normalize(path), Instant.now());
-                            }
+            if (msg instanceof AssistantMessage assistantMessage
+                    && assistantMessage.hasToolCalls()) {
+                for (AssistantMessage.ToolCall call : assistantMessage.getToolCalls()) {
+                    if (isFileAccessTool(call.name())) {
+                        String path = extractFilePath(call.arguments());
+                        if (path != null) {
+                            // put (not putIfAbsent): keep the newest access time.
+                            accessTimes.put(normalize(path), Instant.now());
                         }
                     }
                 }
@@ -52,22 +64,48 @@ public class FileReadState {
     /**
      * Get the most recently accessed files, sorted by timestamp (newest first).
      *
-     * @param maxFiles  maximum number of files to return
+     * @param maxFiles maximum number of files to return
      * @return list of file paths, newest first
      */
-    public List<String> getRecentFiles(int maxFiles) {
+    public synchronized List<String> getRecentFiles(int maxFiles) {
         return accessTimes.entrySet().stream()
-                .sorted(Map.Entry.<String, Instant>comparingByValue().reversed())
+                .sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
                 .limit(maxFiles)
                 .map(Map.Entry::getKey)
                 .toList();
     }
 
-    public int size() {
+    public synchronized int size() {
         return accessTimes.size();
     }
 
     // ── helpers ──
+
+    private static boolean isFileAccessTool(String name) {
+        return "readFile".equals(name) || "writeFile".equals(name);
+    }
+
+    /** Parse the {@code filePath} parameter out of a tool-call arguments JSON. */
+    static String extractFilePath(String arguments) {
+        if (arguments == null || arguments.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode node = MAPPER.readTree(arguments);
+            if (node == null || !node.isObject()) {
+                return null;
+            }
+            for (String field : new String[] {"filePath", "file_path", "path"}) {
+                JsonNode value = node.get(field);
+                if (value != null && value.isTextual() && !value.asText().isBlank()) {
+                    return value.asText();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     private static String normalize(String path) {
         try {
@@ -75,24 +113,5 @@ public class FileReadState {
         } catch (Exception e) {
             return path;
         }
-    }
-
-    static List<String> extractPaths(String data) {
-        List<String> paths = new ArrayList<>();
-        for (String line : data.split("[\r\n]+")) {
-            line = line.trim();
-            if (matchesPath(line) && line.length() < 500) {
-                paths.add(line);
-            }
-        }
-        return paths;
-    }
-
-    private static boolean matchesPath(String s) {
-        if (s.startsWith("/") || s.matches("^[A-Za-z]:\\\\.*")) return true;
-        if (s.matches("^\\.?[\\\\/].*")) return true;
-        // Also match simple relative paths like "src/main/..."
-        if (s.matches("^[a-zA-Z0-9_].*[\\\\/].*") && !s.contains(" ")) return true;
-        return false;
     }
 }

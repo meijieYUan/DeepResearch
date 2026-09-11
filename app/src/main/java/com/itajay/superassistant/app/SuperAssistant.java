@@ -9,6 +9,7 @@ import com.itajay.superassistant.plan.PlanModeContext;
 import com.itajay.superassistant.security.ApprovalDecision;
 import com.itajay.superassistant.security.HITLHelper;
 import com.itajay.superassistant.security.PendingInterruptionStore;
+import com.itajay.superassistant.service.ChatMessagePersistenceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.*;
@@ -26,11 +27,14 @@ public class SuperAssistant {
 
     private final ReactAgent mainAgent;
     private final PendingInterruptionStore pendingInterruptionStore;
+    private final ChatMessagePersistenceService messagePersistenceService;
 
     public SuperAssistant(ReactAgent mainAgent,
-                          PendingInterruptionStore pendingInterruptionStore) {
+                          PendingInterruptionStore pendingInterruptionStore,
+                          ChatMessagePersistenceService messagePersistenceService) {
         this.mainAgent = mainAgent;
         this.pendingInterruptionStore = pendingInterruptionStore;
+        this.messagePersistenceService = messagePersistenceService;
     }
 
     @PostMapping("/chat/{threadId}")
@@ -43,6 +47,7 @@ public class SuperAssistant {
         PlanModeContext.setEnabled(threadId, planEnabled);
 
         try {
+            messagePersistenceService.saveUserMessage(threadId, request.message());
             RunnableConfig config = buildConfig(threadId);
             config.context().put("threadId", threadId);
             config.context().put("planEnabled", String.valueOf(planEnabled));
@@ -126,9 +131,14 @@ public class SuperAssistant {
     private RunnableConfig buildConfig(String threadId) {
         PendingInterruptionStore.PendingInterruption pending = pendingInterruptionStore.get(threadId);
         if (pending != null) {
-            return pending.config();
+            return RunnableConfig.builder(pending.config())
+                    .addMetadata("threadId", threadId)
+                    .build();
         }
-        return RunnableConfig.builder().threadId(threadId).build();
+        return RunnableConfig.builder()
+                .threadId(threadId)
+                .addMetadata("threadId", threadId)
+                .build();
     }
 
     private Map<String, Object> interruptionResponse(String threadId, InterruptionMetadata metadata, boolean planEnabled) {

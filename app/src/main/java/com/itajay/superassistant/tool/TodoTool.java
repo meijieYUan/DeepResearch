@@ -35,7 +35,6 @@ public class TodoTool {
 
     @Tool(description = "创建一个子任务。dependsOn 为 JSON 数组字符串如 '[\"t1\"]' 或 '[]'。parentId 为父任务ID（可选）。")
     public String createTask(
-            @ToolParam(description = "任务归属的 threadId") String threadId,
             @ToolParam(description = "任务总目标（可选）") String objective,
             @ToolParam(description = "任务标题") String title,
             @ToolParam(description = "任务说明（可选）") String description,
@@ -43,7 +42,9 @@ public class TodoTool {
             @ToolParam(description = "依赖的 step_key JSON 数组字符串，如 '[\"t1\"]'（可选）") String dependsOn,
             @ToolParam(description = "优先级 LOW/MEDIUM/HIGH/URGENT（可选）") String priority,
             @ToolParam(description = "截止时间 yyyy-MM-ddTHH:mm:ss（可选）") String dueDate,
-            @ToolParam(description = "父任务ID（可选）") Long parentId) {
+            @ToolParam(description = "父任务ID（可选）") Long parentId,
+            ToolContext toolContext) {
+        String threadId = resolveThreadId(toolContext);
         log.info("Create task [thread={}, title={}]", threadId, title);
         TodoTask task = todoService.createTask(threadId, objective, null, title, description,
                 acceptanceCriteria, priority, dueDate, dependsOn, parentId);
@@ -76,12 +77,13 @@ public class TodoTool {
         return "可执行子任务 (" + tasks.size() + ")：\n\n" + formatTaskList(tasks);
     }
 
-    @Tool(description = "按可选条件查询子任务：status、priority、keyword（标题/说明）、threadId。")
+    @Tool(description = "按可选条件查询当前会话的子任务：status、priority、keyword（标题/说明）。")
     public String queryTodos(
             @ToolParam(description = "状态过滤：PENDING/RUNNING/COMPLETED/FAILED/CANCELLED") String status,
             @ToolParam(description = "优先级过滤：LOW/MEDIUM/HIGH/URGENT") String priority,
             @ToolParam(description = "标题/说明关键字") String keyword,
-            @ToolParam(description = "会话 threadId（可选）") String threadId) {
+            ToolContext toolContext) {
+        String threadId = resolveThreadId(toolContext);
         List<TodoTask> tasks = todoService.queryTasks(status, priority, keyword, threadId);
         if (tasks.isEmpty()) {
             return "没有符合条件的子任务。";

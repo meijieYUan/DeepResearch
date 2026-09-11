@@ -27,9 +27,9 @@ import { toasts } from '../utils/toast'
   background: var(--bg2); border: 1px solid var(--border);
   box-shadow: var(--shadow); max-width: 360px; pointer-events: auto;
 }
-.toast-error { border-color: rgba(248, 113, 113, .4); color: var(--red); }
-.toast-success { border-color: rgba(52, 211, 153, .4); color: var(--green); }
-.toast-info { border-color: rgba(108, 140, 255, .4); color: var(--accent); }
+.toast-error { border-color: rgba(220, 38, 38, .35); color: var(--red); }
+.toast-success { border-color: rgba(22, 163, 74, .35); color: var(--green); }
+.toast-info { border-color: rgba(79, 70, 229, .35); color: var(--accent); }
 .toast-enter-active, .toast-leave-active { transition: all .25s ease; }
 .toast-enter-from { opacity: 0; transform: translateX(20px); }
 .toast-leave-to { opacity: 0; transform: translateY(8px); }

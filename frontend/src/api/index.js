@@ -22,12 +22,12 @@ export const sendChat = (threadId, message, mode = 'Default') =>
 export const approveChat = (threadId, decisions) =>
   api.post(`/chat/${threadId}/approve`, { decisions })
 
-// Todos
-export const getTodos = () => api.get('/todos')
-export const getPendingTodos = () => api.get('/todos/pending')
-export const getOverdueTodos = () => api.get('/todos/overdue')
-export const queryTodos = (status, priority, keyword) =>
-  api.post('/todos/query', { status, priority, keyword })
+// Todos — every query is scoped to a conversation threadId
+export const getTodos = (threadId) => api.get('/todos', { params: { threadId } })
+export const getPendingTodos = (threadId) => api.get('/todos/pending', { params: { threadId } })
+export const getOverdueTodos = (threadId) => api.get('/todos/overdue', { params: { threadId } })
+export const queryTodos = (threadId, status, priority, keyword) =>
+  api.post('/todos/query', { threadId, status, priority, keyword })
 
 // Knowledge
 export const uploadKnowledge = (file) => {
@@ -35,8 +35,3 @@ export const uploadKnowledge = (file) => {
   fd.append('file', file)
   return api.post('/knowledge/upload', fd)
 }
-
-// Plans (read-only queries; approve/reject go through chat)
-export const getPlan = (planId) => api.get(`/plans/${planId}`)
-export const getPlanEvents = (planId) => api.get(`/plans/${planId}/events`)
-export const getPlanRuns = (planId) => api.get(`/plans/${planId}/runs`)

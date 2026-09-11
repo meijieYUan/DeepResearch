@@ -1,7 +1,7 @@
 import { marked } from 'marked'
 import hljs from 'highlight.js/lib/common'
 import DOMPurify from 'dompurify'
-import 'highlight.js/styles/github-dark.css'
+import 'highlight.js/styles/github.css'
 
 marked.setOptions({ gfm: true, breaks: true })
 

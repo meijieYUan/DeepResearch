@@ -65,6 +65,27 @@ rag:
     top-k: 5
 
 agent:
+  checkpoint-retention:
+    retention-days: 30
+    max-per-thread: 20
+    active-grace-hours: 24
+    cron: "0 0 3 * * *"
+  compact:
+    # 上下文压缩：动态阈值 = (模型窗口 - 输出预留 - 系统/工具/用户上下文预留) × 比例
+    # 模型上下文窗口（tokens），deepseek-chat 默认 128K
+    model-context-window-tokens: 128000
+    # 为模型输出预留的窗口（tokens）
+    output-reserve-tokens: 8000
+    # 为系统提示词 + 工具定义 + 注入的用户上下文/记忆/MCP 说明预留的窗口（tokens）
+    system-prompt-reserve-tokens: 12000
+    # 触发 L1-L3 压缩的可用预算比例（0~1）
+    warning-ratio: 0.70
+    # 触发全量 LLM 压缩的可用预算比例（0~1，需大于 warning-ratio）
+    critical-ratio: 0.90
+    # 两次全量压缩之间最少间隔的 agent 调用次数
+    cooldown-calls: 5
+    # 每个线程保留的全量压缩快照数量
+    snapshot-keep: 5
   guard:
     # 模型调用异常兜底（重试 + 兜底回答）
     model-retry:

@@ -1,56 +1,99 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #0f1117;
-  --bg2: #1a1d27;
-  --bg3: #242836;
-  --border: #2e3348;
-  --text: #e1e4ed;
-  --text2: #8b90a0;
-  --accent: #6c8cff;
-  --accent2: #4a6cf7;
-  --green: #34d399;
-  --red: #f87171;
-  --yellow: #fbbf24;
-  --orange: #fb923c;
-  --radius: 8px;
-  --shadow: 0 2px 8px rgba(0,0,0,.3);
+  --bg: #f7f8fa;
+  --bg2: #ffffff;
+  --bg3: #eef0f5;
+  --border: #e5e7eb;
+  --border-strong: #d6dae1;
+  --text: #1a1d27;
+  --text2: #6b7280;
+  --accent: #4f46e5;
+  --accent2: #4338ca;
+  --accent-soft: rgba(79, 70, 229, .07);
+  --accent-soft-2: rgba(79, 70, 229, .13);
+  --green: #16a34a;
+  --red: #dc2626;
+  --yellow: #d97706;
+  --orange: #ea580c;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .05);
+  --shadow-lg: 0 12px 32px -8px rgba(16, 24, 40, .14), 0 4px 10px -4px rgba(16, 24, 40, .06);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
 }
 
-html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; }
+html, body {
+  height: 100%;
+  font-family: var(--font-sans);
+  background-color: var(--bg); color: var(--text); font-size: 14px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* Ambient background: faint dot grid over soft accent glows. Panels and
+   sidebars stay opaque, so the texture only shows through in the content
+   areas that are deliberately transparent. */
+body {
+  background-image:
+    radial-gradient(rgba(15, 23, 42, .055) 1px, transparent 1.5px),
+    radial-gradient(58rem 34rem at 6% -12%, rgba(79, 70, 229, .14), transparent 58%),
+    radial-gradient(50rem 32rem at 102% -4%, rgba(14, 165, 233, .12), transparent 60%),
+    radial-gradient(62rem 38rem at 50% 118%, rgba(124, 58, 237, .10), transparent 58%);
+  background-size: 22px 22px, auto, auto, auto;
+  background-repeat: repeat, no-repeat, no-repeat, no-repeat;
+  background-position: 0 0, center, center, center;
+  background-attachment: fixed;
+}
 
 #app { height: 100vh; display: flex; }
 
 a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
 
 button {
-  cursor: pointer; border: none; border-radius: var(--radius); padding: 8px 16px;
-  font-size: 13px; font-weight: 500; transition: all .15s;
+  cursor: pointer; border: none; border-radius: var(--radius-sm); padding: 8px 16px;
+  font-size: 13px; font-weight: 550; font-family: inherit; letter-spacing: -.005em;
+  transition: all .15s ease;
 }
 button:disabled { opacity: .5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); color: #fff; }
-.btn-primary:hover { background: var(--accent2); }
+.btn-primary { background: var(--accent); color: #fff; box-shadow: 0 1px 2px rgba(79, 70, 229, .25); }
+.btn-primary:hover:not(:disabled) { background: var(--accent2); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(79, 70, 229, .28); }
 .btn-danger { background: var(--red); color: #fff; }
-.btn-success { background: var(--green); color: #111; }
-.btn-ghost { background: transparent; color: var(--text2); border: 1px solid var(--border); }
-.btn-ghost:hover { background: var(--bg3); color: var(--text); }
+.btn-danger:hover:not(:disabled) { background: #b91c1c; }
+.btn-success { background: var(--green); color: #fff; }
+.btn-success:hover:not(:disabled) { background: #15803d; }
+.btn-ghost { background: var(--bg2); color: var(--text2); border: 1px solid var(--border); }
+.btn-ghost:hover:not(:disabled) { background: var(--bg3); color: var(--text); border-color: var(--border-strong); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 
 input, textarea, select {
-  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
-  color: var(--text); padding: 8px 12px; font-size: 13px; outline: none; transition: border-color .15s;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); padding: 8px 12px; font-size: 13px; font-family: inherit;
+  outline: none; transition: border-color .15s, box-shadow .15s;
 }
-input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: #9ca3af; }
+input:focus, textarea:focus, select:focus {
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft-2);
+}
 
-.scrollbar::-webkit-scrollbar { width: 6px; }
+.scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
 .scrollbar::-webkit-scrollbar-track { background: transparent; }
-.scrollbar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.scrollbar::-webkit-scrollbar-thumb { background: #d6dae1; border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+.scrollbar::-webkit-scrollbar-thumb:hover { background: #b8bec9; background-clip: padding-box; }
 
-.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-.badge-high { background: rgba(248,113,113,.15); color: var(--red); }
-.badge-medium { background: rgba(251,191,36,.15); color: var(--yellow); }
-.badge-low { background: rgba(52,211,153,.15); color: var(--green); }
+.card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; box-shadow: var(--shadow);
+}
+.badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; }
+.badge-high { background: rgba(220, 38, 38, .10); color: var(--red); }
+.badge-medium { background: rgba(217, 119, 6, .12); color: var(--yellow); }
+.badge-low { background: rgba(22, 163, 74, .10); color: var(--green); }
 
 .fade-enter-active, .fade-leave-active { transition: opacity .2s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
@@ -58,51 +101,56 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 .loading { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- Markdown content styles (used inside v-html rendered messages) ---- */
-.msg-text :deep(p) { margin-bottom: 8px; }
-.msg-text :deep(p:last-child) { margin-bottom: 0; }
-.msg-text :deep(strong) { color: var(--accent); font-weight: 600; }
-.msg-text :deep(em) { font-style: italic; }
-.msg-text :deep(code) {
-  background: rgba(0,0,0,.25); padding: 2px 6px; border-radius: 4px;
-  font-size: 12px; font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+/* ---- Markdown content (rendered via v-html inside .msg-text) ----
+   This is a GLOBAL stylesheet, so selectors must NOT use :deep() —
+   that syntax is only compiled inside .vue scoped blocks and would be
+   dropped as an invalid selector here. */
+.msg-text p { margin-bottom: 8px; }
+.msg-text p:last-child { margin-bottom: 0; }
+.msg-text strong { color: var(--text); font-weight: 700; }
+.msg-text em { font-style: italic; }
+.msg-text code {
+  background: rgba(15, 23, 42, .06); padding: 2px 6px; border-radius: 5px;
+  font-size: 12px; font-family: var(--font-mono);
 }
-.msg-text :deep(pre) { margin: 0; padding: 0; background: transparent; overflow: visible; }
-.msg-text :deep(pre code) {
-  display: block; padding: 12px 14px; border-radius: 0 0 6px 6px;
-  background: #11151e; overflow-x: auto; font-size: 12px; line-height: 1.55;
+.msg-text pre { margin: 0; padding: 0; background: transparent; overflow: visible; }
+.msg-text pre code {
+  display: block; padding: 12px 14px; border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  overflow-x: auto; font-size: 12px; line-height: 1.6;
 }
-.msg-text :deep(.code-block) {
-  margin: 10px 0; border-radius: 6px; border: 1px solid var(--border);
-  overflow: hidden; background: #11151e;
+.msg-text .code-block {
+  margin: 10px 0; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  overflow: hidden; background: #f8fafc;
 }
-.msg-text :deep(.code-header) {
+.msg-text .code-header {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 6px 12px; background: rgba(108,140,255,.08);
+  padding: 6px 12px; background: #f1f3f8;
   border-bottom: 1px solid var(--border); font-size: 11px;
 }
-.msg-text :deep(.code-lang) { color: var(--text2); text-transform: uppercase; font-weight: 600; }
-.msg-text :deep(.code-copy) {
-  background: transparent; color: var(--text2); border: 1px solid var(--border);
+.msg-text .code-header .hljs, .msg-text .code-block .hljs { background: transparent; }
+.msg-text .code-lang { color: var(--text2); text-transform: uppercase; font-weight: 600; }
+.msg-text .code-copy {
+  background: var(--bg2); color: var(--text2); border: 1px solid var(--border);
   padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;
   transition: all .15s;
 }
-.msg-text :deep(.code-copy:hover) { background: var(--bg3); color: var(--text); }
-.msg-text :deep(ul), .msg-text :deep(ol) { padding-left: 20px; margin: 6px 0; }
-.msg-text :deep(li) { margin-bottom: 4px; }
-.msg-text :deep(blockquote) {
+.msg-text .code-copy:hover { background: var(--bg3); color: var(--text); }
+.msg-text ul, .msg-text ol { padding-left: 20px; margin: 6px 0; }
+.msg-text li { margin-bottom: 4px; }
+.msg-text blockquote {
   border-left: 3px solid var(--accent); padding: 4px 12px; margin: 8px 0;
-  color: var(--text2); background: rgba(108,140,255,.05);
+  color: var(--text2); background: var(--accent-soft); border-radius: 0 6px 6px 0;
 }
-.msg-text :deep(table) { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; }
-.msg-text :deep(th), .msg-text :deep(td) { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
-.msg-text :deep(th) { background: var(--bg3); font-weight: 600; }
-.msg-text :deep(hr) { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
-.msg-text :deep(h1), .msg-text :deep(h2), .msg-text :deep(h3), .msg-text :deep(h4) {
-  margin: 12px 0 6px; font-weight: 600; line-height: 1.3;
+.msg-text table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+.msg-text th, .msg-text td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.msg-text th { background: var(--bg3); font-weight: 600; }
+.msg-text hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.msg-text h1, .msg-text h2, .msg-text h3, .msg-text h4 {
+  margin: 16px 0 8px; font-weight: 600; line-height: 1.3; color: var(--text);
+  letter-spacing: -.01em;
 }
-.msg-text :deep(h1) { font-size: 1.3em; }
-.msg-text :deep(h2) { font-size: 1.15em; }
-.msg-text :deep(h3) { font-size: 1.05em; }
-.msg-text :deep(a) { color: var(--accent); text-decoration: underline; }
-.msg-text :deep(img) { max-width: 100%; border-radius: 4px; }
+.msg-text h1:first-child, .msg-text h2:first-child, .msg-text h3:first-child { margin-top: 0; }
+.msg-text h1 { font-size: 1.3em; }
+.msg-text h2 { font-size: 1.15em; }
+.msg-text h3 { font-size: 1.05em; }
+.msg-text img { max-width: 100%; border-radius: 6px; }

@@ -3,6 +3,7 @@ package com.itajay.superassistant.rag;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.agent.hook.AgentHook;
+import com.alibaba.cloud.ai.graph.state.ReplaceAllWith;
 import com.alibaba.cloud.ai.graph.agent.hook.HookPosition;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
@@ -84,9 +85,10 @@ public class RagHook extends AgentHook {
         String context = documents.stream().map(Document::getText).collect
                 (Collectors.joining("\n"));
         String systemPrompt = String.format(RAG_Template, context);
-        List<Message>enhancedMessages=List.of(new SystemMessage(systemPrompt),new UserMessage(text));
-        //使用检索的文档上下文进行回答（默认覆盖了历史消息）
-        return CompletableFuture.completedFuture(Map.of("messages",enhancedMessages));
+        List<Message> enhancedMessages = List.of(new SystemMessage(systemPrompt), new UserMessage(text));
+        // 使用检索的文档上下文进行回答（默认覆盖历史消息）。
+        // ReplaceAllWith 保证该列表替换（而非追加到）rag-agent 的状态消息。
+        return CompletableFuture.completedFuture(Map.of("messages", ReplaceAllWith.of(enhancedMessages)));
     }
 
     public final String RAG_Template= """
