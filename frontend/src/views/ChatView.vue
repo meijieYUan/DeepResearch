@@ -82,11 +82,17 @@
                   <textarea v-if="app.editing" v-model="app.editedArgs" rows="3" placeholder="Edit arguments (JSON)..."></textarea>
                 </div>
                 <div class="approval-actions">
-                  <button class="btn-success btn-sm" @click="decide(app, 'APPROVED')">Approve</button>
-                  <button class="btn-danger btn-sm" @click="decide(app, 'REJECTED')">Reject</button>
-                  <button class="btn-ghost btn-sm" @click="app.editing = !app.editing">
-                    {{ app.editing ? 'Cancel Edit' : 'Edit' }}
-                  </button>
+                  <template v-if="app.editing">
+                    <!-- While editing, Confirm emits an EDITED decision so the backend
+                         (HITLHelper.applyDecision) swaps in the edited arguments. -->
+                    <button class="btn-success btn-sm" @click="confirmEdit(app)">Confirm Edit</button>
+                    <button class="btn-ghost btn-sm" @click="cancelEdit(app)">Cancel</button>
+                  </template>
+                  <template v-else>
+                    <button class="btn-success btn-sm" @click="decide(app, 'APPROVED')">Approve</button>
+                    <button class="btn-danger btn-sm" @click="decide(app, 'REJECTED')">Reject</button>
+                    <button class="btn-ghost btn-sm" @click="startEdit(app)">Edit</button>
+                  </template>
                 </div>
               </div>
               <button class="btn-primary" @click="submitApprovals(msg)" :disabled="!allDecided(msg)">
@@ -100,6 +106,14 @@
           <div class="msg-avatar"><Bot :size="16" /></div>
           <div class="msg-body">
             <div class="typing-dots"><span></span><span></span><span></span></div>
+            <!-- Long workflows (research → write → review) stream their stage here, so the
+                 user can tell "still searching" from "stuck" without waiting blind. -->
+            <div v-if="progressStage" class="progress-stage">
+              <span class="progress-stage-dot" :class="{ failed: progressFailed }"></span>
+              <span class="progress-stage-label">{{ progressStage }}</span>
+              <span v-if="progressRound > 1" class="progress-stage-round">第 {{ progressRound }} 轮</span>
+              <span v-if="progressDetail" class="progress-stage-detail">{{ progressDetail }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -150,7 +164,7 @@
 <script setup>
 import { ref, computed, nextTick, watch, onMounted } from 'vue'
 import { MessageSquare, Send, AlertTriangle, Plus, Trash2, User, Bot, ChevronRight, PanelLeftClose, PanelLeftOpen } from 'lucide-vue-next'
-import { sendChat, approveChat, getTodos } from '../api'
+import { sendChat, approveChat, getTodos, chatStreamUrl } from '../api'
 import { renderMarkdown, handleCopyClick } from '../utils/markdown'
 import { toast } from '../utils/toast'
 
@@ -164,6 +178,13 @@ const planMode = ref(false)
 const planActive = ref(false)
 const taskList = ref([])
 const tasksOpen = ref(false)
+
+// Workflow progress, pushed over SSE while a long request is in flight.
+const progressStage = ref('')
+const progressRound = ref(1)
+const progressFailed = ref(false)
+const progressDetail = ref('')
+let progressSource = null
 
 const THREAD_SIDEBAR_KEY = 'sa_thread_sidebar'
 const THREAD_DEFAULT = 264
@@ -339,19 +360,78 @@ function send() {
   loading.value = true
   saveThreads()
   scrollDown()
+
+  // Open the progress stream before the POST: a workflow can publish its first
+  // stage within milliseconds of starting, and an EventSource opened afterwards
+  // would miss it.
+  openProgressStream(activeThreadId.value)
+
   sendChat(activeThreadId.value, msg, planMode.value ? 'PlanMode' : 'Default')
     .then(r => handleResponse(r.data))
-    .catch(() => {})
-    .finally(() => { loading.value = false; scrollDown() })
+    // Errors surface through the response interceptor (which toasts) — do not
+    // swallow them here, or a failed run looks like a run that returned nothing.
+    .catch(err => handleRequestError(err))
+    .finally(() => { loading.value = false; closeProgressStream(); scrollDown() })
+}
+
+function openProgressStream(threadId) {
+  closeProgressStream()
+  progressStage.value = ''
+  progressRound.value = 1
+  progressFailed.value = false
+  progressDetail.value = ''
+
+  // EventSource reconnects automatically on a dropped connection, which for a
+  // long-running workflow is what we want.
+  const source = new EventSource(chatStreamUrl(threadId))
+  progressSource = source
+
+  source.addEventListener('progress', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      progressStage.value = data.label || ''
+      progressRound.value = data.round || 1
+      progressFailed.value = data.stage === 'FAILED'
+      progressDetail.value = data.detail || ''
+      scrollDown()
+    } catch { /* a malformed frame is not worth breaking the run over */ }
+  })
+
+  source.addEventListener('done', () => closeProgressStream())
+
+  // The stream closing is normal (the server closes it when the run settles) and
+  // so is a reconnect attempt. Only surface a terminal failure if we are still
+  // waiting — otherwise a closed stream would report an error after every answer.
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) closeProgressStream()
+  }
+}
+
+function closeProgressStream() {
+  if (progressSource) {
+    progressSource.close()
+    progressSource = null
+  }
+}
+
+function handleRequestError(err) {
+  const t = threads.value[activeThreadId.value]
+  if (!t) return
+  // The interceptor already toasted the message; record it in the transcript too,
+  // so a failure is still visible after a refresh.
+  const msg = err?.response?.data?.message || err?.message || 'Request failed'
+  t.messages.push({ role: 'assistant', content: '⚠️ Error: ' + msg })
+  t.lastActive = Date.now()
+  saveThreads()
 }
 
 function handleResponse(data) {
   const t = threads.value[activeThreadId.value]
   if (!t) return
   if (data.planEnabled !== undefined) { planMode.value = data.planEnabled }
-    if (data.planActive !== undefined) { planActive.value = data.planActive }
-    refreshTasks()
-    if (data.type === 'ANSWER') {
+  if (data.planActive !== undefined) { planActive.value = data.planActive }
+  refreshTasks()
+  if (data.type === 'ANSWER') {
     const text = extractText(data.response || data)
     t.messages.push({ role: 'assistant', content: text })
   } else if (data.type === 'INTERRUPTED') {
@@ -387,6 +467,24 @@ function extractText(res) {
 function decide(app, result) { app.decision = result }
 function allDecided(msg) { return msg.approvals && msg.approvals.every(a => a.decision) }
 
+// Edit flow: Entering edit mode re-seeds the draft from the original arguments each
+// time, so cancel-and-reopen always starts clean. Confirm validates the draft as JSON
+// (tool arguments are JSON strings) and only then records an EDITED decision, which is
+// what makes submitApprovals send editedArguments to the backend.
+function startEdit(app) {
+  app.editedArgs = app.arguments
+  app.editing = true
+}
+function cancelEdit(app) {
+  app.editing = false
+}
+function confirmEdit(app) {
+  try { JSON.parse(app.editedArgs) }
+  catch { toast('Edited arguments must be valid JSON', 'error'); return }
+  app.decision = 'EDITED'
+  app.editing = false
+}
+
 function submitApprovals(msg) {
   const decisions = msg.approvals.map(a => {
     const d = { toolId: a.toolId, result: a.decision }
@@ -394,10 +492,12 @@ function submitApprovals(msg) {
     return d
   })
   loading.value = true
+  // The run resumes on the same thread, so the progress stream reopens with it.
+  openProgressStream(activeThreadId.value)
   approveChat(activeThreadId.value, decisions)
     .then(r => handleResponse(r.data))
-    .catch(() => {})
-    .finally(() => { loading.value = false; scrollDown() })
+    .catch(err => handleRequestError(err))
+    .finally(() => { loading.value = false; closeProgressStream(); scrollDown() })
 }
 
 function formatArgs(args) {
@@ -527,6 +627,23 @@ onMounted(() => {
 .typing-dots span:nth-child(2) { animation-delay: .16s; }
 .typing-dots span:nth-child(3) { animation-delay: .32s; }
 @keyframes dotBounce { 0%, 60%, 100% { opacity: .3; transform: scale(.8); } 30% { opacity: 1; transform: scale(1); } }
+
+/* Workflow stage, streamed over SSE while a long request runs */
+.progress-stage {
+  display: flex; align-items: center; gap: 7px;
+  padding: 0 14px 10px; font-size: 12.5px; color: var(--text2);
+}
+.progress-stage-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent, #4f8cff);
+  animation: stagePulse 1.6s ease-in-out infinite; flex: none;
+}
+.progress-stage-dot.failed { background: var(--danger, #e5484d); animation: none; }
+@keyframes stagePulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+.progress-stage-round {
+  margin-left: 2px; padding: 1px 6px; border-radius: 999px;
+  background: var(--surface2, rgba(127,127,127,.14)); font-size: 11px; opacity: .85;
+}
+.progress-stage-detail { opacity: .75; }
 
 .message { display: flex; gap: 12px; max-width: var(--chat-max); margin: 0 auto 22px; animation: msgIn .28s ease; }
 @keyframes msgIn { from { opacity: 0; transform: translateY(8px); } }

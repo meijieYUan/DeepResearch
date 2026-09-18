@@ -16,11 +16,21 @@ api.interceptors.response.use(
 export const getHealth = () => api.get('/health')
 
 // Chat — mode is 'Default' or 'PlanMode'
+//
+// timeout: 0 disables axios's own deadline. The research workflow legitimately runs
+// for many minutes (search → download → read → write → review → revise), so the
+// global 2-minute default would abort every such request while the server keeps
+// working. The request is not abandoned: progress arrives over the SSE stream
+// (chatStreamUrl below), and the browser's own connection is what bounds it.
 export const sendChat = (threadId, message, mode = 'Default') =>
-  api.post(`/chat/${threadId}`, { message, mode })
+  api.post(`/chat/${threadId}`, { message, mode }, { timeout: 0 })
 
 export const approveChat = (threadId, decisions) =>
-  api.post(`/chat/${threadId}/approve`, { decisions })
+  api.post(`/chat/${threadId}/approve`, { decisions }, { timeout: 0 })
+
+// SSE endpoint for workflow progress. Opened alongside the POST, not instead of it:
+// the POST's response is still the authoritative answer.
+export const chatStreamUrl = (threadId) => `/api/chat/${threadId}/stream`
 
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId } })
