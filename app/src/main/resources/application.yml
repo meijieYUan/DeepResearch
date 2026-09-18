@@ -6,6 +6,14 @@ spring:
     exclude:
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeMultimodalEmbeddingAutoConfiguration
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      # 排除 Spring AI 的 JDBC 会话记忆自动配置。
+      # 原因：它的 @ConditionalOnMissingBean 推断的是自己的 JdbcChatMemoryRepository 类型，
+      # 而本项目的 CustomJdbcChatMemoryRepository 是实现同一接口的另一个类，无法满足该条件，
+      # 于是两个 Bean 同时注册，ChatMemoryAutoConfiguration.chatMemory(ChatMemoryRepository)
+      # 因"找到 2 个候选"而启动失败。
+      # 本项目不使用框架的 ChatMemory：会话上下文由 graph checkpoint 持有，
+      # CustomJdbcChatMemoryRepository 仅用于前端渲染历史，故直接排除。
+      - org.springframework.ai.model.chat.memory.repository.jdbc.autoconfigure.JdbcChatMemoryRepositoryAutoConfiguration
 
   ai:
     dashscope:
@@ -18,6 +26,13 @@ spring:
         options:
           model: deepseek-chat
           temperature: 0.7
+          # 输出上限，显式固定而非依赖供应商默认值。8192 已是 deepseek-chat 的上限。
+          # writer-agent 把整篇文档作为 writeResearchDocument 的单个参数一次输出，因此文档越大越
+          # 容易在 JSON 字符串中途被截断（Unexpected end-of-input），框架解析失败并终止本次运行。
+          # 现状：文档不再复述四维正文（那些落在 analysis/ 里），体量从「论文数 × 四维全文」降到
+          # 「论文数 × 一句话 + 对比表」，触发点因此后移了一个量级——但**上限本身没有消除**，
+          # 论文数很多时仍可能触及。真触及时要改的是分段写入，不是这个数字。
+          max-tokens: 8192
 
     mcp:
       client:
@@ -86,6 +101,45 @@ agent:
     cooldown-calls: 5
     # 每个线程保留的全量压缩快照数量
     snapshot-keep: 5
+  progress:
+    # 调研工作流的 SSE 进度推送（GET /api/chat/{threadId}/stream）
+    # 心跳间隔：调研运行会在单次子 Agent 调用里停留数分钟，没有心跳时
+    # 代理或浏览器可能掐掉空闲连接，导致后续阶段事件全部丢失。
+    heartbeat-ms: 15000
+  paper:
+    # 论文 PDF 下载、文本提取与图片截取
+    #   research-agent 下载；analyst-agent 做文本与图片提取；reviewer-agent 复核
+    # 调研产出根目录（相对项目根目录），实际布局：
+    #   investigation/{课题方向}/papers/{论文短名}.pdf
+    #   investigation/{课题方向}/analysis/{论文短名}.md
+    #   investigation/{课题方向}/analysis/figures/{论文短名}_Fig{N}.png
+    #   investigation/{课题方向}/document/{文档名}.md
+    investigation-dir: investigation
+    # 单个 PDF 大小上限，防止误解析到超大文件
+    max-pdf-bytes: 52428800
+    # 小于此大小视为错误页/截断文件
+    min-pdf-bytes: 8192
+    # extractPaperText 单次返回的最大字符数（保护模型上下文）
+    max-text-chars: 40000
+    # 单次解析的最大页数
+    max-pages: 60
+    # extractPaperFigures 单次最多导出的图片数（防止大页码范围一次刷屏落盘）
+    max-figures: 8
+    # 裁图时页面栅格化的分辨率：矢量框架图没有位图可提取，只能渲染页面区域再裁
+    figure-dpi: 200
+    # HTTP 连接 / 整体请求超时（学术站点较慢，整体超时给足）
+    connect-timeout-ms: 15000
+    request-timeout-ms: 120000
+    # 每个候选 URL 的尝试次数与退避
+    max-retries: 3
+    initial-backoff-ms: 800
+    max-backoff-ms: 10000
+    # 按主机配置镜像（主地址不可达时使用）：值为镜像 origin，保留原 path 与 query
+    #   https://arxiv.org/pdf/xxx -> https://export.arxiv.org/pdf/xxx
+    # 值中含 %s 时，改为把原 path 填入 %s 位置（适配路径结构不同的镜像）
+    # host-fallbacks:
+    #   arxiv.org:
+    #     - https://export.arxiv.org
   guard:
     # 模型调用异常兜底（重试 + 兜底回答）
     model-retry:
@@ -105,3 +159,6 @@ agent:
       max-model-calls-per-thread: 60
       max-total-tool-calls: 60
       max-identical-calls: 3
+      # analyst-agent 单篇精读的模型调用上限（paperAnalysisCallLimitHook 读取）。
+      # 它在一个 Java 循环里被逐篇调用，某篇结构混乱的 PDF 会让它反复翻页不收敛。
+      max-model-calls-per-paper: 8

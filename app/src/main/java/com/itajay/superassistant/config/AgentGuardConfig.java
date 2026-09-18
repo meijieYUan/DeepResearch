@@ -34,6 +34,25 @@ public class AgentGuardConfig {
     }
 
     /**
+     * 单篇论文精读的模型调用上限，给 analyst-agent 用（不是主 Agent）。
+     *
+     * <p>为什么单独一个 Bean：{@link #modelCallLimitHook} 挂在主 Agent 上，而三个调研子
+     * Agent 都没有接任何循环上限——原先无所谓，因为每个子 Agent 每轮只跑一次。但
+     * {@code analyzePapers} 会在一个 Java 循环里连续调用 analyst N 次，每次都是一次**不受限**
+     * 的运行；一篇排版混乱的 PDF 足以让某一篇反复翻页不收敛，而外层循环还会继续往下走。
+     * 按"单篇"而不是"单轮"设限，是因为一次批量分析里 analyst 会被调用很多次，主 Agent 的
+     * 15 次上限对单篇而言过宽，对整批而言又会被反复重置。</p>
+     */
+    @Bean
+    public ModelCallLimitHook paperAnalysisCallLimitHook(
+            @Value("${agent.guard.loop.max-model-calls-per-paper:8}") int paperLimit) {
+        return ModelCallLimitHook.builder()
+                .runLimit(paperLimit)
+                .exitBehavior(ModelCallLimitHook.ExitBehavior.END)
+                .build();
+    }
+
+    /**
      * 工具调用重试：仅对瞬时性错误重试，重试耗尽后返回错误消息（而非抛出异常终止运行）。
      */
     @Bean

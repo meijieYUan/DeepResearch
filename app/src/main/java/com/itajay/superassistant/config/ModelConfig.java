@@ -24,6 +24,21 @@ public class ModelConfig {
     @Value("${spring.ai.deepseek.chat.options.model:deepseek-chat}")
     private String model;
 
+    /**
+     * Output ceiling for every agent, pinned explicitly rather than left to the
+     * provider default.
+     *
+     * <p>This is not a fix for the truncation the research workflow hits. The writer
+     * emits the whole document as one {@code writeResearchDocument} argument, so once
+     * a document outgrows the ceiling the tool call is cut off mid-string and the
+     * framework fails to parse it ("Unexpected end-of-input ... column: 23400"),
+     * aborting the run. 8192 is DeepSeek's maximum, so no value here removes that
+     * limit — documents that size have to be written in sections instead. Pinning it
+     * at least makes the ceiling visible and adjustable in one place.</p>
+     */
+    @Value("${spring.ai.deepseek.chat.options.max-tokens:8192}")
+    private Integer maxTokens;
+
     @Bean
     public DeepSeekApi deepSeekApi() {
         return DeepSeekApi.builder()
@@ -46,6 +61,7 @@ public class ModelConfig {
                 .defaultOptions(DeepSeekChatOptions.builder()
                         .model(model)
                         .temperature(0.7)
+                        .maxTokens(maxTokens)
                         .build())
                 .toolCallingManager(toolCallingManager)
                 .observationRegistry(observationRegistry)

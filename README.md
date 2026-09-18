@@ -32,15 +32,19 @@
      ▼                      ▼                      ▼
 ┌───────────┐    ┌──────────────────┐   ┌──────────────────┐
 │ 子 Agent  │    │   Local Tools    │   │   MCP Client     │
-│ ├ RagAgent│    │ ├ TodoTool       │   │  ──SSE──► Email  │
-│ ├ Research│    │ ├ WebSearchTool  │   │   MCP Server     │
-│ ├ Writer  │    │ ├ FileOpTool     │   │     :8081        │
-│ └ Reviewer│    │ ├ MemoryTool     │   │  sendEmail       │
-│           │    │ ├ PlanTool       │   │  sendEmailBatch  │
-│ Research- │    │ ├ TerminalTool   │   └──────────────────┘
-│ Write     │    │ ├ CreateAgentTool│
-│ Workflow  │    │ └ ResearchWrite  │
-└─────┬─────┘    └──────────────────┘
+│ └ RagAgent│    │ ├ TodoTool       │   │  ──SSE──► Email  │
+│           │    │ ├ WebSearchTool  │   │   MCP Server     │
+│ Research- │    │ ├ FileOpTool     │   │     :8081        │
+│ Write-    │    │ ├ MemoryTool     │   │  sendEmail       │
+│ Review    │    │ ├ PlanTool       │   │  sendEmailBatch  │
+│ Workflow  │    │ ├ TerminalTool   │   └──────────────────┘
+│  ├Research│    │ ├ CreateAgentTool│
+│  ├Analyst │    │ ├ PaperAnalysis  │
+│  ├ Writer │    │ └ DocumentWrite  │
+│  └Reviewer│    └────────┬─────────┘
+      │                   │ SSE 进度
+      │                   ▼
+      │          GET /api/chat/{id}/stream
       │ Milvus 向量 + BM25 关键词 混合检索
       ▼
 ┌──────────────────────────────────────────────┐
@@ -55,7 +59,7 @@
 
 ### 1. 多智能体协作与计划模式
 
-- **主 Agent（main-agent）**：基于 Spring AI Alibaba ReactAgent 实现统一入口和任务路由，可将子任务委派给 `rag-agent`、`research-agent`、`writer-agent`、`reviewer-agent` 四个专业子 Agent。子 Agent 通过 `AgentTool.create(...)` 包装为 `ToolCallback` 挂载。
+- **主 Agent（main-agent）**：基于 Spring AI Alibaba ReactAgent 实现统一入口和任务路由。`rag-agent` 通过 `AgentTool.create(...)` 包装为 `ToolCallback` 直接挂载；**调研四件套（research / analyst / writer / reviewer）不再逐个暴露**——它们是 `ResearchWriteReviewWorkflow` 的阶段，单独暴露会让主 Agent 跳过审查闸门或乱序执行。主 Agent 只调用 `researchWriteReview` 这一个入口。
 - **PlanTool 计划模式（工具门控）**：复杂任务先进入只读计划阶段。`PlanModeToolInterceptor` 按三级策略动态裁剪模型可见的工具集：
   1. `planEnabled=false`（用户未开启开关）→ 隐藏 `enterPlanMode`/`exitPlanMode`，模型无法进入计划模式；
   2. `planEnabled=true`、`planActive=false` → 全部工具可用；
@@ -69,7 +73,37 @@
         ├─ approved=true  → 退出计划模式，调用 todoWrite 拆解为 Todo 任务执行
         └─ approved=false → 留在计划模式，按反馈修订后重新请求审批
   ```
-- **ResearchWriteWorkflow**：研究 → 写作的顺序流水线，ResearchAgent 搜集素材后 WriterAgent 撰写结构化 Markdown 文档，作为单一 Tool 暴露给主 Agent 调用。
+- **ResearchWriteReviewWorkflow**：调研文档的**带审查闭环**流水线，作为单一 Tool 暴露给主 Agent。由 Java 代码驱动（而非框架的 `SequentialAgent`/`LoopAgent`），因为修订回退需要**按问题归属路由**——框架的 `ConditionLoopStrategy` 谓词只能看到消息列表，无法表达"这条问题该回退到检索、精读还是写作"。
+
+  ```
+  research-agent 检索并下载
+        ↓
+  analyst-agent 逐篇精读 → analysis/{论文短名}.md   （由 writer 的 analyzePapers 工具触发）
+        ↓
+  analyst-agent 截取该篇的嵌入图 → analysis/figures/{论文短名}_p{页}_{序}.png
+        ↓
+  writer-agent 撰写（只做归纳与对比）→ document/{文档名}.md
+        ↓
+  reviewer-agent 审查两份产出 → {approved, issues[].target}
+        ↓
+    approved=true → 交付
+    approved=false → 含 RESEARCHER 级问题 → 重跑 research（补检/补下载）→ 再跑 writer
+                     含 ANALYST 级问题   → 先 reanalyzePaper 重做那几篇精读 → 再重写文档
+                     全为 WRITER 级问题   → 只重跑 writer
+        ↓
+    最多 2 轮，仍未通过则如实上报遗留问题
+  ```
+
+  审查输出无法解析时**按未通过处理**并追加一条说明，绝不静默放行——放行一份未核验的文档等于让审查环节形同虚设。
+
+  **两个不显眼但致命的实现细节**（都是实测踩出来的）：
+
+  1. **子 Agent 的产出必须从 `messages` 里取，不能读 `state.value("output")`。** 框架的 `AgentLlmNode` 只在配置了 `outputKey` 时才写该键，否则只写 `messages`。主 Agent 配了 `outputKey("output")`，四个子 Agent 没有——照抄主 Agent 的读法会让每个阶段都拿到空字符串，整条流水线在空输入上空转，且不报错。
+  2. **审查读的是磁盘上的文档，不是 writer 的回复。** writer 的正文是 `writeResearchDocument` 的**工具参数**，它的最终回复只是一句"已保存"。若把回复当作文档交给 reviewer，reviewer 面对的是空的审查对象，只能一律判 REVISE，闸门形同虚设。因此工作流自己按固定路径从磁盘读回正文；writer 若改了文件名，则回退到它自报的路径，报告里输出的始终是**实际被审查的那个路径**。
+
+  文档名由工作流固定（由课题方向推导）并写进 writer 的输入。实测 writer 会在修订轮次改名（一轮写 `...-survey.md`、下一轮写 `Training-free-....md`），导致 reviewer 反复审查同一份未修订的旧稿、循环永不收敛。
+
+  进度通过 SSE 实时推送（见下节）。
 - **CreateAgentTool**：动态创建子 Agent 执行独立任务。
 
 > **注意**：早期的独立计划子系统（`PlanController` / `PlanService` / `PlanStepHook` / `plan_task` / `plan_step` 相关实体与 Mapper）及其前端页面（`PlanView.vue`、`/plans` 路由、`/api/plans/*` 调用）已全部移除。现在"计划"完全通过对话完成：Agent 在计划模式下与用户商量并写出计划，用户审核后由 `exitPlanMode` 退出并拆分为 Todo 任务；前端通过 Todo 接口展示任务进展。
@@ -227,9 +261,32 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | **PlanTool** | `enterPlanMode` / `exitPlanMode` |
 | **TerminalTool** | `executeCommand`（纳入 HITL 审批） |
 | **CreateAgentTool** | 动态创建子 Agent 执行独立任务 |
-| **ResearchWriteWorkflow** | 研究 → 写作一站式流水线 |
+| **SkillResourceTool** | `readSkillResource`，只读读取 skill 的参考文件（路径限定在 skills 目录内），供子 Agent 加载参考指南 |
+| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重）。**仅 `research-agent` 使用** |
+| **PaperTextTool** | `extractPaperText` / `listDownloadedPapers`，读取已下载 PDF 的正文（支持分页、超长截断）。**`analyst-agent` 与 `reviewer-agent` 使用** |
+| **PaperFigureTool** | `extractPaperFigures`，取出 PDF 里**原生嵌入的图片**并落盘为 PNG，**同时返回两种相对路径**（写进 analysis 文件的 `figures/…` 与写进文档的 `../analysis/figures/…`）。**仅 `analyst-agent` 使用** |
+| **DocumentWriteTool** | `writeResearchDocument`，把调研文档写入 `investigation/{课题方向}/document/`（仅限该目录、仅 Markdown） |
+| **AnalysisWriteTool** | `writePaperAnalysis`，把单篇论文的四维信息写入 `investigation/{课题方向}/analysis/`（仅限该目录、仅 Markdown），文件头由工具生成 |
+| **AnalysisReadTool** | `readPaperAnalysis`，按论文短名读回一篇精读结果。**`writer-agent` 与 `reviewer-agent` 共用** |
+| **PaperAnalysisTool** | `analyzePapers(topic)` 枚举该课题已下载论文、跳过已有精读结果的、逐篇调用 `analyst-agent`；`reanalyzePaper(topic, 短名, reason)` 强制重做一篇。**`writer-agent` 使用** |
+| **ResearchWriteReviewWorkflow** | 研究 → 精读 → 写作 → 审查的闭环流水线（含按 target 三分路由的修订回退） |
 
-**子 Agent 工具**（`tools`）：`rag-agent` / `research-agent` / `writer-agent` / `reviewer-agent`
+**子 Agent 工具**（`tools`）：仅 `rag-agent`。`research-agent` / `analyst-agent` / `writer-agent` / `reviewer-agent` 是 `ResearchWriteReviewWorkflow` 的阶段，不单独挂载。
+
+**为什么把论文工具拆得这么细**：沿用本项目"窄工具"的惯例（`SkillResourceTool` 只读、`DocumentWriteTool` 只写文档）。子 Agent 的工具调用不经过主 Agent 的 HITL 审批，因此职责边界必须由**工具能力**强制，而不是靠提示词约束：
+
+| Agent | 拥有 | 没有 | 效果 |
+|---|---|---|---|
+| `research-agent` | `downloadPaper`、`listDownloadedPapers` | 任何读正文的工具 | 它无从精读，交付物只能是"候选池 + 判定表 + 下载清单" |
+| `analyst-agent` | `extractPaperText`、`writePaperAnalysis`、`extractPaperFigures` | 下载工具、文档写入 | 一次只拿到**一篇**论文，只能写出一份精读结果与该篇的图 |
+| `writer-agent` | `analyzePapers`、`readPaperAnalysis`、`writeResearchDocument` | **任何读 PDF 的工具** | 它触发精读、按需读回结果、成文，但翻不了原文也改不了精读结果 |
+| `reviewer-agent` | `extractPaperText`、`readPaperAnalysis`、`SkillResourceTool` | 任何写入工具 | 能读原文逐字核对公式，但改不了任何东西 |
+
+`writer-agent` **刻意没有 `extractPaperText`，也刻意没有 `extractPaperFigures`**：四维信息一旦重新流进 writer 的上下文，就等于回到了"文档体量 = 论文数 × 四维全文"的老路，而这正是本次重构要拆掉的截断成因；图片同理——它只**逐字复制** analysis 文件里 analyst 已经嵌好的 `> 文档引用：` 路径，自己不解图、不挑图。
+
+**图片的来源只有一条链**：`extractPaperFigures` 写在 PDF 里读到什么图就给什么图，并把两种相对路径都拼好（`figures/…` 给 analysis 文件，`../analysis/figures/…` 给文档）；analysis 文件里每张图下面带一行 `> 文档引用：<路径>`，writer 逐字复制它。**任何 agent 都不许自己拼图片路径**——这曾经是"产出中不内嵌图片"的原因（模型拼相对路径必错），现在改成了让工具给路径：断链从"必然"变成了"可判定的错误"，reviewer 手里有工作流附上的**图片清单**，可以纯字符串判定（`review-guide.md` P2/P3）。
+
+`reviewer-agent` 之所以同时需要 `extractPaperText` 与 `readPaperAnalysis`：公式现在承载在 analysis 文件里，审查时必须把 analysis 与**论文原文**逐字符并排比对；它也需要读原文来判断 `FULL_TEXT` 的来源等级标注是否属实。
 
 **MCP 工具**（独立 Email Server :8081）：`sendEmail` / `sendEmailBatch`（纳入 HITL 审批）
 
@@ -239,11 +296,67 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 
 [SkillConfig](app/src/main/java/com/itajay/superassistant/skill/SkillConfig.java) 通过 ClasspathSkillRegistry 加载 skills：
 
-- `research_writing_skill`：科研论文调研与文献综述撰写。自动检索 arXiv / Semantic Scholar / Google Scholar，精读 4-8 篇论文，提取方法框架/创新点/训练目标，按模板生成结构化调研文档。
+- `research_writing_skill`：科研论文调研与文献综述撰写。自动检索 arXiv / Semantic Scholar / Google Scholar，下载 4-8 篇相关论文，逐篇精读提取方法框架/创新点/训练目标并落盘，按模板生成**对比型**调研文档并经质量审查。
 
-添加新 skill：在 `resources/skills/{skill-name}/` 下创建 `SKILL.md` + 可选 `template/`、`example/` 目录即可。
+skill 采用渐进式披露（progressive disclosure）拆分：
 
-### 9. 模型/工具兜底与循环防护
+| 文件 | 加载方式 | 内容 |
+|---|---|---|
+| `SKILL.md` | 由 `SkillScanner` 自动加载（仅识别该文件名） | 主流程总览：六步流程（含审查回边）、四个角色的职责边界、全局红线 |
+| `references/research-guide.md` | `research-agent` 按需读取 | 检索策略、五维相关性评分、下载闸门、**输出契约**（候选池/判定表/下载清单/参考文献） |
+| `references/writing-guide.md` | `writer-agent` 按需读取 | **整份都属于 writer**：输入契约与修订轮次、文档骨架、逐篇定位（含"图片路径逐字复制"规则）、对比分析、汇总表、参考文献、语言排版、红线、自检清单 |
+| `references/analysis-guide.md` | `analyst-agent` 按需读取 | **整份都属于 analyst**：四维信息定义、公式核对纪律、来源等级限制、**从这一篇的 PDF 截取图片并各自引用**、`writePaperAnalysis` 参数与文件骨架 |
+| `references/review-guide.md` | `reviewer-agent` 按需读取 | 九个审查维度（文档结构 / **analysis 完整性** / 事实忠实性 / 公式正确性 / 来源追溯 / 覆盖度 / **分工与体量** / 格式 / 一致性）、BLOCKER/MAJOR/MINOR 分级、判定规则、**target 三分路由口径** |
+| `template/`、`example/` | 撰写阶段按需读取 | 结构权威与风格范例（范例仅为风格参考，结构以模板为准） |
+
+**每个角色只读属于自己的一份规程，两份都是整份相关**。此前是 `writing-guide.md` 一份供两个角色共用、让 analyst"重点看 §1"——它每轮都在读一份大半是别人规程的文件，且依赖"模型会照小节号跳读"，实测并不稳。`example/` 下的 `papper*.png` 是**范例文档自己的素材**（与 `example.md` 同目录），实跑文档**不得**引用；实跑引用的图必须来自 `extractPaperFigures` 截取的 `analysis/figures/`，两者不共享任何路径。
+
+四个子 Agent 通过 `SkillResourceTool`（只读、路径限定在 skills 目录内）读取上述参考文件，无需授予通用文件工具，避免绕过主 Agent 的 HITL 审批。
+
+**四个子 Agent 刻意不挂 `SkillsAgentHook`。** 该 Hook 会额外注册一个框架自带的 `read_skill` 工具，它按 skill 的 frontmatter 名（`research-writing`，注意与目录名 `research_writing_skill` 不同）查找，且只返回 `SKILL.md`，够不到 `references/*.md`——正是子 Agent 真正需要的文件。两个命名口径不同、能力重叠的"读 skill"工具并列时，模型会开始猜：实测日志里出现了 `Skill not found: reviewer` / `reviewer_skill` / `reviewer-agent` 三次失败调用。现在每个子 Agent 的指令里直接写死唯一正确的调用
+`readSkillResource(skillName="research_writing_skill", relativePath="references/xxx.md")`。主 Agent 仍保留该 Hook，用于技能发现。
+
+### 9. 调研进度实时推送（SSE）
+
+调研工作流耗时可达数分钟（检索 → 下载 → 精读 → 撰写 → 审查 → 修订），若前端静默等待，用户无法区分"仍在检索"和"已经卡死"。
+
+```
+GET /api/chat/{threadId}/stream   →  text/event-stream
+```
+
+- `ProgressChannelRegistry` 按 threadId 维护一条 `SseEmitter`（超时 30 分钟），`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。
+- 阶段枚举：`RESEARCHING` / `WRITING` / `REVIEWING` / `REVISING` / `DONE` / `FAILED`，事件体为 `ProgressEvent{stage, label, round, detail, timestamp}`。
+- 推送是**尽力而为**：没有客户端监听时 `publish` 是 no-op，客户端中途断开只是摘除该 emitter——**工作流绝不因无人监听而失败**。
+- 连接关闭前会先发一个 `done` 事件。少了它，`EventSource` 会把"正常关闭"当作掉线并自动重连，为一个已经结束的运行重新注册通道。
+
+**为什么 POST 保持阻塞**：`POST /api/chat/{threadId}` 仍是同步阻塞调用（前端把 axios 超时设为 `0`），SSE 走一条**独立并发连接**。改成异步执行会破坏 `PlanContextHolder` 的 `ThreadLocal` 与 HITL 中断/恢复流程——两者都假设整个运行在同一条线程上。
+
+**已知取舍**：SSE 连接随页面销毁，刷新后无法续看进度；但 POST 的返回值仍是权威结果，刷新后可从历史记录看到最终答案。
+
+#### 调研产出目录
+
+论文与文档按**课题方向**归档在项目根目录下：
+
+```
+{项目根目录}/investigation/{课题方向}/
+├── papers/     # research-agent 下载的论文原件（PaperDownloadTool）
+├── analysis/   # analyst-agent 逐篇生成的精读结果（AnalysisWriteTool），一篇一个文件
+│   └── figures/  # 同一批论文里截出来的图（PaperFigureTool），{短名}_p{页}_{序}.png
+└── document/   # writer-agent 生成的调研文档（DocumentWriteTool）
+```
+
+- **课题方向是目录的唯一键，且不区分 thread**：换个对话继续调研同一课题，只要课题方向一致即可复用已下载的论文**与已完成的精读结果**。
+- **`analysis/{论文短名}.md` 与 `papers/{论文短名}.pdf` 同名成对**，是给人看的产物：用户可以直接打开任意一篇查看详细分析（四维信息、逐字抄录的公式），不必在长文档里翻找。文档中也用相对链接 `../analysis/{短名}.md` 指向它们。
+- **图的短名前缀与 analysis 文件名逐字节同源**（都取自 `AnalysisStore.nameFor`），因此"每张图都对应一份已存在的精读结果"是可机械校验的性质，而不是君子协定。文件名里的 `{序}` 是该页内按 XObject 名字顺序的 1-based 序号，同一 PDF 上稳定，所以重跑同名覆盖、不产生碎片。原始嵌入图**自身不带图号**——第几张对应 Fig. 几必须由读过图注的 analyst 确认。
+- 项目根目录由 `WorkspacePaths` 从工作目录向上查找 `.git` 确定，避免 IDE / `spring-boot:run` 从子模块启动时把产出散落到 `app/investigation/`。
+- 四个子 Agent 都**没有通用文件能力**：`research-agent` 只能通过 `downloadPaper` 下载，`analyst-agent` 只能读正文并写自己那一篇的精读结果，`writer-agent` 只能触发精读、读回精读结果并写 Markdown 文档，`reviewer-agent` 完全只读；四者都限定在对应课题目录内。
+- 论文 PDF 去重**按解析后的文件名**判定，因此**短名就是去重键**——同一篇论文换了短名会被重新下载。
+- **精读结果按短名跳过已完成项**：`analyzePapers` 发现某篇已有 analysis 文件就不重做。因此一次中断或失败的运行重跑时，已完成的精读不会白做。
+- `investigation/` 已在 `.gitignore` 中忽略。
+
+添加新 skill：在 `resources/skills/{skill-name}/` 下创建 `SKILL.md` + 可选 `references/`、`template/`、`example/` 目录即可。
+
+### 10. 模型/工具兜底与循环防护
 
 配置前缀 `agent.guard`，由 `AgentGuardConfig` 装配：
 
@@ -256,6 +369,8 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | `ModelCallLimitHook` | MODEL hook | 限制单次运行的模型调用次数 |
 
 `MAIN_AGENT_INSTRUCTION` 中同时内置"安全规则"（禁止破坏性命令、提权、数据外泄等）与"健壮性/终止规则"（避免重复调用、及时停止、错误优雅处理）以配合上述防护。
+
+**上表中的 hook/interceptor 只注册在 `mainAgent` 上，`analyst-agent` 是唯一例外。** 其余三个子 Agent 每轮只跑一次，无上限不构成风险；但 `analyzePapers` 会在一个 Java 循环里连续调用 analyst N 次，每次都是一次**无上限**的运行——一篇结构混乱的 PDF 足以让某一篇反复翻页不收敛，而外层循环还会继续往下走。因此 `AgentGuardConfig` 额外提供 `paperAnalysisCallLimitHook`（`agent.guard.loop.max-model-calls-per-paper`，默认 8，`.exitBehavior(END)` 终止该篇而非整批），并且 `analyzePapers` 对单篇失败做隔离——**一篇失败不中断整批**，如实记入返回索引的失败列。
 
 ## 技术栈
 
@@ -333,9 +448,10 @@ SuperAssistant/
 │       ├── checkpoint/            # checkpoint 生命周期管理
 │       │   └── CheckpointRetentionService.java  # 定时清理过期 checkpoint
 │       ├── agent/                 # 专业子 Agent
-│       │   ├── ResearchAgent.java        # 研究 Agent：搜索 + 素材收集
-│       │   ├── WriterAgent.java          # 写作 Agent：结构化文档撰写
-│       │   └── ReviewerAgent.java        # 审查 Agent：验收与修订判定
+│       │   ├── ResearchAgent.java        # 研究 Agent：搜索 + 相关性判定 + PDF 下载（不精读）
+│       │   ├── AnalystAgent.java         # 精读 Agent：逐篇读正文 + 四维提取 + 落盘（一次一篇）
+│       │   ├── WriterAgent.java          # 写作 Agent：触发精读 + 归纳对比成文（不碰 PDF）
+│       │   └── ReviewerAgent.java        # 审查 Agent：读原文与精读结果核对 + 结构化审批结论
 │       ├── plan/                  # 计划模式上下文
 │       │   ├── PlanModeContext.java      # 计划模式 启用/激活 状态
 │       │   └── PlanContextHolder.java    # ThreadLocal 上下文持有者
@@ -373,10 +489,25 @@ SuperAssistant/
 │       │   ├── PlanTool.java              # 计划模式入口/出口
 │       │   ├── TerminalTool.java          # 终端命令执行（HITL 审批）
 │       │   ├── CreateAgentTool.java       # 动态创建子 Agent
+│       │   ├── SkillResourceTool.java     # 只读读取 skill 参考文件（子 Agent 用）
+│       │   ├── PaperDownloadTool.java     # 论文 PDF 下载（research-agent 用）
+│       │   ├── PaperTextTool.java         # 已下载 PDF 正文读取（analyst / reviewer 用）
+│       │   ├── PaperFigureTool.java       # 论文嵌入图截取，返回两种相对路径（analyst-agent 用）
+│       │   ├── PaperStore.java            # 论文 PDF 的路径解析与清单
+│       │   ├── AnalysisWriteTool.java     # 单篇精读结果落盘（analyst-agent 用）
+│       │   ├── AnalysisReadTool.java      # 单篇精读结果读回（writer / reviewer 用）
+│       │   ├── AnalysisStore.java         # 精读文件的路径解析、清单与文件头解析
+│       │   ├── PaperAnalysisTool.java     # analyzePapers / reanalyzePaper（writer-agent 用）
+│       │   ├── DocumentWriteTool.java     # 调研文档落盘（writer-agent 用）
 │       │   ├── DateTimeTool.java          # 日期时间（未挂载）
 │       │   └── WeatherTool.java           # 天气查询（未挂载）
 │       ├── workflow/              # Agent 工作流
-│       │   └── ResearchWriteWorkflow.java # 研究→写作顺序流水线
+│       │   ├── ResearchWriteReviewWorkflow.java # 研究→精读→写作→审查闭环（含三分路由的修订）
+│       │   └── ReviewResult.java          # 审查结论解析（容错，解析失败按未通过处理）
+│       ├── progress/              # 工作流进度推送
+│       │   ├── ProgressStage.java         # 阶段枚举 + 中文 label
+│       │   ├── ProgressEvent.java         # SSE 事件体
+│       │   └── ProgressChannelRegistry.java # 按 threadId 维护 SseEmitter + 心跳
 │       ├── service/               # 业务服务层
 │       │   ├── TodoService.java
 │       │   ├── WebSearchService.java
@@ -401,9 +532,16 @@ SuperAssistant/
 │           │   └── custom_chat_memory.sql # custom_chat_memory 表
 │           └── skills/
 │               └── research_writing_skill/
-│                   ├── SKILL.md
-│                   ├── template/template.md
-│                   └── example/*.md, *.png
+│                   ├── SKILL.md                       # 主流程（自动加载）
+│                   ├── references/                    # 子 Agent 参考指南（按需读取）
+│                   │   ├── research-guide.md          # 检索/相关性判定/下载/输出契约
+│                   │   ├── analysis-guide.md          # 整份给 analyst：四维提取、公式纪律、截图与引用、落盘格式
+│                   │   ├── writing-guide.md           # 整份给 writer：输入契约、骨架、逐篇定位、对比写作、红线
+│                   │   └── review-guide.md            # 文档与 analysis 双对象检查清单 + 三分路由口径
+│                   ├── template/template.md           # 对比型文档结构权威（只定结构与图片写法，不含素材）
+│                   └── example/                       # 风格范例（对比型，仅演示粒度与写法）
+│                       ├── example.md
+│                       └── papper{1..4}_{framework,component}.png  # 范例文档自己引用的图，仅此目录内成立
 │
 └── server/                        # MCP Email Server :8081
     ├── pom.xml
@@ -413,7 +551,7 @@ SuperAssistant/
             └── EmailMcpTools.java        # sendEmail / sendEmailBatch
 ```
 
-测试位于 `app/src/test/`：覆盖压缩阈值/估算器/截断器/Snip/MicroCompact/文件状态、`PromptSubmitHook`、checkpoint 保留策略等。
+测试位于 `app/src/test/`：覆盖压缩阈值/估算器/截断器/Snip/MicroCompact/文件状态、`PromptSubmitHook`、checkpoint 保留策略、调研产出的路径规则（`WorkspacePathsTest` / `AnalysisPathTest`）、审查结论的解析与三分路由（`ReviewResultTest`）等。`PaperFigureToolTest` 与 `PaperTextToolTest` 用 PDFBox **构造真 PDF** 作 fixture（真嵌入图、真解码），验证落盘位置、两种相对路径形态、小图过滤、同调用内去重、页码夹取、越界与敌意输入被拒、重跑幂等。其余子 Agent 的"是否真的落盘/读回"需要活的模型，由端到端验证覆盖，不做单测。
 
 ## API 参考
 
@@ -423,8 +561,11 @@ SuperAssistant/
 |--------|------|---------|----------|
 | POST | `/api/chat/{threadId}` | `{"message":"...", "mode":"Default|PlanMode"}` | `{type:"ANSWER", response:"..."}` 或 `{type:"INTERRUPTED", pendingApprovals:[...]}` |
 | POST | `/api/chat/{threadId}/approve` | `{"decisions":[{"toolId","result","description?","editedArguments?"}]}` | 同 chat 响应格式 |
+| GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，事件名 `progress`（`ProgressEvent`）/ `done`（运行结束） |
 
 响应中额外包含 `planEnabled` / `planActive` 字段反映计划模式状态。
+
+`stream` 是独立于 POST 的第二条连接，需**在发 POST 之前**打开——工作流可能在毫秒内就推送第一个阶段事件。POST 返回后服务端关闭该流（先发 `done`）。
 
 ### 知识库
 
@@ -501,7 +642,8 @@ agent.guard:
   model-retry:  { max-attempts: 3, initial-delay-ms: 500, max-delay-ms: 8000, backoff-multiplier: 2.0 }
   tool-retry:   { max-retries: 2,  initial-delay-ms: 300, max-delay-ms: 3000, backoff-factor: 2.0 }
   loop:         { max-model-calls-per-run: 15, max-model-calls-per-thread: 60,
-                  max-total-tool-calls: 60, max-identical-calls: 3 }
+                  max-total-tool-calls: 60, max-identical-calls: 3,
+                  max-model-calls-per-paper: 8 }   # analyst-agent 单篇精读的调用上限
 
 # checkpoint 保留策略（定时清理）
 agent.checkpoint-retention:
@@ -606,6 +748,20 @@ POST /api/chat/test-001/approve
 | `GRAPH_THREAD` / `GRAPH_CHECKPOINT` | MysqlSaver 图状态快照，`CheckpointRetentionService` 定时清理 |
 | `plan_task` / `plan_step` | 计划子系统遗留表（对应代码已移除，可忽略） |
 | `agent_run_log` | Agent 运行日志（`AgentRunLogService` 已实现，暂无调用方） |
+
+## 已知限制
+
+- **文档体量仍随论文数线性增长，因此超大规模调研仍可能触及输出上限。** `writer-agent` 把整篇文档作为 `writeResearchDocument` 的**一个参数**输出，`deepseek-chat` 的 8192 token 输出上限已是上限值，**调大参数解决不了**。
+  **本次重构把触发点推远了一个量级**：四维信息改为逐篇落盘到 `analysis/`，文档只做归纳与对比，体量从 `N × 四维全文` 降为 `N × 一句话 + 对比`（实测 2 篇论文的文档从 22,031 字符降到数千字符量级）。现实规模（4-8 篇）下不再逼近上限。
+  **但没有消除这个上限**：文档仍与论文数成正比，论文数足够多时同样会截断。届时需要给 `writeResearchDocument` 增加 append / 分段语义（`appendDocumentSection`），尚未实现。
+  当前行为是**安全**的：异常被工作流捕获，如实回报失败，不会落盘半篇文档、也不会声称成功。
+- **修订轮次上限 2 轮**（`ResearchWriteReviewWorkflow.MAX_ROUNDS`，与 `review-guide.md` 一致）。实测常见情况是第 2 轮已把问题收敛到少量 MINOR 项，但预算耗尽——此时工作流按未通过上报，由主 Agent 如实转告用户。
+- 审查期间会把整篇文档、调研材料与 `analysis/` 清单一并注入 reviewer 上下文，两篇论文量级约 2 万字符；更多论文时需关注上下文占用（精读正文由 reviewer 自己按需读取，不预先注入）。
+- **精读与写作不具备逐篇 SSE 进度**：`analyzePapers` 在一个 Java 循环里连续调用 `analyst-agent`，拿不到 `ToolContext` 的 `threadId`，因此逐篇精读只体现在 `WRITING` 阶段的文案上（"精读论文并撰写文档"）。要逐篇推送需把 analyst 提为工作流的独立阶段，与"由 writer 提供工具触发"的设计冲突。
+- **文档里的图只来自 `extractPaperFigures` 的嵌入图，取不到时降级为文字指路。** 早期版本是"产出中一律不内嵌图片"，理由是模型自己拼相对路径必错——这个观察是对的，但结论错了：解法是**禁止拼路径**而不是禁止图片。现在路径由工具给出、由 agent 逐字复制，所以断链成了可判定的错误（reviewer 拿图片清单纯字符串核对）。**范例与实跑因此彻底解耦**：`example/example.md` 引用的是**与自己同目录**的 `papper*.png`（示范图放哪、图注怎么写），实跑文档引用的是 `analysis/figures/{短名}_p{页}_{序}.png`，两者不共享任何路径，实跑**不得**引用 skill 目录下的任何文件。
+- **矢量图形与扫描版 PDF 取不到图。** 工具读的是 PDF 里**原生嵌入的图片对象**（`PDResources.getXObjectNames()` + `PDImageXObject.getImage()`），不做整页栅格化。整页渲染可兜底，但会带进整页版面与文字，还需要新的依赖取舍与尺寸策略，本次未做。此时工具返回降级话术，analysis 文件里写「图见原文 Fig. N (p.X)」而不引用图片。
+- **JBIG2 / JPEG2000 压缩的嵌入图可能无法解码。** `jbig2-imageio` 在 PDFBox 自己的 pom 里是 test-scope，**不在本应用的运行时 classpath**（PDFBox 3.0.5，经 `spring-ai-pdf-document-reader:2.0.0-M1` 传递引入）。这类图逐张 `catch` 跳过并在返回体里记 `undecodable: N 张无法解码 — p.5 /Im3 (…)`，其余图照常导出。是否需要引入该依赖，等实跑数据再定。
+- **`extractPaperFigures` 的图片识别有两条保守过滤**：任一边小于 `min-figure-pixels`（默认 120px）视为图标/装饰跳过；同一次调用内**逐像素 CRC 相同**的图只保留第一张（页眉页脚 logo）。单次调用最多导出 `max-figures`（默认 8）张，达上限时返回体记 `truncated` 并提示用更窄的页码范围重试。代价是：真正的第 9 张之后的图不会被导出，而"哪一张是 Fig. 3"仍需 analyst 按图注确认——嵌入图自身不带图号。
 
 ## 注意事项
 

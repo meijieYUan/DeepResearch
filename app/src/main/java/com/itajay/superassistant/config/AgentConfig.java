@@ -9,14 +9,11 @@ import com.alibaba.cloud.ai.graph.agent.hook.skills.SkillsAgentHook;
 import com.alibaba.cloud.ai.graph.agent.interceptor.toolerror.ToolErrorInterceptor;
 import com.alibaba.cloud.ai.graph.agent.interceptor.toolretry.ToolRetryInterceptor;
 import com.alibaba.cloud.ai.graph.checkpoint.savers.mysql.MysqlSaver;
-import com.itajay.superassistant.agent.ResearchAgent;
-import com.itajay.superassistant.agent.ReviewerAgent;
-import com.itajay.superassistant.agent.WriterAgent;
 import com.itajay.superassistant.compact.CompactHook;
 import com.itajay.superassistant.interceptor.LoopGuardToolInterceptor;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.CreateAgentTool;
-import com.itajay.superassistant.workflow.ResearchWriteWorkflow;
+import com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow;
 import com.itajay.superassistant.interceptor.PlanModeToolInterceptor;
 import com.itajay.superassistant.prompt.PromptSubmitHook;
 import com.itajay.superassistant.rag.RagAgent;
@@ -51,7 +48,20 @@ public class AgentConfig {
             - **Web research**: use the web search and crawl tools. Do not use curl/wget in the terminal.
             - **Task management**: decompose work into tracked todo tasks. Use the task tools to create, start, complete, and query tasks.
             - **Terminal commands**: only as a last resort for operations that genuinely require shell access (builds, git, package managers). Every terminal command requires human approval.
-            - **Sub-agents**: delegate specialized work (research, writing, review, RAG queries) to the appropriate sub-agent. Do not try to do everything yourself.
+            - **Research documents**: the research, close-reading, writing, and review agents are **not** available
+              as individual tools. Literature reviews, surveys, and research reports go through the
+              `researchWriteReview` workflow, which runs them all in order and revises when the review finds
+              problems. Call it once per topic and wait for it to finish — it is slow (many minutes), because it
+              downloads papers, close-reads each one, and reviews the result. Never try to do the research or the
+              writing yourself.
+              Begin the topic argument with a **short, stable identifier** (a few words, e.g. "多主体布局控制"):
+              it becomes the folder under `investigation/` that holds the papers, the per-paper analyses and the
+              document, so a long sentence creates an unusable directory and defeats reuse across conversations.
+              Put the time range, paper count and language after it. When the result reports the document did
+              **not** pass review, tell the user the remaining issues as-is — never present an unverified document
+              as finished work. The per-paper analyses are kept on disk; mention their location, since the user can
+              open them directly.
+            - **Knowledge questions**: delegate professional/domain questions to the RAG agent.
 
             ## Safety Rules (CRITICAL — violations are unacceptable)
             1. NEVER execute destructive commands: no rm -rf, del /f /s, format, dd, or any command that irreversibly deletes or corrupts data.
@@ -75,7 +85,9 @@ public class AgentConfig {
             - Simple requests: respond directly with the appropriate tool.
             - Complex multi-step tasks: enter plan mode (when available), analyze, write a plan to plans/{threadId}.md, present it, and wait for approval.
             - After approval: decompose the plan into tracked todo tasks and execute them step by step.
-            - For research+writing: use the researchWrite workflow (one-stop research->write pipeline).
+            - For research+writing: use the researchWriteReview workflow. It handles research, close reading,
+              writing, and review in one call, including a revision round if the review fails. Do not decompose
+              it into sub-agent calls.
             - Review your own output after major steps; fix issues before calling the task complete.
             """;
 
@@ -91,11 +103,8 @@ public class AgentConfig {
                                  PlanTool planTool,
                                  TerminalTool terminalTool,
                                  RagAgent ragAgent,
-                                 ResearchAgent researchAgent,
-                                 WriterAgent writerAgent,
-                                 ReviewerAgent reviewerAgent,
                                  CreateAgentTool createAgentTool,
-                                 ResearchWriteWorkflow researchWriteWorkflow,
+                                 ResearchWriteReviewWorkflow researchWriteReviewWorkflow,
                                  SkillsAgentHook skillsAgentHook,
                                  MysqlSaver mysqlSaver,
                                  ModelMessagePersistenceHook modelMessagePersistenceHook,
@@ -119,20 +128,24 @@ public class AgentConfig {
                         .description("批量邮件发送需要人工审批，发送前可编辑收件人列表/主题/正文").build())
                 .build();
 
-        // Wrap each sub-agent as an AgentTool so the main agent can call them directly
+        // The RAG agent stays individually callable: it answers domain questions and is
+        // unrelated to the research-document pipeline.
+        //
+        // The research / analyst / writer / reviewer agents deliberately are NOT exposed
+        // here. They are stages of the researchWriteReview workflow, and exposing them
+        // individually let the main agent run a stage out of order or skip the review
+        // gate entirely. The analyst is not even a workflow stage — its only entry point
+        // is the writer's analyzePapers tool, so it has no reason to exist in this list.
         ToolCallback ragTool = AgentTool.create(ragAgent.reactAgent);
-        ToolCallback researchTool = AgentTool.create(researchAgent.reactAgent);
-        ToolCallback writerTool = AgentTool.create(writerAgent.reactAgent);
-        ToolCallback reviewerTool = AgentTool.create(reviewerAgent.reactAgent);
 
         var builder = ReactAgent.builder()
                 .name("main-agent")
-                .description("Main agent: handles user interaction, planning, tool orchestration, and sub-agent delegation.")
+                .description("Main agent: handles user interaction, planning, tool orchestration, and workflow delegation.")
                 .model(chatModel)
                 .instruction(MAIN_AGENT_INSTRUCTION)
                 .methodTools(todoTool, webSearchTool, fileOperationTool, memoryTool,
-                             planTool, terminalTool, createAgentTool, researchWriteWorkflow)
-                .tools(ragTool, researchTool, writerTool, reviewerTool)
+                             planTool, terminalTool, createAgentTool, researchWriteReviewWorkflow)
+                .tools(ragTool)
                 .hooks(compactHook, skillsAgentHook, humanInTheLoopHook,
                        modelCallLimitHook, modelMessagePersistenceHook)
                 .interceptors(promptSubmitHook,

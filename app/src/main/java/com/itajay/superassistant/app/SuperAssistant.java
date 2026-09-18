@@ -6,13 +6,16 @@ import com.alibaba.cloud.ai.graph.action.InterruptionMetadata;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.itajay.superassistant.plan.PlanContextHolder;
 import com.itajay.superassistant.plan.PlanModeContext;
+import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.security.ApprovalDecision;
 import com.itajay.superassistant.security.HITLHelper;
 import com.itajay.superassistant.security.PendingInterruptionStore;
 import com.itajay.superassistant.service.ChatMessagePersistenceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -28,13 +31,36 @@ public class SuperAssistant {
     private final ReactAgent mainAgent;
     private final PendingInterruptionStore pendingInterruptionStore;
     private final ChatMessagePersistenceService messagePersistenceService;
+    private final ProgressChannelRegistry progressChannels;
 
     public SuperAssistant(ReactAgent mainAgent,
                           PendingInterruptionStore pendingInterruptionStore,
-                          ChatMessagePersistenceService messagePersistenceService) {
+                          ChatMessagePersistenceService messagePersistenceService,
+                          ProgressChannelRegistry progressChannels) {
         this.mainAgent = mainAgent;
         this.pendingInterruptionStore = pendingInterruptionStore;
         this.messagePersistenceService = messagePersistenceService;
+        this.progressChannels = progressChannels;
+    }
+
+    /**
+     * Progress stream for a conversation thread.
+     *
+     * <p>A separate connection from {@code POST /chat/{threadId}}, which stays
+     * blocking. Keeping the run synchronous is deliberate: the run holds a
+     * thread-local plan-mode context and can suspend for human approval, and both
+     * assume one thread for the whole run. This endpoint exists purely so a long
+     * workflow can report where it is while that request is still in flight.</p>
+     *
+     * <p>The client opens this before sending the chat request and closes it when
+     * the POST returns. Nothing here is required for correctness — if no one is
+     * listening, the run proceeds and the POST response is the authoritative
+     * result.</p>
+     */
+    @GetMapping(value = "/chat/{threadId}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter stream(@PathVariable String threadId) {
+        log.debug("Progress stream opened [thread={}]", threadId);
+        return progressChannels.register(threadId);
     }
 
     @PostMapping("/chat/{threadId}")
@@ -75,6 +101,9 @@ public class SuperAssistant {
             return errorResponse(e.getMessage());
         } finally {
             PlanContextHolder.clear();
+            // The run is over, so the progress stream has nothing left to report.
+            // The POST response carries the result; the client closes its side too.
+            progressChannels.complete(threadId);
         }
     }
 
@@ -125,6 +154,12 @@ public class SuperAssistant {
             return errorResponse(e.getMessage());
         } finally {
             PlanContextHolder.clear();
+            // Only close the stream when the run really finished. An interruption means
+            // the run is paused, not done, so the client keeps listening across the
+            // approval round-trip.
+            if (pendingInterruptionStore.get(threadId) == null) {
+                progressChannels.complete(threadId);
+            }
         }
     }
 

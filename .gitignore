@@ -45,3 +45,6 @@ startup.log
 
 # Lucene BM25 索引
 data/
+
+# 调研产出：下载的论文 PDF 与生成的调研文档
+investigation/
