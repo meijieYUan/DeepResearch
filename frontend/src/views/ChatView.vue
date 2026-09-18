@@ -550,9 +550,12 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* Reading column: fluid up to --chat-max, then centered. Keeps ultrawide
-   displays readable while still filling the space freed by collapsing a sidebar. */
-.chat-layout { display: flex; height: 100%; --chat-max: 1400px; }
+/* The chat area is a fixed-width card centred in the space beside the thread
+   sidebar. The sidebar stays flush and full-height; the card floats on the
+   ambient background, so an ultrawide monitor widens the margin rather than
+   stretching the reading column. `gap` guarantees the card never butts up
+   against the sidebar once the auto margins have collapsed. */
+.chat-layout { display: flex; height: 100%; --chat-width: 1100px; gap: 14px; }
 
 .thread-sidebar {
   position: relative;
@@ -589,7 +592,16 @@ onMounted(() => {
 .thread-delete:hover { background: rgba(220,38,38,.10); }
 .no-threads { padding: 24px 12px; font-size: 12.5px; color: var(--text2); text-align: center; }
 
-.chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: transparent; }
+.chat-main {
+  flex: 0 1 var(--chat-width); width: 100%; max-width: var(--chat-width);
+  /* Centred by auto margins; `flex: 0 1` keeps the card from stretching once the
+     sidebar leaves more room than the card needs. */
+  margin: 14px auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
 .chat-header {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
   height: 58px; padding: 0 24px; flex-shrink: 0;
@@ -645,7 +657,7 @@ onMounted(() => {
 }
 .progress-stage-detail { opacity: .75; }
 
-.message { display: flex; gap: 12px; max-width: var(--chat-max); margin: 0 auto 22px; animation: msgIn .28s ease; }
+.message { display: flex; gap: 12px; max-width: 100%; margin: 0 auto 22px; animation: msgIn .28s ease; }
 @keyframes msgIn { from { opacity: 0; transform: translateY(8px); } }
 .message.user { flex-direction: row-reverse; }
 .msg-avatar {
@@ -669,7 +681,7 @@ onMounted(() => {
 .approval-actions { display: flex; gap: 6px; }
 .composer { flex-shrink: 0; padding: 14px 24px 20px; background: var(--bg2); border-top: 1px solid var(--border); }
 .composer-inner {
-  display: flex; gap: 8px; align-items: flex-end; max-width: var(--chat-max); margin: 0 auto;
+  display: flex; gap: 8px; align-items: flex-end; max-width: 100%; margin: 0 auto;
   background: var(--bg); border: 1px solid var(--border-strong); border-radius: 16px;
   padding: 6px 6px 6px 14px;
   transition: border-color .15s, box-shadow .15s;
@@ -683,9 +695,12 @@ onMounted(() => {
 .send-btn { padding: 9px; border-radius: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 
 @media (max-width: 720px) {
-  .chat-layout { position: relative; }
+  .chat-layout { position: relative; gap: 0; }
   .thread-sidebar { display: none; }
   .header-left .icon-btn { display: none; }
+  /* Below the card width the floating shell is all margin and no content: drop
+     it so the chat uses the full viewport instead of shrinking into a strip. */
+  .chat-main { margin: 0; border: none; border-radius: 0; box-shadow: none; }
   .chat-messages, .composer { padding-left: 14px; padding-right: 14px; }
   .task-panel { width: calc(100% - 28px); }
   .msg-body { max-width: 86%; }
@@ -707,7 +722,7 @@ onMounted(() => {
 
 /* Collapsible task panel */
 .task-panel {
-  width: calc(100% - 48px); max-width: var(--chat-max); margin: 0 auto 10px;
+  width: calc(100% - 48px); max-width: 100%; margin: 0 auto 10px;
   background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
   box-shadow: var(--shadow); overflow: hidden;
 }

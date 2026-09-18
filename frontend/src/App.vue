@@ -121,7 +121,10 @@ onUnmounted(() => clearInterval(timer))
 </script>
 
 <style scoped>
-.app-shell { display: flex; height: 100%; }
+/* `flex: 1` is load-bearing: #app is a flex container, so without it the shell
+   shrink-wraps to its content and the chat card's fixed width has nothing to
+   centre within. */
+.app-shell { flex: 1; display: flex; height: 100%; min-width: 0; }
 .sidebar {
   position: relative;
   width: var(--sb-width, 232px);
