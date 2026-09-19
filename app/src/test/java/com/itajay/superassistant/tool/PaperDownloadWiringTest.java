@@ -2,6 +2,7 @@ package com.itajay.superassistant.tool;
 
 import com.itajay.superassistant.config.PaperDownloadProperties;
 import com.itajay.superassistant.config.PaperDownloadPropertiesConfig;
+import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.tool.annotation.Tool;
@@ -27,6 +28,7 @@ class PaperDownloadWiringTest {
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of(ConfigurationPropertiesAutoConfiguration.class))
             .withUserConfiguration(PaperDownloadPropertiesConfig.class,
+                    ProgressChannelRegistry.class,
                     PaperDownloadTool.class, PaperTextTool.class);
 
     @Test

@@ -1,6 +1,7 @@
 package com.itajay.superassistant.workflow;
 
 import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.alibaba.cloud.ai.graph.agent.tools.ToolContextHelper;
 import com.alibaba.cloud.ai.graph.exception.GraphRunnerException;
@@ -11,6 +12,7 @@ import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.progress.ProgressEvent;
 import com.itajay.superassistant.progress.ProgressStage;
 import com.itajay.superassistant.tool.AnalysisStore;
+import com.itajay.superassistant.tool.PaperAnalysisTool;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,15 +73,18 @@ public class ResearchWriteReviewWorkflow {
     private final ResearchAgent researchAgent;
     private final WriterAgent writerAgent;
     private final ReviewerAgent reviewerAgent;
+    private final PaperAnalysisTool paperAnalysisTool;
     private final ProgressChannelRegistry progress;
 
     public ResearchWriteReviewWorkflow(ResearchAgent researchAgent,
                                        WriterAgent writerAgent,
                                        ReviewerAgent reviewerAgent,
+                                       PaperAnalysisTool paperAnalysisTool,
                                        ProgressChannelRegistry progress) {
         this.researchAgent = researchAgent;
         this.writerAgent = writerAgent;
         this.reviewerAgent = reviewerAgent;
+        this.paperAnalysisTool = paperAnalysisTool;
         this.progress = progress;
     }
 
@@ -136,15 +141,25 @@ public class ResearchWriteReviewWorkflow {
 
         try {
             publish(threadId, ProgressStage.RESEARCHING, 1, "开始检索与筛选论文");
-            materials = invoke(researchAgent.reactAgent, researchInput(topicId, brief), "research-agent");
+            materials = invoke(researchAgent.reactAgent, researchInput(topicId, brief),
+                    configFor(threadId), "research-agent");
 
             while (rounds < MAX_ROUNDS) {
                 rounds++;
 
                 publish(threadId, ProgressStage.WRITING, rounds,
                         rounds == 1 ? "开始精读论文并撰写文档" : "按审查意见修订文档");
+                // The workflow, not the writer, drives the batch analysis and waits on
+                // it here (Java-side; the model never polls). The final index then
+                // travels in the writer's input — the "analysis complete" callback the
+                // model actually sees. Repeating it every round is deliberate: when
+                // everything is already analysed this is just an enumeration plus a
+                // render, and it lets the index reflect any reanalyzePaper the writer
+                // did in the previous round.
+                String analysisIndex = paperAnalysisTool.analyzeTopicSync(topicId, threadId, rounds);
                 documentOutput = invoke(writerAgent.reactAgent,
-                        writerInput(topicId, brief, materials, review), "writer-agent");
+                        writerInput(topicId, brief, materials, analysisIndex, review),
+                        configFor(threadId), "writer-agent");
 
                 publish(threadId, ProgressStage.REVIEWING, rounds, "开始质量审查");
                 reviewed = readBack(documentPath, documentOutput);
@@ -165,7 +180,8 @@ public class ResearchWriteReviewWorkflow {
                     publish(threadId, ProgressStage.RESEARCHING, rounds + 1,
                             "审查要求补充材料，重新检索");
                     materials = invoke(researchAgent.reactAgent,
-                            researchRevisionInput(topicId, materials, review), "research-agent");
+                            researchRevisionInput(topicId, materials, review),
+                            configFor(threadId), "research-agent");
                 } else {
                     publish(threadId, ProgressStage.REVISING, rounds,
                             review.needsAnalyst() ? "审查指出精读结果有误，重做后修订" : "审查未通过，仅修订文档");
@@ -237,15 +253,24 @@ public class ResearchWriteReviewWorkflow {
     }
 
     /** Writer input for round 1 (materials only) and later rounds (materials plus findings). */
-    private String writerInput(String topicId, String brief, String materials, ReviewResult previousReview) {
+    private String writerInput(String topicId, String brief, String materials,
+                               String analysisIndex, ReviewResult previousReview) {
         StringBuilder sb = new StringBuilder();
         sb.append("课题方向：").append(topicId).append("\n\n");
         sb.append("本次调研的要求：\n").append(brief.strip()).append("\n\n");
         sb.append("""
                 以下是 research-agent 交付的调研材料（候选池、相关性判定表、下载清单）。
-                请先调用 analyzePapers(topic) 让每篇已下载论文完成精读并落盘到 analysis/，
-                再按需读取、按 template/template.md 撰写对比型文档，最后调用 writeResearchDocument 保存。
-                课题方向必须与材料中使用的完全一致。
+                论文精读已由工作流完成并落盘到 analysis/，最终索引如下（以「论文精读完成：」开头）。
+
+                --- 精读最终索引 ---
+                """);
+        sb.append(analysisIndex == null || analysisIndex.isBlank()
+                ? "（精读未产出索引——该情况属于异常，请如实向调用方报告，不得凭材料编造分析内容）"
+                : analysisIndex.strip()).append("\n--- 索引结束 ---\n\n");
+        sb.append("""
+                你**不需要**调用 analyzePapers(topic) 批量分析——结果已经在上面。
+                请按需读取（readPaperAnalysis）、按 template/template.md 撰写对比型文档，
+                最后调用 writeResearchDocument 保存。课题方向必须与材料中使用的完全一致。
 
                 --- 调研材料 ---
                 """);
@@ -650,9 +675,20 @@ public class ResearchWriteReviewWorkflow {
      * which is why every input is assembled explicitly above.</p>
      */
     private String invoke(ReactAgent agent, String input, String name) {
+        return invoke(agent, input, null, name);
+    }
+
+    /**
+     * Same, with a run config. The config carries the conversation threadId, which
+     * is how the sub-agent's own tool calls (e.g. {@code downloadPaper}) get a
+     * populated {@code ToolContext} — without it, per-paper progress events would
+     * have no channel to reach. The thread runs alone, so reusing the conversation's
+     * threadId cannot collide with another run.
+     */
+    private String invoke(ReactAgent agent, String input, RunnableConfig config, String name) {
         Optional<OverAllState> result;
         try {
-            result = agent.invoke(input);
+            result = config == null ? agent.invoke(input) : agent.invoke(input, config);
         } catch (GraphRunnerException e) {
             // Name the stage: "workflow failed" alone does not say which agent broke.
             throw new IllegalStateException(name + " failed to run: " + e.getMessage(), e);
@@ -662,6 +698,11 @@ public class ResearchWriteReviewWorkflow {
             log.warn("{} returned no output", name);
         }
         return output;
+    }
+
+    /** The conversation's thread as a run config, or null when the thread is unknown. */
+    private static RunnableConfig configFor(String threadId) {
+        return threadId == null ? null : RunnableConfig.builder().threadId(threadId).build();
     }
 
     /**

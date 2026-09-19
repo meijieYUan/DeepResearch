@@ -1,11 +1,17 @@
 package com.itajay.superassistant.tool;
 
+import com.alibaba.cloud.ai.graph.RunnableConfig;
+import com.alibaba.cloud.ai.graph.agent.tools.ToolContextHelper;
 import com.itajay.superassistant.config.PaperDownloadProperties;
+import com.itajay.superassistant.progress.ProgressChannelRegistry;
+import com.itajay.superassistant.progress.ProgressEvent;
+import com.itajay.superassistant.progress.ProgressStage;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -66,10 +72,12 @@ public class PaperDownloadTool {
             Pattern.CASE_INSENSITIVE);
 
     private final PaperDownloadProperties props;
+    private final ProgressChannelRegistry progress;
     private final HttpClient httpClient;
 
-    public PaperDownloadTool(PaperDownloadProperties props) {
+    public PaperDownloadTool(PaperDownloadProperties props, ProgressChannelRegistry progress) {
         this.props = props;
+        this.progress = progress;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
                 .followRedirects(HttpClient.Redirect.NORMAL)
@@ -91,7 +99,8 @@ public class PaperDownloadTool {
     public String downloadPaper(
             @ToolParam(description = "课题方向, the research topic. Becomes the topic folder name — keep it identical across the whole investigation so the same topic reuses one folder.") String topic,
             @ToolParam(description = "URL of the PDF, arXiv abs page, DOI, or publisher landing page") String url,
-            @ToolParam(description = "Short name used as the filename, e.g. 'MS-Diffusion'. Letters, digits, dash, underscore, dot only.") String shortName) {
+            @ToolParam(description = "Short name used as the filename, e.g. 'MS-Diffusion'. Letters, digits, dash, underscore, dot only.") String shortName,
+            ToolContext toolContext) {
 
         if (url == null || url.isBlank()) {
             return "Error: url is required.";
@@ -118,13 +127,16 @@ public class PaperDownloadTool {
         // the same paper under the same short name is a no-op. A different shortName
         // for the same paper will fetch it again.
         String normalizedUrl = url.trim();
+        String threadId = threadIdOf(toolContext);
         if (Files.isRegularFile(target)) {
             Integer pages = PaperStore.pageCount(target);
             if (pages != null) {
+                publishDownload(threadId, "论文已存在，跳过下载：" + shortName);
                 return ok(target, pages, PaperStore.sha256(target), "already downloaded — skipped")
                         + "\n(If this is a different paper, choose a different shortName.)";
             }
         }
+        publishDownload(threadId, "开始下载论文：" + shortName);
 
         List<String> candidates = buildCandidates(normalizedUrl);
         List<String> failures = new ArrayList<>();
@@ -137,7 +149,7 @@ public class PaperDownloadTool {
                 continue;
             }
             if (outcome.bytes() != null) {
-                return saveAndReport(outcome, target, failures);
+                return finish(outcome, target, failures, threadId, shortName);
             }
             if (outcome.html() != null) {
                 lastHtml = outcome.html();
@@ -152,7 +164,7 @@ public class PaperDownloadTool {
             for (String link : discovered) {
                 FetchOutcome outcome = fetch(link, failures);
                 if (outcome != null && outcome.bytes() != null) {
-                    return saveAndReport(outcome, target, failures);
+                    return finish(outcome, target, failures, threadId, shortName);
                 }
             }
             if (!discovered.isEmpty()) {
@@ -162,6 +174,7 @@ public class PaperDownloadTool {
             }
         }
 
+        publishDownload(threadId, "下载失败：" + shortName + "（将尝试其他来源或降级为仅摘要）");
         return "DOWNLOAD_FAILED: " + normalizedUrl + "\n"
                 + "Attempts:\n" + formatFailures(failures) + "\n"
                 + "Next: try an alternative source (arXiv mirror, OpenReview, author homepage), "
@@ -179,6 +192,44 @@ public class PaperDownloadTool {
     public String listDownloadedPapers(
             @ToolParam(description = "课题方向, the research topic whose papers should be listed") String topic) {
         return PaperStore.listPdfs(topic);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Progress
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Wraps {@link #saveAndReport} so the SSE channel learns the outcome either way.
+     * Downloads are the only visible heartbeat during the research stage — a search
+     * pass takes minutes, and without these events a frontend user has no way to
+     * tell progress from a hang.
+     */
+    private String finish(FetchOutcome outcome, Path target, List<String> failures,
+                          String threadId, String shortName) {
+        String result = saveAndReport(outcome, target, failures);
+        if (result.startsWith("DOWNLOAD_FAILED")) {
+            publishDownload(threadId, "下载失败：" + shortName + "（该来源不可用，换源或降级为仅摘要）");
+        } else {
+            publishDownload(threadId, "已下载论文：" + shortName);
+        }
+        return result;
+    }
+
+    /** The conversation thread for SSE, or null when the caller carried no config. */
+    private static String threadIdOf(ToolContext toolContext) {
+        if (toolContext == null) {
+            return null;
+        }
+        return ToolContextHelper.getConfig(toolContext)
+                .flatMap(RunnableConfig::threadId)
+                .orElse(null);
+    }
+
+    /** Best-effort publish; a no-op when no client is listening or the thread is unknown. */
+    private void publishDownload(String threadId, String detail) {
+        if (progress != null) {
+            progress.publish(threadId, ProgressEvent.of(ProgressStage.RESEARCHING, 0, detail));
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────

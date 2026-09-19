@@ -38,7 +38,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 **为什么精读不并进 writer-agent**：四维信息曾经由 writer 在上下文里提取、再全文写进文档，结果是文档体量 = 论文数 × 四维全文，两篇论文就已逼近模型的单次输出上限，第三篇必然中途截断、整轮运行终止。现在精读一次落盘（每篇一个文件），文档只做归纳与对比，体量与论文数解耦。**不要把精读结果再抄回文档**——那会把这个设计推翻。
 
-**为什么 analyst 不是一个独立的工作流阶段**：它由 `writer-agent` 的 `analyzePapers` 工具按论文逐篇调用，调用方是 Java 循环，保证每篇已下载论文都有一份分析文件；已分析的会自动跳过，因此中断后重跑不会重复劳动。
+**为什么 analyst 不是一个独立的工作流阶段**：它由 `analyzePapers` 工具按论文调用，调用方是 Java（工作流在 writer 运行前并行精读全部论文，路数受配置限制），保证每篇已下载论文都有一份分析文件；已分析的会自动跳过，因此中断后重跑不会重复劳动。
 
 参考文件相对本 skill 根目录的路径为 `references/*.md`。读取时使用相对 skill 根目录的路径或绝对路径（skill 根目录即包含本 `SKILL.md` 的目录）。`template/template.md` 与 `example/example.md` 为撰写阶段的模板与范例，同样通过文件读取方式获取。
 
@@ -87,7 +87,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
    │      用 extractPaperText 逐篇读正文，公式逐字核对
    │      概要与作者意图 / 方法框架 / 关键机制与创新点 / 训练目标
    │      → 落盘 investigation/{课题方向}/analysis/{论文短名}.md
-   │      用 listPaperFigures 看图注选图，再用 extractPaperFigures 截取（至多 2 张，取不到则降级为"图见原文 Fig. N"）
+   │      用 listPaperFigures 看图注选图，再用 extractPaperFigures 截取（只截方法框架图/关键机制图，一般 1-4 张，没有就一张不截并降级为"图见原文 Fig. N"）
    │      → 落盘 analysis/figures/{论文短名}_Fig{N}.png
    │
    ├─ 第四步 撰写调研文档 ─────────────── writer-agent
@@ -145,7 +145,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 **由 `analyst-agent` 执行**，逐篇调用，一次只处理一篇论文（只有它有读取 PDF 正文与截图的工具）。执行细则见 `references/analysis-guide.md`。
 
-`writer-agent` 调用 `analyzePapers(topic)` 触发：工具枚举该课题下所有已下载论文，**跳过已有分析文件的**，对每篇调用一次 analyst，并把结果落盘。单篇失败不中断整批，会在返回索引中列出。
+触发方式：工作流在 writer 运行前调用 `analyzePapers(topic)` 的批量路径（Java 阻塞等待、多篇并行），最终索引随 writer 的输入交付——**writer 不轮询、不批量调用**。单篇失败不中断整批，在最终索引中列出；对失败论文可调用 `analyzePapers(topic, "论文短名")` 单篇重试，重试仍失败才按 ABSTRACT_ONLY 处理。
 
 对每篇论文，analyst 用 `extractPaperText(topic, pathOrName, startPage, endPage)` 读取正文，提取四个维度：
 
@@ -158,7 +158,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 产出通过 `writePaperAnalysis(topic, paperShortName, sourceLevel, oneLineSummary, content)` 落盘到 `investigation/{课题方向}/analysis/{论文短名}.md`。**来源等级由 analyst 如实声明**，写在文件头部，供后续核对。
 
-图片先用 `listPaperFigures(topic, pathOrName)` 取图注索引（只读文字，不落盘），再用 `extractPaperFigures(topic, pathOrName, figures = "Fig. 2")` 按图号截取，落盘到 `analysis/figures/`，**每篇至多 2 张**。图号来自图注，所以文件名 `{论文短名}_Fig{N}.png` 里的号就是论文里的号。返回表同时给出"analysis 里怎么引用"与"文档里怎么引用"两种完整相对路径，analyst 把后者另起一行写进精读结果；扫描版或矢量图形取不到图时，如实降级为「图见原文 Fig. N（p.X）」，不引用别处的图。
+图片先用 `listPaperFigures(topic, pathOrName)` 取图注索引（只读文字，不落盘），再用 `extractPaperFigures(topic, pathOrName, figures = "Fig. 2")` 按图号截取，落盘到 `analysis/figures/`，**只截方法框架图或关键机制图，一般 1-4 张；论文中不存在这类图时一张不截，写降级行**。图号来自图注，所以文件名 `{论文短名}_Fig{N}.png` 里的号就是论文里的号。返回表同时给出"analysis 里怎么引用"与"文档里怎么引用"两种完整相对路径，analyst 把后者另起一行写进精读结果；扫描版或矢量图形取不到图时，如实降级为「图见原文 Fig. N（p.X）」，不引用别处的图。
 
 ## 第四步：撰写调研文档
 
@@ -185,7 +185,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 | # | 论文 | 年份/会议 | 来源等级 | 一句话定位 | 详细分析 |
 
 # 1. 逐篇定位
-## 1.1 {论文短名}      （2-4 句，不复述四维细节 + 至多 2 张图，路径逐字复制）
+## 1.1 {论文短名}      （2-4 句，不复述四维细节 + 该篇已有的图（至多 4 张），路径逐字复制）
 
 # 2. 对比分析
 ## 2.1 方法框架对比

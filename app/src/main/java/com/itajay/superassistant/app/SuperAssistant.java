@@ -1,10 +1,7 @@
 package com.itajay.superassistant.app;
 
-import com.alibaba.cloud.ai.graph.NodeOutput;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.action.InterruptionMetadata;
-import com.alibaba.cloud.ai.graph.agent.ReactAgent;
-import com.itajay.superassistant.plan.PlanContextHolder;
 import com.itajay.superassistant.plan.PlanModeContext;
 import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.security.ApprovalDecision;
@@ -17,55 +14,52 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 
+/**
+ * The chat endpoints. Both POSTs return {@code text/event-stream}: the response body
+ * <em>is</em> the run. See {@link ChatStreamingService} for the event protocol
+ * ({@code progress}/{@code delta}/{@code answer}/{@code interruption}/{@code error}/
+ * {@code done}).
+ *
+ * <p>{@code GET /chat/{threadId}/stream} remains as a debug-only listener for the
+ * progress events; the client-facing stream is the POST response itself.</p>
+ */
 @RestController
 @RequestMapping("/api")
 public class SuperAssistant {
 
     private static final Logger log = LoggerFactory.getLogger(SuperAssistant.class);
 
-    private final ReactAgent mainAgent;
+    private final ChatStreamingService chatStreamingService;
     private final PendingInterruptionStore pendingInterruptionStore;
     private final ChatMessagePersistenceService messagePersistenceService;
     private final ProgressChannelRegistry progressChannels;
 
-    public SuperAssistant(ReactAgent mainAgent,
+    public SuperAssistant(ChatStreamingService chatStreamingService,
                           PendingInterruptionStore pendingInterruptionStore,
                           ChatMessagePersistenceService messagePersistenceService,
                           ProgressChannelRegistry progressChannels) {
-        this.mainAgent = mainAgent;
+        this.chatStreamingService = chatStreamingService;
         this.pendingInterruptionStore = pendingInterruptionStore;
         this.messagePersistenceService = messagePersistenceService;
         this.progressChannels = progressChannels;
     }
 
-    /**
-     * Progress stream for a conversation thread.
-     *
-     * <p>A separate connection from {@code POST /chat/{threadId}}, which stays
-     * blocking. Keeping the run synchronous is deliberate: the run holds a
-     * thread-local plan-mode context and can suspend for human approval, and both
-     * assume one thread for the whole run. This endpoint exists purely so a long
-     * workflow can report where it is while that request is still in flight.</p>
-     *
-     * <p>The client opens this before sending the chat request and closes it when
-     * the POST returns. Nothing here is required for correctness — if no one is
-     * listening, the run proceeds and the POST response is the authoritative
-     * result.</p>
-     */
+    /** Debug listener for a thread's progress events. Not used by the chat client. */
     @GetMapping(value = "/chat/{threadId}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable String threadId) {
-        log.debug("Progress stream opened [thread={}]", threadId);
         return progressChannels.register(threadId);
     }
 
-    @PostMapping("/chat/{threadId}")
-    public Map<String, Object> chat(@PathVariable String threadId,
-                                    @RequestBody ChatRequest request) {
+    /**
+     * Starts one agent turn. Returns immediately; the run's output — tool progress,
+     * incremental model text, and one terminal event — streams back as the response
+     * body until {@code done}.
+     */
+    @PostMapping(value = "/chat/{threadId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter chat(@PathVariable String threadId,
+                           @RequestBody ChatRequest request) {
         log.info("Chat request [thread={}]: {}", threadId, request.message());
 
         String reqMode = request.mode() != null ? request.mode() : "Default";
@@ -77,45 +71,29 @@ public class SuperAssistant {
             RunnableConfig config = buildConfig(threadId);
             config.context().put("threadId", threadId);
             config.context().put("planEnabled", String.valueOf(planEnabled));
-            PlanContextHolder.setThreadId(threadId);
-            Optional<NodeOutput> result = mainAgent.invokeAndGetOutput(request.message(), config);
-
-            if (result.isEmpty()) {
-                return errorResponse("Agent returned empty result");
-            }
-
-            NodeOutput output = result.get();
-
-            if (output instanceof InterruptionMetadata metadata) {
-                pendingInterruptionStore.put(threadId, config, metadata, request.message());
-                return interruptionResponse(threadId, metadata, planEnabled);
-            }
-
-            Object answer = output.state().value("output").orElse(output.toString());
-            pendingInterruptionStore.remove(threadId);
-            return answerResponse(threadId, answer, planEnabled);
-
+            return chatStreamingService.start(threadId, request.message(), config, planEnabled);
         } catch (Exception e) {
-            log.error("Chat error [thread={}]", threadId, e);
+            log.error("Chat request failed before the run started [thread={}]", threadId, e);
             pendingInterruptionStore.remove(threadId);
-            return errorResponse(e.getMessage());
-        } finally {
-            PlanContextHolder.clear();
-            // The run is over, so the progress stream has nothing left to report.
-            // The POST response carries the result; the client closes its side too.
-            progressChannels.complete(threadId);
+            return chatStreamingService.rejected(threadId, e.getMessage());
         }
     }
 
-    @PostMapping("/chat/{threadId}/approve")
-    public Map<String, Object> approve(@PathVariable String threadId,
-                                       @RequestBody ApproveRequest request) {
+    /**
+     * Resumes a run that interrupted for human approval. Same stream semantics as
+     * {@link #chat}: the resumed run streams until its own terminal event. An
+     * approval can interrupt again (a second risky tool call), in which case the new
+     * pending interruption replaces the old one and the client can approve again.
+     */
+    @PostMapping(value = "/chat/{threadId}/approve", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter approve(@PathVariable String threadId,
+                              @RequestBody ApproveRequest request) {
         log.info("Approve request [thread={}]: {} decision(s)", threadId,
                 request.decisions() != null ? request.decisions().size() : 0);
 
         PendingInterruptionStore.PendingInterruption pending = pendingInterruptionStore.get(threadId);
         if (pending == null) {
-            return errorResponse("No pending interruption, threadId=" + threadId);
+            return chatStreamingService.rejected(threadId, "No pending interruption, threadId=" + threadId);
         }
 
         boolean planEnabled = PlanModeContext.isEnabled(threadId);
@@ -128,38 +106,11 @@ public class SuperAssistant {
                     .addHumanFeedback(resolved)
                     .build();
 
-            PlanContextHolder.setThreadId(threadId);
-            Optional<NodeOutput> result = mainAgent.invokeAndGetOutput(
-                    pending.inputMessage(), resumeConfig);
-
-            pendingInterruptionStore.remove(threadId);
-
-            if (result.isEmpty()) {
-                return errorResponse("Agent returned empty result after resume");
-            }
-
-            NodeOutput output = result.get();
-
-            if (output instanceof InterruptionMetadata metadata) {
-                pendingInterruptionStore.put(threadId, resumeConfig, metadata, pending.inputMessage());
-                return interruptionResponse(threadId, metadata, planEnabled);
-            }
-
-            Object answer = output.state().value("output").orElse(output.toString());
-            return answerResponse(threadId, answer, planEnabled);
-
+            return chatStreamingService.start(threadId, pending.inputMessage(), resumeConfig, planEnabled);
         } catch (Exception e) {
-            log.error("Approve error [thread={}]", threadId, e);
+            log.error("Approve request failed before the run resumed [thread={}]", threadId, e);
             pendingInterruptionStore.remove(threadId);
-            return errorResponse(e.getMessage());
-        } finally {
-            PlanContextHolder.clear();
-            // Only close the stream when the run really finished. An interruption means
-            // the run is paused, not done, so the client keeps listening across the
-            // approval round-trip.
-            if (pendingInterruptionStore.get(threadId) == null) {
-                progressChannels.complete(threadId);
-            }
+            return chatStreamingService.rejected(threadId, e.getMessage());
         }
     }
 
@@ -174,31 +125,6 @@ public class SuperAssistant {
                 .threadId(threadId)
                 .addMetadata("threadId", threadId)
                 .build();
-    }
-
-    private Map<String, Object> interruptionResponse(String threadId, InterruptionMetadata metadata, boolean planEnabled) {
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("type", "INTERRUPTED");
-        response.put("threadId", threadId);
-        response.put("message", "High-risk operations require approval");
-        response.put("pendingApprovals", HITLHelper.getPendingApprovals(metadata));
-        response.put("planEnabled", planEnabled);
-        response.put("planActive", PlanModeContext.isActive(threadId));
-        return response;
-    }
-
-    private Map<String, Object> answerResponse(String threadId, Object answer, boolean planEnabled) {
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("type", "ANSWER");
-        response.put("threadId", threadId);
-        response.put("response", answer);
-        response.put("planEnabled", planEnabled);
-        response.put("planActive", PlanModeContext.isActive(threadId));
-        return response;
-    }
-
-    private Map<String, Object> errorResponse(String message) {
-        return Map.of("type", "ERROR", "message", message == null ? "Unknown error" : message);
     }
 
     public record ChatRequest(String message, String mode) {

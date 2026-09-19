@@ -11,8 +11,8 @@
     <groupId>com.itajay</groupId>
     <artifactId>super-assistant-app</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>SuperAssistant</name>
-    <description>SuperAssistant</description>
+    <name>DeepResearchAgent</name>
+    <description>DeepResearchAgent · 课题调研智能体</description>
     <properties>
         <java.version>21</java.version>
         <maven.compiler.source>21</maven.compiler.source>

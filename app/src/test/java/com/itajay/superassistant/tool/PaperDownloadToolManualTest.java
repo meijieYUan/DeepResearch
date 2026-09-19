@@ -1,6 +1,7 @@
 package com.itajay.superassistant.tool;
 
 import com.itajay.superassistant.config.PaperDownloadProperties;
+import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -30,7 +31,7 @@ class PaperDownloadToolManualTest {
     }
 
     private PaperDownloadTool tool() {
-        return new PaperDownloadTool(props());
+        return new PaperDownloadTool(props(), new ProgressChannelRegistry());
     }
 
     private PaperTextTool textTool() {
@@ -60,7 +61,7 @@ class PaperDownloadToolManualTest {
                 Boolean.getBoolean("paper.it"), "set -Dpaper.it=true to run network tests");
 
         PaperDownloadTool tool = tool();
-        String result = tool.downloadPaper(TOPIC, "https://arxiv.org/abs/1706.03762", "AttentionIsAllYouNeed");
+        String result = tool.downloadPaper(TOPIC, "https://arxiv.org/abs/1706.03762", "AttentionIsAllYouNeed", null);
         System.out.println(result);
 
         assertThat(result).startsWith("OK:");
@@ -80,7 +81,7 @@ class PaperDownloadToolManualTest {
         assertThat(text).doesNotStartWith("Error:");
 
         // Re-downloading the same paper must be recognised and skipped.
-        String again = tool.downloadPaper(TOPIC, "https://arxiv.org/abs/1706.03762", "AttentionIsAllYouNeed");
+        String again = tool.downloadPaper(TOPIC, "https://arxiv.org/abs/1706.03762", "AttentionIsAllYouNeed", null);
         System.out.println(again);
         assertThat(again).contains("already downloaded");
 
@@ -90,7 +91,7 @@ class PaperDownloadToolManualTest {
     @Test
     void rejectsNonPdfUrl() {
         PaperDownloadTool tool = tool();
-        String result = tool.downloadPaper(TOPIC, "https://example.com/", "NotAPaper");
+        String result = tool.downloadPaper(TOPIC, "https://example.com/", "NotAPaper", null);
         System.out.println(result);
         assertThat(result).startsWith("DOWNLOAD_FAILED");
     }
@@ -102,7 +103,7 @@ class PaperDownloadToolManualTest {
         // Even with a traversal-shaped topic, the resolved directory stays inside
         // investigation/. The download itself fails (unreachable host), which is fine —
         // the assertion is about where the path lands.
-        String result = tool.downloadPaper("../../evil", "https://example.com/x.pdf", "../../../pwned");
+        String result = tool.downloadPaper("../../evil", "https://example.com/x.pdf", "../../../pwned", null);
         System.out.println(result);
         assertThat(result).doesNotContain("evil/").doesNotContain("pwned/");
 

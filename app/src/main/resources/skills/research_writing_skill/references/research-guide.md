@@ -22,7 +22,7 @@
 | `downloadPaper` | 下载论文 PDF 到 `investigation/{课题方向}/papers/`，自动重试、校验、去重 | 接受 PDF 链接 / arXiv abs 页 / DOI / 出版社 landing page；**仅用于已判定相关的论文** |
 | `listDownloadedPapers` | 列出某课题下已下载的论文（大小、页数） | 下载前先查，避免重复下载 |
 
-> **你手上没有 `extractPaperText`，也没有 `extractPaperFigures`。** 读取 PDF 正文与从 PDF 截图的能力都属于 `analyst-agent`——精读与取图是为写作准备素材的环节，不属于检索。不要尝试用 `webCrawl` 打开 `.pdf` 链接来代劳（它只解析 HTML，对 PDF 只会返回乱码或空内容）。
+> 读取 PDF 正文与从 PDF 截图的能力都属于 `analyst-agent`——精读与取图是为写作准备素材的环节，不属于检索。不要尝试用 `webCrawl` 打开 `.pdf` 链接来代劳（它只解析 HTML，对 PDF 只会返回乱码或空内容）。
 
 由此推出三条硬性结论：
 

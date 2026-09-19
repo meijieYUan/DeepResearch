@@ -1,6 +1,6 @@
 spring:
   application:
-    name: super-assistant-app
+    name: deep-research-agent
 
   autoconfigure:
     exclude:
@@ -134,6 +134,9 @@ agent:
     max-retries: 3
     initial-backoff-ms: 800
     max-backoff-ms: 10000
+    # analyzePapers 并行精读的路数。每路是一次完整的 analyst-agent 运行（多次 LLM 调用），
+    # 路数过高会同时打多个模型请求，可能触发供应商速率限制；调小即退回近似串行。
+    analysis-parallelism: 4
     # 按主机配置镜像（主地址不可达时使用）：值为镜像 origin，保留原 path 与 query
     #   https://arxiv.org/pdf/xxx -> https://export.arxiv.org/pdf/xxx
     # 值中含 %s 时，改为把原 path 填入 %s 位置（适配路径结构不同的镜像）

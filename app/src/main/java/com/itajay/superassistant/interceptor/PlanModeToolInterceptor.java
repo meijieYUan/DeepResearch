@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -45,7 +46,14 @@ public class PlanModeToolInterceptor extends ModelInterceptor {
 
     @Override
     public ModelResponse interceptModel(ModelRequest request, ModelCallHandler handler) {
-        String threadId = PlanContextHolder.getThreadId();
+        // The run config carries the threadId in its context, which reaches every
+        // model call regardless of which thread the streaming pipeline happens to
+        // execute on. PlanContextHolder is a same-thread fallback for runs started
+        // the old blocking way.
+        String threadId = contextThreadId(request);
+        if (threadId == null) {
+            threadId = PlanContextHolder.getThreadId();
+        }
         if (threadId == null) {
             return handler.call(request);
         }
@@ -81,5 +89,11 @@ public class PlanModeToolInterceptor extends ModelInterceptor {
                 .tools(filtered)
                 .build();
         return handler.call(safeRequest);
+    }
+
+    private static String contextThreadId(ModelRequest request) {
+        Map<String, Object> context = request.getContext();
+        Object value = context == null ? null : context.get("threadId");
+        return value == null ? null : String.valueOf(value);
     }
 }

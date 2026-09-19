@@ -66,7 +66,23 @@
           </div>
           <div class="msg-body">
             <div v-if="msg.role === 'user'" class="msg-text">{{ msg.content }}</div>
-            <div v-else class="msg-text" v-html="renderMarkdown(msg.content)" @click="handleCopyClick"></div>
+            <div v-else class="msg-text" :class="{ streaming: msg.streaming }">
+              <!-- A streaming bubble starts empty: typing dots until the first delta,
+                   then the markdown body grows in place as deltas land. -->
+              <div v-if="msg.streaming && !msg.content" class="typing-dots">
+                <span></span><span></span><span></span>
+              </div>
+              <div v-else class="stream-content" v-html="renderMarkdown(msg.content)" @click="handleCopyClick"></div>
+              <!-- Workflow stage, streamed on the same connection: the user can tell
+                   "still searching / reading paper 3/6" from "stuck" while the model
+                   itself has nothing incremental to say. -->
+              <div v-if="msg.streaming && progressStage" class="progress-stage">
+                <span class="progress-stage-dot" :class="{ failed: progressFailed }"></span>
+                <span class="progress-stage-label">{{ progressStage }}</span>
+                <span v-if="progressRound > 1" class="progress-stage-round">第 {{ progressRound }} 轮</span>
+                <span v-if="progressDetail" class="progress-stage-detail">{{ progressDetail }}</span>
+              </div>
+            </div>
             <div v-if="msg.approvals" class="approval-panel card">
               <div class="approval-header">
                 <AlertTriangle :size="16" />
@@ -98,21 +114,6 @@
               <button class="btn-primary" @click="submitApprovals(msg)" :disabled="!allDecided(msg)">
                 Submit Approvals
               </button>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="loading" class="message assistant">
-          <div class="msg-avatar"><Bot :size="16" /></div>
-          <div class="msg-body">
-            <div class="typing-dots"><span></span><span></span><span></span></div>
-            <!-- Long workflows (research → write → review) stream their stage here, so the
-                 user can tell "still searching" from "stuck" without waiting blind. -->
-            <div v-if="progressStage" class="progress-stage">
-              <span class="progress-stage-dot" :class="{ failed: progressFailed }"></span>
-              <span class="progress-stage-label">{{ progressStage }}</span>
-              <span v-if="progressRound > 1" class="progress-stage-round">第 {{ progressRound }} 轮</span>
-              <span v-if="progressDetail" class="progress-stage-detail">{{ progressDetail }}</span>
             </div>
           </div>
         </div>
@@ -164,7 +165,7 @@
 <script setup>
 import { ref, computed, nextTick, watch, onMounted } from 'vue'
 import { MessageSquare, Send, AlertTriangle, Plus, Trash2, User, Bot, ChevronRight, PanelLeftClose, PanelLeftOpen } from 'lucide-vue-next'
-import { sendChat, approveChat, getTodos, chatStreamUrl } from '../api'
+import { chatStream, approveStream, getTodos } from '../api'
 import { renderMarkdown, handleCopyClick } from '../utils/markdown'
 import { toast } from '../utils/toast'
 
@@ -179,12 +180,18 @@ const planActive = ref(false)
 const taskList = ref([])
 const tasksOpen = ref(false)
 
-// Workflow progress, pushed over SSE while a long request is in flight.
+// Workflow progress, streamed on the same connection as the answer.
 const progressStage = ref('')
 const progressRound = ref(1)
 const progressFailed = ref(false)
 const progressDetail = ref('')
-let progressSource = null
+
+function resetProgress() {
+  progressStage.value = ''
+  progressRound.value = 1
+  progressFailed.value = false
+  progressDetail.value = ''
+}
 
 const THREAD_SIDEBAR_KEY = 'sa_thread_sidebar'
 const THREAD_DEFAULT = 264
@@ -361,107 +368,91 @@ function send() {
   saveThreads()
   scrollDown()
 
-  // Open the progress stream before the POST: a workflow can publish its first
-  // stage within milliseconds of starting, and an EventSource opened afterwards
-  // would miss it.
-  openProgressStream(activeThreadId.value)
-
-  sendChat(activeThreadId.value, msg, planMode.value ? 'PlanMode' : 'Default')
-    .then(r => handleResponse(r.data))
-    // Errors surface through the response interceptor (which toasts) — do not
-    // swallow them here, or a failed run looks like a run that returned nothing.
-    .catch(err => handleRequestError(err))
-    .finally(() => { loading.value = false; closeProgressStream(); scrollDown() })
+  // The streaming bubble: created up front, filled by deltas, finalized by the
+  // terminal event. See makeStreamHandlers for the whole lifecycle.
+  const bubble = { role: 'assistant', content: '', streaming: true }
+  t.messages.push(bubble)
+  chatStream(activeThreadId.value, msg, planMode.value ? 'PlanMode' : 'Default', makeStreamHandlers(t, bubble))
+    .catch(err => finalizeFailure(t, bubble, err?.message || 'Request failed'))
+    .finally(() => { loading.value = false; scrollDown() })
 }
 
-function openProgressStream(threadId) {
-  closeProgressStream()
-  progressStage.value = ''
-  progressRound.value = 1
-  progressFailed.value = false
-  progressDetail.value = ''
+// Everything one streamed run does to the transcript. `bubble` is the in-place
+// assistant message the run fills; terminal events finalize it. A connection that
+// closes without a terminal event is marked as interrupted — the run itself keeps
+// going server-side, so persistence and approvals land regardless.
+function makeStreamHandlers(t, bubble) {
+  resetProgress()
+  let pendingDelta = ''
+  let flushScheduled = false
 
-  // EventSource reconnects automatically on a dropped connection, which for a
-  // long-running workflow is what we want.
-  const source = new EventSource(chatStreamUrl(threadId))
-  progressSource = source
-
-  source.addEventListener('progress', (e) => {
-    try {
-      const data = JSON.parse(e.data)
-      progressStage.value = data.label || ''
-      progressRound.value = data.round || 1
-      progressFailed.value = data.stage === 'FAILED'
-      progressDetail.value = data.detail || ''
+  return {
+    onProgress(p) {
+      progressStage.value = p.label || ''
+      progressRound.value = p.round || 1
+      progressFailed.value = p.stage === 'FAILED'
+      progressDetail.value = p.detail || ''
       scrollDown()
-    } catch { /* a malformed frame is not worth breaking the run over */ }
-  })
-
-  source.addEventListener('done', () => closeProgressStream())
-
-  // The stream closing is normal (the server closes it when the run settles) and
-  // so is a reconnect attempt. Only surface a terminal failure if we are still
-  // waiting — otherwise a closed stream would report an error after every answer.
-  source.onerror = () => {
-    if (source.readyState === EventSource.CLOSED) closeProgressStream()
-  }
-}
-
-function closeProgressStream() {
-  if (progressSource) {
-    progressSource.close()
-    progressSource = null
-  }
-}
-
-function handleRequestError(err) {
-  const t = threads.value[activeThreadId.value]
-  if (!t) return
-  // The interceptor already toasted the message; record it in the transcript too,
-  // so a failure is still visible after a refresh.
-  const msg = err?.response?.data?.message || err?.message || 'Request failed'
-  t.messages.push({ role: 'assistant', content: '⚠️ Error: ' + msg })
-  t.lastActive = Date.now()
-  saveThreads()
-}
-
-function handleResponse(data) {
-  const t = threads.value[activeThreadId.value]
-  if (!t) return
-  if (data.planEnabled !== undefined) { planMode.value = data.planEnabled }
-  if (data.planActive !== undefined) { planActive.value = data.planActive }
-  refreshTasks()
-  if (data.type === 'ANSWER') {
-    const text = extractText(data.response || data)
-    t.messages.push({ role: 'assistant', content: text })
-  } else if (data.type === 'INTERRUPTED') {
-    const approvals = (data.pendingApprovals || []).map(a => ({
-      ...a, decision: null, editing: false, editedArgs: a.arguments
-    }))
-    t.messages.push({ role: 'assistant', content: data.message || '', approvals, threadId: data.threadId })
-  } else if (data.type === 'ERROR') {
-    t.messages.push({ role: 'assistant', content: '\u26a0\ufe0f Error: ' + (data.message || 'Unknown error') })
-  }
-  t.lastActive = Date.now()
-  saveThreads()
-}
-
-// ANSWER type always contains response as either plain text or NodeOutput{state={...}} string
-// Extract just the last assistant message text for display
-function extractText(res) {
-  if (!res) return ''
-  if (typeof res === 'string') {
-    const m = res.match(/state=(\{.*\}),?\s*subGraph/)
-    if (m) {
-      try {
-        const s = JSON.parse(m[1])
-        const msgs = (s.OverAllState || s).data?.messages || []
-        for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].text) return msgs[i].text
-      } catch {}
+    },
+    onDelta(d) {
+      pendingDelta += d.text || ''
+      // Coalesce token deltas into one DOM update per frame; re-rendering the
+      // markdown for every chunk is wasted work the eye cannot see.
+      if (!flushScheduled) {
+        flushScheduled = true
+        requestAnimationFrame(() => {
+          flushScheduled = false
+          bubble.content += pendingDelta
+          pendingDelta = ''
+          scrollDown()
+        })
+      }
+    },
+    onAnswer(p) {
+      if (p.planEnabled !== undefined) planMode.value = p.planEnabled
+      if (p.planActive !== undefined) planActive.value = p.planActive
+      // The server's final text wins: it is the same run read from its settled
+      // state, so a lost delta cannot leave the transcript truncated.
+      bubble.content = p.text || bubble.content
+      bubble.streaming = false
+      t.lastActive = Date.now()
+      saveThreads()
+      refreshTasks()
+      scrollDown()
+    },
+    onInterruption(p) {
+      if (p.planEnabled !== undefined) planMode.value = p.planEnabled
+      if (p.planActive !== undefined) planActive.value = p.planActive
+      // The empty placeholder has nothing to show — the approval panel takes over.
+      const idx = t.messages.indexOf(bubble)
+      if (idx >= 0) t.messages.splice(idx, 1)
+      const approvals = (p.pendingApprovals || []).map(a => ({
+        ...a, decision: null, editing: false, editedArgs: a.arguments
+      }))
+      t.messages.push({ role: 'assistant', content: p.message || '', approvals, threadId: p.threadId })
+      t.lastActive = Date.now()
+      saveThreads()
+      refreshTasks()
+      scrollDown()
+    },
+    onError(p) {
+      bubble.content = '⚠️ Error: ' + (p.message || 'Unknown error')
+      bubble.streaming = false
+      t.lastActive = Date.now()
+      saveThreads()
+      scrollDown()
     }
-    return res
   }
-  return res.text || JSON.stringify(res)
+}
+
+// The stream itself failed to open (network, non-200): nothing was ever streamed.
+function finalizeFailure(t, bubble, message) {
+  if (!bubble.streaming) return
+  bubble.content = '⚠️ Error: ' + message
+  bubble.streaming = false
+  t.lastActive = Date.now()
+  saveThreads()
+  scrollDown()
 }
 
 function decide(app, result) { app.decision = result }
@@ -492,12 +483,14 @@ function submitApprovals(msg) {
     return d
   })
   loading.value = true
-  // The run resumes on the same thread, so the progress stream reopens with it.
-  openProgressStream(activeThreadId.value)
-  approveChat(activeThreadId.value, decisions)
-    .then(r => handleResponse(r.data))
-    .catch(err => handleRequestError(err))
-    .finally(() => { loading.value = false; closeProgressStream(); scrollDown() })
+  // The resumed run streams on its own connection: a fresh bubble fills with the
+  // revised answer, and it may interrupt again on the next risky tool call.
+  const t = threads.value[activeThreadId.value]
+  const bubble = { role: 'assistant', content: '', streaming: true }
+  t.messages.push(bubble)
+  approveStream(activeThreadId.value, decisions, makeStreamHandlers(t, bubble))
+    .catch(err => finalizeFailure(t, bubble, err?.message || 'Request failed'))
+    .finally(() => { loading.value = false; scrollDown() })
 }
 
 function formatArgs(args) {

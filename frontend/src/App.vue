@@ -6,7 +6,7 @@
     >
       <div class="sidebar-header">
         <span class="logo">S</span>
-        <span class="brand">SuperAssistant</span>
+        <span class="brand">DeepResearchAgent</span>
         <button
           class="collapse-btn"
           :title="collapsed ? 'Expand sidebar' : 'Collapse sidebar'"

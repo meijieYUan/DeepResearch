@@ -15,22 +15,68 @@ api.interceptors.response.use(
 // Health
 export const getHealth = () => api.get('/health')
 
-// Chat — mode is 'Default' or 'PlanMode'
+// Chat — the POST response body IS the run: an SSE stream carrying
+// progress / delta / answer / interruption / error events, closed by done.
+// EventSource cannot issue a POST, so the stream is parsed from a fetch reader.
 //
-// timeout: 0 disables axios's own deadline. The research workflow legitimately runs
-// for many minutes (search → download → read → write → review → revise), so the
-// global 2-minute default would abort every such request while the server keeps
-// working. The request is not abandoned: progress arrives over the SSE stream
-// (chatStreamUrl below), and the browser's own connection is what bounds it.
-export const sendChat = (threadId, message, mode = 'Default') =>
-  api.post(`/chat/${threadId}`, { message, mode }, { timeout: 0 })
+// handlers: { onProgress, onDelta, onAnswer, onInterruption, onError, onDone }
+// — each receives the parsed JSON payload (delta: {text}, answer: {text, threadId,
+// planEnabled, planActive}, ...). The returned promise resolves when the stream
+// closes; it rejects only if the stream never started (network/HTTP error).
+export async function streamChatEvents(threadId, path, body, handlers) {
+  const res = await fetch(`/api/chat/${threadId}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(body)
+  })
+  if (!res.ok || !res.body) {
+    throw new Error(`Chat stream failed to open (HTTP ${res.status})`)
+  }
 
-export const approveChat = (threadId, decisions) =>
-  api.post(`/chat/${threadId}/approve`, { decisions }, { timeout: 0 })
+  const dispatch = (name, data) => {
+    const handler = handlers['on' + name.charAt(0).toUpperCase() + name.slice(1)]
+    if (handler) handler(data)
+  }
+  const dispatchFrame = () => {
+    if (dataLines.length === 0) { eventName = 'message'; return }
+    const raw = dataLines.join('\n')
+    dataLines = []
+    const name = eventName
+    eventName = 'message'
+    try {
+      const payload = raw ? JSON.parse(raw) : {}
+      if (name === 'done') handlers.onDone?.(payload)
+      else if (name === 'message') { /* an unnamed frame carries nothing we render */ }
+      else dispatch(name, payload)
+    } catch { /* a malformed frame is not worth breaking the stream over */ }
+  }
 
-// SSE endpoint for workflow progress. Opened alongside the POST, not instead of it:
-// the POST's response is still the authoritative answer.
-export const chatStreamUrl = (threadId) => `/api/chat/${threadId}/stream`
+  let eventName = 'message'
+  let dataLines = []
+  let buffer = ''
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let nl
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).replace(/\r$/, '')
+      buffer = buffer.slice(nl + 1)
+      if (line === '') { dispatchFrame(); continue }
+      if (line.startsWith('event:')) eventName = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+    }
+  }
+  dispatchFrame()
+}
+
+export const chatStream = (threadId, message, mode, handlers) =>
+  streamChatEvents(threadId, '', { message, mode }, handlers)
+
+export const approveStream = (threadId, decisions, handlers) =>
+  streamChatEvents(threadId, '/approve', { decisions }, handlers)
 
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId } })
