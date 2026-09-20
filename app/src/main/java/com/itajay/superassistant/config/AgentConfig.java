@@ -46,7 +46,6 @@ public class AgentConfig {
             ## Tool Usage Principles
             - **File operations**: use the dedicated file read/write tools. Avoid terminal commands (cat, echo, sed, etc.) for file work.
             - **Web research**: use the web search and crawl tools. Do not use curl/wget in the terminal.
-            - **Task management**: decompose work into tracked todo tasks. Use the task tools to create, start, complete, and query tasks.
             - **Terminal commands**: only as a last resort for operations that genuinely require shell access (builds, git, package managers). Every terminal command requires human approval.
             - **Research documents**: the research, close-reading, writing, and review agents are **not** available
               as individual tools. Literature reviews, surveys, and research reports go through the

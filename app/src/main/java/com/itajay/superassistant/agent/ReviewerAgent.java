@@ -1,6 +1,7 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.AnalysisReadTool;
 import com.itajay.superassistant.tool.PaperTextTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
@@ -46,7 +47,8 @@ public class ReviewerAgent {
     public ReviewerAgent(ChatModel chatModel,
                          SkillResourceTool skillResourceTool,
                          PaperTextTool paperTextTool,
-                         AnalysisReadTool analysisReadTool) {
+                         AnalysisReadTool analysisReadTool,
+                         ModelCallGuardInterceptor subAgentModelCallGuard) {
         this.reactAgent = ReactAgent.builder()
                 .name("reviewer-agent")
                 .description("调研文档质量审查 agent：按验收标准检查产出，输出结构化审批结论与修改意见。")
@@ -132,6 +134,7 @@ public class ReviewerAgent {
                 // derives from the verdict anyway, so a reviewer that answered both inconsistently
                 // produced a self-contradicting verdict that the parse then silently overrode.
                 .outputType(ReviewResult.Payload.class)
+                .interceptors(subAgentModelCallGuard)
                 .build();
     }
 }

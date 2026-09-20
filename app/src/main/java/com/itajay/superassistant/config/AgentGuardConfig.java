@@ -53,6 +53,29 @@ public class AgentGuardConfig {
     }
 
     /**
+     * 子 Agent 的模型兜底：只重试，重试耗尽后把异常如实抛出（不返回兜底回答）。
+     *
+     * <p>为什么与主 Agent 不同：四个调研子 Agent 的产出会被落盘复用——analyst 的精读结果写进
+     * {@code investigation/{课题}/analysis/}，writer 的文档写进 {@code document/}，后续修订轮次
+     * 和以后的重跑都会读它们。主 Agent 那句「模型服务当前不可用」一旦被子 Agent 当成正常输出
+     * 写进文件，就被当成既成事实缓存下来了，这比直接失败更糟。耗尽即抛出，则由
+     * {@code ResearchWriteReviewWorkflow} 的 catch 转成「哪个阶段失败了」的如实上报，
+     * 缓存和半成品都不会被污染。</p>
+     *
+     * <p>按参数名注入（{@code subAgentModelCallGuard}），与上面的
+     * {@link #paperAnalysisCallLimitHook} 同一套做法：同一类型有两个 Bean，用名字选中那个。</p>
+     */
+    @Bean
+    public ModelCallGuardInterceptor subAgentModelCallGuard(
+            @Value("${agent.guard.model-retry.max-attempts:3}") int maxAttempts,
+            @Value("${agent.guard.model-retry.initial-delay-ms:500}") long initialDelayMs,
+            @Value("${agent.guard.model-retry.max-delay-ms:8000}") long maxDelayMs,
+            @Value("${agent.guard.model-retry.backoff-multiplier:2.0}") double backoffMultiplier) {
+        return new ModelCallGuardInterceptor(maxAttempts, initialDelayMs, maxDelayMs,
+                backoffMultiplier, false);
+    }
+
+    /**
      * 工具调用重试：仅对瞬时性错误重试，重试耗尽后返回错误消息（而非抛出异常终止运行）。
      */
     @Bean

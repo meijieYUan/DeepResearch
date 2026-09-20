@@ -4,13 +4,25 @@ import com.itajay.superassistant.config.PaperDownloadProperties;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -177,5 +189,160 @@ class PaperTextToolTest {
 
         assertThat(listing).doesNotStartWith("Error");
         assertThat(listing).contains("No papers downloaded yet");
+    }
+
+    // ── page-text cache ──
+
+    /** A tool with the cache off — the reference implementation for byte-equality checks. */
+    private PaperTextTool uncachedTool() {
+        PaperDownloadProperties props = new PaperDownloadProperties();
+        props.setTextCacheMaxDocs(0);
+        return new PaperTextTool(props);
+    }
+
+    /** Like writePdf, but each page carries a distinct line of text so join fidelity is exercised. */
+    private Path writeTextPdf(String name, int pages) throws IOException {
+        Path dir = WorkspacePaths.papersDir(TOPIC);
+        Files.createDirectories(dir);
+        Path pdf = dir.resolve(name + ".pdf");
+        try (PDDocument doc = new PDDocument()) {
+            for (int i = 1; i <= pages; i++) {
+                PDPage page = new PDPage();
+                doc.addPage(page);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                    cs.beginText();
+                    cs.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 12);
+                    cs.newLineAtOffset(72, 700);
+                    cs.showText("Paper text on page " + i);
+                    cs.endText();
+                }
+            }
+            doc.save(pdf.toFile());
+        }
+        return pdf;
+    }
+
+    @Test
+    void repeatedSameRangeIsServedFromCache() throws IOException {
+        writeTextPdf("Cached", 3);
+
+        String first = tool.extractPaperText(TOPIC, "Cached", 1, 3);
+        String second = tool.extractPaperText(TOPIC, "Cached", 1, 3);
+
+        assertThat(first).contains("Pages: 1-3 of 3");
+        assertThat(second).isEqualTo(first);
+        // The second call was served entirely from the page cache: the document was opened once.
+        assertThat(tool.pdfOpensForTesting()).isEqualTo(1);
+    }
+
+    @Test
+    void overlappingSubsetHitsCacheAfterFullRead() throws IOException {
+        writeTextPdf("Overlap", 4);
+        PaperTextTool reference = uncachedTool();
+
+        String full = tool.extractPaperText(TOPIC, "Overlap", 1, 4);
+        String mid = tool.extractPaperText(TOPIC, "Overlap", 2, 3);
+        String head = tool.extractPaperText(TOPIC, "Overlap", 1, 2);
+
+        // Subsets of a verified document are cache hits and must stay byte-identical
+        // to what a parse would have produced.
+        assertThat(full).isEqualTo(reference.extractPaperText(TOPIC, "Overlap", 1, 4));
+        assertThat(mid).isEqualTo(reference.extractPaperText(TOPIC, "Overlap", 2, 3));
+        assertThat(head).isEqualTo(reference.extractPaperText(TOPIC, "Overlap", 1, 2));
+        assertThat(tool.pdfOpensForTesting()).isEqualTo(1);
+    }
+
+    @Test
+    void partiallyCachedWindowStillOpensAndStaysCorrect() throws IOException {
+        writeTextPdf("Partial", 3);
+        PaperTextTool reference = uncachedTool();
+
+        tool.extractPaperText(TOPIC, "Partial", 1, 1);
+        String widened = tool.extractPaperText(TOPIC, "Partial", 1, 3);
+        String again = tool.extractPaperText(TOPIC, "Partial", 1, 3);
+
+        assertThat(widened).isEqualTo(reference.extractPaperText(TOPIC, "Partial", 1, 3));
+        // The widened window was a miss (it opened the document), the repeat a hit.
+        assertThat(again).isEqualTo(widened);
+        assertThat(tool.pdfOpensForTesting()).isEqualTo(2);
+    }
+
+    @Test
+    void joinedPageTextMatchesRangeStrip() throws IOException {
+        // The join-fidelity guard: a tool that read the paper page by page and then
+        // asks for the whole range must get exactly what a single range strip yields.
+        writeTextPdf("Join", 3);
+        PaperTextTool whole = uncachedTool();
+
+        String rangeStripped = whole.extractPaperText(TOPIC, "Join", 1, 3);
+
+        // The two-page window is what measures the join separator (a single-page
+        // window cannot discriminate the candidates); the next call harvests page 3.
+        tool.extractPaperText(TOPIC, "Join", 1, 2);
+        tool.extractPaperText(TOPIC, "Join", 3, 3);
+        String joined = tool.extractPaperText(TOPIC, "Join", 1, 3);
+
+        assertThat(joined).isEqualTo(rangeStripped);
+        // Two misses happened; the final whole-range call must have been a cache join.
+        assertThat(tool.pdfOpensForTesting()).isEqualTo(2);
+    }
+
+    @Test
+    void replacedPdfIsNotServedStale() throws IOException {
+        Path pdf = writePdf("Replaced", 2);
+        tool.extractPaperText(TOPIC, "Replaced", 1, 2);
+
+        // Overwrite with a different paper. lastModified is forced forward because
+        // same-second mtime granularity would otherwise make the new key collide.
+        writePdf("Replaced", 4);
+        Files.setLastModifiedTime(pdf, FileTime.from(Instant.now().plusSeconds(10)));
+
+        String result = tool.extractPaperText(TOPIC, "Replaced", 1, 2);
+
+        assertThat(result).contains("Pages: 1-2 of 4");
+    }
+
+    @Test
+    void cacheCanBeDisabledByProperty() throws IOException {
+        writeTextPdf("Nocache", 2);
+        PaperTextTool disabled = uncachedTool();
+
+        String first = disabled.extractPaperText(TOPIC, "Nocache", 1, 2);
+        String second = disabled.extractPaperText(TOPIC, "Nocache", 1, 2);
+
+        assertThat(second).isEqualTo(first);
+        assertThat(disabled.pdfOpensForTesting()).isEqualTo(2);
+    }
+
+    @Test
+    void cacheSurvivesConcurrentReads() throws Exception {
+        writeTextPdf("Concurrent", 6);
+        PaperTextTool reference = uncachedTool();
+        int[][] windows = {{1, 6}, {1, 3}, {2, 5}, {3, 6}, {2, 2}, {4, 4}, {1, 1}, {3, 4}};
+
+        ExecutorService pool = Executors.newFixedThreadPool(windows.length);
+        try {
+            CountDownLatch ready = new CountDownLatch(windows.length);
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<String>> futures = new ArrayList<>();
+            for (int[] window : windows) {
+                futures.add(pool.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return tool.extractPaperText(TOPIC, "Concurrent", window[0], window[1]);
+                }));
+            }
+            ready.await(5, TimeUnit.SECONDS);
+            start.countDown();
+
+            for (int i = 0; i < windows.length; i++) {
+                String expected = reference.extractPaperText(TOPIC, "Concurrent", windows[i][0], windows[i][1]);
+                assertThat(futures.get(i).get(30, TimeUnit.SECONDS))
+                        .as("window %d-%d", windows[i][0], windows[i][1])
+                        .isEqualTo(expected);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }

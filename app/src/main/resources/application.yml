@@ -123,6 +123,10 @@ agent:
     max-text-chars: 40000
     # 单次解析的最大页数
     max-pages: 60
+    # extractPaperText 的页级文本缓存：最多缓存的文档数（LRU；0 或负数关闭缓存）。
+    # analyst 精读后 reviewer 复核、reanalyzePaper 重读的是同一批未变动的 PDF，
+    # 命中即可免去重复的 PDFBox 解析
+    text-cache-max-docs: 32
     # extractPaperFigures 单次最多导出的图片数（防止大页码范围一次刷屏落盘）
     max-figures: 8
     # 裁图时页面栅格化的分辨率：矢量框架图没有位图可提取，只能渲染页面区域再裁

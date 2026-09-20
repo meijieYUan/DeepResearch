@@ -1,6 +1,7 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.AnalysisReadTool;
 import com.itajay.superassistant.tool.DocumentWriteTool;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
@@ -36,7 +37,8 @@ public class WriterAgent {
                        SkillResourceTool skillResourceTool,
                        PaperAnalysisTool paperAnalysisTool,
                        AnalysisReadTool analysisReadTool,
-                       DocumentWriteTool documentWriteTool) {
+                       DocumentWriteTool documentWriteTool,
+                       ModelCallGuardInterceptor subAgentModelCallGuard) {
         this.reactAgent = ReactAgent.builder()
                 .name("writer-agent")
                 .description("调研文档撰写 agent：基于已落盘的单篇论文分析，归纳并撰写对比型 Markdown 调研文档。")
@@ -106,6 +108,7 @@ public class WriterAgent {
                         除 writeResearchDocument 落盘外，不要执行其他写入、删除、发送邮件等副作用操作。
                         """)
                 .methodTools(skillResourceTool, paperAnalysisTool, analysisReadTool, documentWriteTool)
+                .interceptors(subAgentModelCallGuard)
                 .build();
     }
 }

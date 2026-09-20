@@ -34,6 +34,13 @@ public class PaperDownloadProperties {
     /** Max pages parsed during extraction. Stops a 300-page proceedings volume from burning time. */
     private int maxPages = 60;
 
+    /**
+     * Max documents whose per-page extracted text is retained in memory (LRU).
+     * Serves repeated reads of the same PDF (analyst close-read, then reviewer
+     * re-check, then reanalysis) without re-parsing. 0 or less disables the cache.
+     */
+    private int textCacheMaxDocs = 32;
+
     /** Max figures one extraction call may write, so a wide page range cannot flood the folder. */
     private int maxFigures = 8;
 
@@ -113,6 +120,14 @@ public class PaperDownloadProperties {
 
     public void setMaxPages(int maxPages) {
         this.maxPages = maxPages;
+    }
+
+    public int getTextCacheMaxDocs() {
+        return textCacheMaxDocs;
+    }
+
+    public void setTextCacheMaxDocs(int textCacheMaxDocs) {
+        this.textCacheMaxDocs = textCacheMaxDocs;
     }
 
     public int getMaxFigures() {

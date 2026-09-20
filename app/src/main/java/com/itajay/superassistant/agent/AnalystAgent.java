@@ -2,6 +2,7 @@ package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.alibaba.cloud.ai.graph.agent.hook.modelcalllimit.ModelCallLimitHook;
+import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.AnalysisWriteTool;
 import com.itajay.superassistant.tool.PaperFigureTool;
 import com.itajay.superassistant.tool.PaperTextTool;
@@ -47,7 +48,8 @@ public class AnalystAgent {
                         PaperTextTool paperTextTool,
                         AnalysisWriteTool analysisWriteTool,
                         PaperFigureTool paperFigureTool,
-                        ModelCallLimitHook paperAnalysisCallLimitHook) {
+                        ModelCallLimitHook paperAnalysisCallLimitHook,
+                        ModelCallGuardInterceptor subAgentModelCallGuard) {
         this.reactAgent = ReactAgent.builder()
                 .name("analyst-agent")
                 .description("单篇论文精读 agent：读取一篇已下载论文的正文，提取四维信息并落盘到 analysis/ 目录。")
@@ -119,6 +121,7 @@ public class AnalystAgent {
                         """)
                 .methodTools(skillResourceTool, paperTextTool, analysisWriteTool, paperFigureTool)
                 .hooks(paperAnalysisCallLimitHook)
+                .interceptors(subAgentModelCallGuard)
                 .build();
     }
 }

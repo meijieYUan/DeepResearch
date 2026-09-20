@@ -49,6 +49,7 @@ class PaperDownloadWiringTest {
                         "agent.paper.min-pdf-bytes=4096",
                         "agent.paper.max-text-chars=5000",
                         "agent.paper.max-pages=12",
+                        "agent.paper.text-cache-max-docs=5",
                         "agent.paper.connect-timeout-ms=1000",
                         "agent.paper.request-timeout-ms=2000",
                         "agent.paper.max-retries=7",
@@ -62,6 +63,7 @@ class PaperDownloadWiringTest {
                     assertThat(props.getMinPdfBytes()).isEqualTo(4_096L);
                     assertThat(props.getMaxTextChars()).isEqualTo(5_000);
                     assertThat(props.getMaxPages()).isEqualTo(12);
+                    assertThat(props.getTextCacheMaxDocs()).isEqualTo(5);
                     assertThat(props.getConnectTimeoutMs()).isEqualTo(1_000);
                     assertThat(props.getRequestTimeoutMs()).isEqualTo(2_000);
                     assertThat(props.getMaxRetries()).isEqualTo(7);
@@ -69,6 +71,16 @@ class PaperDownloadWiringTest {
                     assertThat(props.getMaxBackoffMs()).isEqualTo(900L);
                     assertThat(props.getHostFallbacks()).isEmpty();
                 });
+    }
+
+    @Test
+    void textCacheIsOnByDefault() {
+        // A mis-set bound of 0 silently turns the cache off; the default must not be that.
+        runner.run(context -> {
+            assertThat(context).hasNotFailed();
+            PaperDownloadProperties props = context.getBean(PaperDownloadProperties.class);
+            assertThat(props.getTextCacheMaxDocs()).isEqualTo(32);
+        });
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.PaperDownloadTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
 import com.itajay.superassistant.tool.WebSearchTool;
@@ -29,7 +30,8 @@ public class ResearchAgent {
     public ResearchAgent(WebSearchTool webSearchTool,
                          SkillResourceTool skillResourceTool,
                          PaperDownloadTool paperDownloadTool,
-                         ChatModel chatModel) {
+                         ChatModel chatModel,
+                         ModelCallGuardInterceptor subAgentModelCallGuard) {
         this.reactAgent = ReactAgent.builder()
                 .name("research-agent")
                 .description("科研论文检索与下载 agent：使用 research-writing skill 的检索网站与筛选标准，建立候选池、判定相关性并下载相关论文。")
@@ -79,6 +81,7 @@ public class ResearchAgent {
                         包含候选池、相关性判定表（含摘要证据摘录）、下载清单与参考文献列表。
                         """)
                 .methodTools(webSearchTool, skillResourceTool, paperDownloadTool)
+                .interceptors(subAgentModelCallGuard)
                 .build();
     }
 }
