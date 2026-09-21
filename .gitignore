@@ -46,3 +46,11 @@ startup.log
 # Lucene BM25 索引
 data/
 
+### 调研产物 / 运行时状态（体积大、可重建，不入库）###
+# 调研工作流落盘的论文 PDF、精读结果与报告（由 agent 运行生成）
+investigation/
+# Agent 记忆 / 计划 / 压缩快照等运行时状态
+.memory/
+plans/
+.compact/
+

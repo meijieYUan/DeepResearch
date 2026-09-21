@@ -83,6 +83,13 @@
                 <span v-if="progressDetail" class="progress-stage-detail">{{ progressDetail }}</span>
               </div>
             </div>
+            <!-- The connection closed without the run's terminal event (no done /
+                 answer / interruption): the text above is only what got through,
+                 so say so rather than passing a truncated answer off as final. -->
+            <div v-if="msg.incomplete" class="incomplete-note">
+              <AlertTriangle :size="12" />
+              <span>连接中断，回答可能不完整</span>
+            </div>
             <div v-if="msg.approvals" class="approval-panel card">
               <div class="approval-header">
                 <AlertTriangle :size="16" />
@@ -163,7 +170,7 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, watch, onMounted } from 'vue'
+import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { MessageSquare, Send, AlertTriangle, Plus, Trash2, User, Bot, ChevronRight, PanelLeftClose, PanelLeftOpen } from 'lucide-vue-next'
 import { chatStream, approveStream, getTodos } from '../api'
 import { renderMarkdown, handleCopyClick } from '../utils/markdown'
@@ -250,6 +257,13 @@ const inputRef = ref(null)
 const loading = ref(false)
 const msgContainer = ref(null)
 
+// The single in-flight stream, if any. send() and submitApprovals() register their
+// AbortController and finalize hook here, so an unmount, a thread switch, or a
+// delete can stop the run and settle its bubble instead of leaking the reader and
+// leaving the bubble spinning. Only one run is ever in flight, because the
+// composer is disabled while `loading`.
+let liveStream = null
+
 // Computed
 const activeThread = computed(() => threads.value[activeThreadId.value] || null)
 const messages = computed(() => {
@@ -282,6 +296,9 @@ function saveThreads() {
       messages: (t.messages || []).map(m => {
         const { role, content } = m
         const c = { role, content }
+        // Keep the "may be incomplete" flag across reloads: the truncation is a
+        // property of the stored answer, not of this session.
+        if (m.incomplete) c.incomplete = true
         if (m.approvals) {
           c.approvals = m.approvals.map(a => ({
             toolId: a.toolId, toolName: a.toolName,
@@ -292,7 +309,15 @@ function saveThreads() {
       })
     }
   }
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(clean))
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(clean))
+  } catch {
+    // A full quota (or a locked-down storage) must never bubble out: send() calls
+    // this mid-flight, and a throw there would skip the rest of send() and leave
+    // the composer disabled for good. Warn and carry on with in-memory threads.
+    // The toast is deduped, so repeated failures don't stack.
+    toast('无法保存对话到本地存储（空间已满）', 'error')
+  }
 }
 
 function ensureThread() {
@@ -313,6 +338,9 @@ function newThread() {
 }
 
 function switchThread(id) {
+  // Leaving a conversation mid-answer cancels its stream: the reader would keep
+  // running invisibly otherwise, and its bubble must not be left streaming.
+  if (id !== activeThreadId.value) stopStream(activeThreadId.value)
   activeThreadId.value = id
   input.value = ''
   persistActive(id)
@@ -321,6 +349,7 @@ function switchThread(id) {
 }
 
 function deleteThread(id) {
+  stopStream(id)
   delete threads.value[id]
   if (activeThreadId.value === id) {
     const remaining = threadList.value
@@ -356,7 +385,9 @@ watch(input, adjustTextarea)
 function send() {
   if (!input.value.trim() || loading.value || !activeThreadId.value) return
   const msg = input.value.trim()
-  const t = threads.value[activeThreadId.value]
+  const threadId = activeThreadId.value
+  const t = threads.value[threadId]
+  if (!t) return
   if (!t.title && t.messages.length === 0) {
     t.title = msg.length > 40 ? msg.substring(0, 40) + '...' : msg
   }
@@ -372,21 +403,78 @@ function send() {
   // terminal event. See makeStreamHandlers for the whole lifecycle.
   const bubble = { role: 'assistant', content: '', streaming: true }
   t.messages.push(bubble)
-  chatStream(activeThreadId.value, msg, planMode.value ? 'PlanMode' : 'Default', makeStreamHandlers(t, bubble))
-    .catch(err => finalizeFailure(t, bubble, err?.message || 'Request failed'))
-    .finally(() => { loading.value = false; scrollDown() })
+  runStream(threadId, bubble, (signal, handlers) =>
+    chatStream(threadId, msg, planMode.value ? 'PlanMode' : 'Default', handlers, signal))
 }
 
-// Everything one streamed run does to the transcript. `bubble` is the in-place
-// assistant message the run fills; terminal events finalize it. A connection that
-// closes without a terminal event is marked as interrupted — the run itself keeps
-// going server-side, so persistence and approvals land regardless.
-function makeStreamHandlers(t, bubble) {
+// Stops the in-flight stream, optionally only when it belongs to `threadId` (an
+// unrelated switch must not kill a run in another conversation). Aborting first
+// stops the reader from delivering more frames; finalize then settles the bubble
+// so it can never be left stuck in the streaming state. No-op when idle, and the
+// finalize hook is idempotent, so a double call is harmless.
+function stopStream(threadId = null) {
+  const s = liveStream
+  if (!s || (threadId !== null && s.threadId !== threadId)) return
+  liveStream = null
+  s.controller.abort()
+  s.finalize({ incomplete: true })
+}
+
+// The single entry point for a streamed run. It owns the AbortController and the
+// end-of-stream bookkeeping, so however the transport ends — terminal event,
+// abrupt close, network failure, or abort — the bubble is settled and `loading`
+// is released. `launch` receives the handlers and the abort signal.
+function runStream(threadId, bubble, launch) {
+  const controller = new AbortController()
+  const handlers = makeStreamHandlers(threadId, bubble)
+  const slot = { threadId, controller, finalize: handlers.finalize }
+  liveStream = slot
+
+  launch(controller.signal, handlers)
+    .catch(err => {
+      // An abort is not a failure: stopStream already settled the bubble.
+      if (err?.name === 'AbortError') return
+      finalizeFailure(threadId, bubble, err?.message || 'Request failed')
+    })
+    .finally(() => {
+      // The backstop for a stream that closed without a terminal event (the
+      // server never sent `done`): without it the bubble would stream forever.
+      handlers.finalize({ incomplete: true })
+      if (liveStream === slot) liveStream = null
+      loading.value = false
+      scrollDown()
+    })
+}
+
+// Everything one streamed run does to the transcript. The target is addressed by
+// threadId and re-resolved from threads.value on every event: loadThreads() can
+// swap in a fresh object graph, and a handler that had closed over the old thread
+// (or bubble) object would then write into an orphan that no view renders — the
+// answer would silently vanish. If the thread or bubble is gone, the event is
+// dropped rather than resurrecting stale state.
+//
+// `finalize` (attached to the returned handlers) is the one settle path, shared by
+// the server's `done` event and the transport's fallback in runStream.
+function makeStreamHandlers(threadId, bubble) {
   resetProgress()
   let pendingDelta = ''
   let flushScheduled = false
+  let finalized = false
 
-  return {
+  const liveThread = () => threads.value[threadId] || null
+  const liveBubble = () => {
+    const t = liveThread()
+    return t && (t.messages || []).includes(bubble) ? bubble : null
+  }
+  const flushDeltas = () => {
+    if (!pendingDelta) return
+    const b = liveBubble()
+    if (b) b.content += pendingDelta
+    pendingDelta = ''
+  }
+  const touch = (t) => { if (t) t.lastActive = Date.now() }
+
+  const handlers = {
     onProgress(p) {
       progressStage.value = p.label || ''
       progressRound.value = p.round || 1
@@ -402,8 +490,7 @@ function makeStreamHandlers(t, bubble) {
         flushScheduled = true
         requestAnimationFrame(() => {
           flushScheduled = false
-          bubble.content += pendingDelta
-          pendingDelta = ''
+          flushDeltas()
           scrollDown()
         })
       }
@@ -412,10 +499,16 @@ function makeStreamHandlers(t, bubble) {
       if (p.planEnabled !== undefined) planMode.value = p.planEnabled
       if (p.planActive !== undefined) planActive.value = p.planActive
       // The server's final text wins: it is the same run read from its settled
-      // state, so a lost delta cannot leave the transcript truncated.
-      bubble.content = p.text || bubble.content
-      bubble.streaming = false
-      t.lastActive = Date.now()
+      // state, so a lost delta cannot leave the transcript truncated — drop the
+      // unflushed tail instead of appending it after the authoritative text.
+      pendingDelta = ''
+      const b = liveBubble()
+      if (b) {
+        b.content = p.text || b.content
+        b.streaming = false
+        b.incomplete = false
+      }
+      touch(liveThread())
       saveThreads()
       refreshTasks()
       scrollDown()
@@ -423,6 +516,8 @@ function makeStreamHandlers(t, bubble) {
     onInterruption(p) {
       if (p.planEnabled !== undefined) planMode.value = p.planEnabled
       if (p.planActive !== undefined) planActive.value = p.planActive
+      const t = liveThread()
+      if (!t) return
       // The empty placeholder has nothing to show — the approval panel takes over.
       const idx = t.messages.indexOf(bubble)
       if (idx >= 0) t.messages.splice(idx, 1)
@@ -430,26 +525,52 @@ function makeStreamHandlers(t, bubble) {
         ...a, decision: null, editing: false, editedArgs: a.arguments
       }))
       t.messages.push({ role: 'assistant', content: p.message || '', approvals, threadId: p.threadId })
-      t.lastActive = Date.now()
+      touch(t)
       saveThreads()
       refreshTasks()
       scrollDown()
     },
     onError(p) {
-      bubble.content = '⚠️ Error: ' + (p.message || 'Unknown error')
-      bubble.streaming = false
-      t.lastActive = Date.now()
+      const b = liveBubble()
+      if (b) {
+        b.content = '⚠️ Error: ' + (p.message || 'Unknown error')
+        b.streaming = false
+      }
+      touch(liveThread())
       saveThreads()
       scrollDown()
-    }
+    },
+    // The server's terminal frame. Reaching it with the bubble still streaming
+    // means no answer / interruption ever arrived, so the run was cut short.
+    onDone() { handlers.finalize({ incomplete: true }) }
   }
+
+  // Settles the bubble exactly once, however the run ended.
+  handlers.finalize = ({ incomplete = false } = {}) => {
+    if (finalized) return
+    finalized = true
+    const b = liveBubble()
+    if (!b) return
+    // Paint whatever the last coalescing frame had not yet flushed.
+    flushDeltas()
+    if (!b.streaming) return
+    b.streaming = false
+    if (incomplete) b.incomplete = true
+    touch(liveThread())
+    saveThreads()
+    scrollDown()
+  }
+
+  return handlers
 }
 
 // The stream itself failed to open (network, non-200): nothing was ever streamed.
-function finalizeFailure(t, bubble, message) {
-  if (!bubble.streaming) return
-  bubble.content = '⚠️ Error: ' + message
-  bubble.streaming = false
+function finalizeFailure(threadId, bubble, message) {
+  const t = threads.value[threadId]
+  const b = t && (t.messages || []).includes(bubble) ? bubble : null
+  if (!b || !b.streaming) return
+  b.content = '⚠️ Error: ' + message
+  b.streaming = false
   t.lastActive = Date.now()
   saveThreads()
   scrollDown()
@@ -482,15 +603,16 @@ function submitApprovals(msg) {
     if (a.decision === 'EDITED' && a.editedArgs) d.editedArguments = a.editedArgs
     return d
   })
+  const threadId = activeThreadId.value
+  const t = threads.value[threadId]
+  if (!t) return
   loading.value = true
   // The resumed run streams on its own connection: a fresh bubble fills with the
   // revised answer, and it may interrupt again on the next risky tool call.
-  const t = threads.value[activeThreadId.value]
   const bubble = { role: 'assistant', content: '', streaming: true }
   t.messages.push(bubble)
-  approveStream(activeThreadId.value, decisions, makeStreamHandlers(t, bubble))
-    .catch(err => finalizeFailure(t, bubble, err?.message || 'Request failed'))
-    .finally(() => { loading.value = false; scrollDown() })
+  runStream(threadId, bubble, (signal, handlers) =>
+    approveStream(threadId, decisions, handlers, signal))
 }
 
 function formatArgs(args) {
@@ -540,6 +662,10 @@ onMounted(() => {
     refreshTasks()
   }
 })
+
+// A route change unmounts the view while a run may still be streaming: abort it,
+// or the reader lives on holding a dead component and the run never settles.
+onUnmounted(() => stopStream())
 </script>
 
 <style scoped>
@@ -663,6 +789,12 @@ onMounted(() => {
 .msg-text { padding: 11px 15px; border-radius: 14px; font-size: 13.5px; line-height: 1.7; }
 .message.assistant .msg-text { background: var(--bg2); border: 1px solid var(--border); box-shadow: var(--shadow); border-top-left-radius: 5px; }
 .message.user .msg-text { background: var(--accent); color: #fff; border-top-right-radius: 5px; white-space: pre-wrap; word-break: break-word; }
+/* Shown when a stream ended without its terminal event: the bubble above holds
+   only what arrived, so it must not read as a finished answer. */
+.incomplete-note {
+  display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 0 4px;
+  font-size: 11.5px; color: var(--yellow, #b45309);
+}
 .approval-panel { margin-top: 10px; }
 .approval-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--yellow); font-weight: 600; font-size: 13px; }
 .approval-item { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }

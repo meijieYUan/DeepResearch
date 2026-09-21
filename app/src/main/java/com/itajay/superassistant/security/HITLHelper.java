@@ -82,14 +82,22 @@ public class HITLHelper {
     // ================================================================
 
     private static ApprovalDecision find(List<ApprovalDecision> decisions, String toolId) {
+        if (decisions == null) {
+            return null;
+        }
         for (var d : decisions) {
-            if (d.toolId().equals(toolId)) return d;
+            if (d != null && java.util.Objects.equals(d.toolId(), toolId)) return d;
         }
         return null;
     }
 
     private static InterruptionMetadata.ToolFeedback applyDecision(
             InterruptionMetadata.ToolFeedback original, ApprovalDecision d) {
+        // A decision without a result carries no instruction — leave the feedback as is
+        // rather than writing null into the builder.
+        if (d.result() == null) {
+            return original;
+        }
         var fb = InterruptionMetadata.ToolFeedback.builder(original);
         if (d.result() == InterruptionMetadata.ToolFeedback.FeedbackResult.EDITED
                 && d.editedArguments() != null) {

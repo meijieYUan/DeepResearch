@@ -1,0 +1,39 @@
+# 测试 profile 配置（单元测试基础）
+#
+# 用途：为不依赖真实外部基础设施的测试提供可启动的 Spring 上下文。
+# 启用方式：在测试类上标注 @ActiveProfiles("test")（Spring Boot 不会自动激活本文件）。
+#
+# 说明：启动完整应用上下文还需要 MySQL 表结构（checkpoint / mybatis 表）、Milvus 向量库、
+# 以及 MCP 邮件服务；本文件只把「能靠内存替身满足的部分」替换掉，作为后续单测的起点，
+# 不保证 standalone 就能撑起整个 SuperAssistantApplication 上下文。
+# 因此 SuperAssistantApplicationTests#contextLoads 仍标注 @Disabled，
+# 需要真机依赖的集成验证请显式启用集成 profile 后运行。
+
+spring:
+  datasource:
+    # H2 内存库：仅测试生命周期内存在，随 JVM 退出销毁
+    url: jdbc:h2:mem:test;DB_CLOSE_DELAY=-1;MODE=MySQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  sql:
+    init:
+      # 如需用 app/src/main/resources/sql 下的建表脚本初始化 H2，可在此打开
+      mode: never
+
+  ai:
+    # 关闭 MCP 客户端：测试不连局域网内的邮件 MCP 服务
+    mcp:
+      client:
+        enabled: false
+
+  autoconfigure:
+    exclude:
+      # 向量库（Milvus）需要真实服务，测试环境排除
+      - org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreAutoConfiguration
+      # DashScope 需要 API Key，测试环境排除
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeMultimodalEmbeddingAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      # 与主配置一致：避免 JdbcChatMemoryRepository 与本项目 CustomJdbcChatMemoryRepository 冲突
+      - org.springframework.ai.model.chat.memory.repository.jdbc.autoconfigure.JdbcChatMemoryRepositoryAutoConfiguration

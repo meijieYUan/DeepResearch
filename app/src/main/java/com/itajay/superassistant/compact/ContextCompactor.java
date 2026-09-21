@@ -14,11 +14,18 @@ import org.springframework.ai.chat.prompt.Prompt;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
 /**
@@ -62,6 +69,17 @@ public final class ContextCompactor {
             """;
 
     private static final int COMPACT_INPUT_MAX_CHARS = 30_000;
+
+    /** Bounded parallelism for chunk summarization; each task is one blocking LLM call. */
+    private static final int SUMMARY_PARALLELISM = 4;
+    /** Overall deadline for the parallel chunk phase; exceeding it degrades to L1-L3. */
+    private static final Duration SUMMARY_TIMEOUT = Duration.ofMinutes(5);
+    private static final ExecutorService SUMMARY_EXECUTOR =
+            Executors.newFixedThreadPool(SUMMARY_PARALLELISM, task -> {
+                Thread thread = new Thread(task, "compact-summary");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private record SnapshotMessage(String type, String content) {}
 
@@ -153,16 +171,45 @@ public final class ContextCompactor {
             return null;
         }
 
-        List<String> summaries = new ArrayList<>();
-        for (String chunk : chunks) {
-            String summary = callSummaryModel(COMPACT_PROMPT + chunk, chatModel);
+        if (chunks.size() == 1) {
+            String summary = callSummaryModel(COMPACT_PROMPT + chunks.get(0), chatModel);
+            return summary == null || summary.isBlank() ? null : summary.trim();
+        }
+
+        // Chunk summaries are independent LLM calls — run them in parallel under one
+        // overall deadline. The old serial loop could block the BEFORE_AGENT hook (and
+        // with it the whole run) for minutes on a long history. On timeout or any chunk
+        // failure we return null, and CompactHook degrades to the L1-L3 result.
+        List<CompletableFuture<String>> futures = chunks.stream()
+                .map(chunk -> CompletableFuture.supplyAsync(
+                        () -> callSummaryModel(COMPACT_PROMPT + chunk, chatModel),
+                        SUMMARY_EXECUTOR))
+                .toList();
+        try {
+            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
+                    .get(SUMMARY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            futures.forEach(f -> f.cancel(true));
+            log.error("Full compact aborted: {} chunk summaries did not finish within {}",
+                    chunks.size(), SUMMARY_TIMEOUT);
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            futures.forEach(f -> f.cancel(true));
+            log.warn("Full compact interrupted during chunk summarization");
+            return null;
+        } catch (ExecutionException e) {
+            log.error("Full compact chunk summarization failed", e.getCause());
+            return null;
+        }
+
+        List<String> summaries = new ArrayList<>(futures.size());
+        for (CompletableFuture<String> future : futures) {
+            String summary = future.getNow(null);
             if (summary == null || summary.isBlank()) {
                 return null;
             }
             summaries.add(summary);
-        }
-        if (summaries.size() == 1) {
-            return summaries.get(0).trim();
         }
 
         StringBuilder mergedInput = new StringBuilder();

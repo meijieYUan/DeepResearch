@@ -6,14 +6,20 @@ const api = axios.create({ baseURL: '/api', timeout: 120000 })
 api.interceptors.response.use(
   response => response,
   error => {
-    const msg = error.response?.data?.message || error.message || 'Request failed'
-    toast(msg, 'error')
+    // `silent: true` on a request opts out of the global toast — used by the
+    // health poll, whose failure is already shown by the sidebar status chip and
+    // would otherwise toast on every tick while the backend is down.
+    if (!error.config?.silent) {
+      const msg = error.response?.data?.message || error.message || 'Request failed'
+      toast(msg, 'error')
+    }
     return Promise.reject(error)
   }
 )
 
-// Health
-export const getHealth = () => api.get('/health')
+// Health — polled on a timer, so it fails fast on its own short timeout (the
+// global 120s would keep a dead backend looking "pending") and never toasts.
+export const getHealth = () => api.get('/health', { silent: true, timeout: 5000 })
 
 // Chat — the POST response body IS the run: an SSE stream carrying
 // progress / delta / answer / interruption / error events, closed by done.
@@ -21,13 +27,17 @@ export const getHealth = () => api.get('/health')
 //
 // handlers: { onProgress, onDelta, onAnswer, onInterruption, onError, onDone }
 // — each receives the parsed JSON payload (delta: {text}, answer: {text, threadId,
-// planEnabled, planActive}, ...). The returned promise resolves when the stream
-// closes; it rejects only if the stream never started (network/HTTP error).
-export async function streamChatEvents(threadId, path, body, handlers) {
+// planEnabled, planActive}, ...). `signal` (an AbortSignal) cancels the request and
+// the reader loop; aborting rejects the promise with an AbortError. The returned
+// promise resolves when the stream closes; it rejects if the stream never started
+// (network/HTTP error) or is aborted. A stream can also close without ever sending
+// `done`, so callers must not rely on onDone alone to finalize state.
+export async function streamChatEvents(threadId, path, body, handlers, signal) {
   const res = await fetch(`/api/chat/${threadId}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   })
   if (!res.ok || !res.body) {
     throw new Error(`Chat stream failed to open (HTTP ${res.status})`)
@@ -72,11 +82,11 @@ export async function streamChatEvents(threadId, path, body, handlers) {
   dispatchFrame()
 }
 
-export const chatStream = (threadId, message, mode, handlers) =>
-  streamChatEvents(threadId, '', { message, mode }, handlers)
+export const chatStream = (threadId, message, mode, handlers, signal) =>
+  streamChatEvents(threadId, '', { message, mode }, handlers, signal)
 
-export const approveStream = (threadId, decisions, handlers) =>
-  streamChatEvents(threadId, '/approve', { decisions }, handlers)
+export const approveStream = (threadId, decisions, handlers, signal) =>
+  streamChatEvents(threadId, '/approve', { decisions }, handlers, signal)
 
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId } })

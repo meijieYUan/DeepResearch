@@ -14,35 +14,29 @@
     <name>DeepResearchAgent</name>
     <description>DeepResearchAgent · 课题调研智能体</description>
     <properties>
-        <java.version>21</java.version>
-        <maven.compiler.source>21</maven.compiler.source>
-        <maven.compiler.target>21</maven.compiler.target>
-        <java.version>21</java.version>
+        <!-- java.version / spring-ai.version 由根 pom 统一声明，此处不重复 -->
         <spring-ai-alibaba.version>2.0.0-M1.1</spring-ai-alibaba.version>
-        <spring-ai.version>2.0.0-M1</spring-ai.version>
         <mybatis-plus.version>3.5.17</mybatis-plus.version>
         <lucene.version>9.12.1</lucene.version>
     </properties>
     <dependencies>
+        <!-- spring-ai-* 版本由根 pom import 的 spring-ai-bom 统一管理 -->
         <!-- Source: https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-starter-model-chat-memory-repository-jdbc -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-chat-memory-repository-jdbc</artifactId>
-            <version>${spring-ai.version}</version>
             <scope>compile</scope>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-markdown-document-reader -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-markdown-document-reader</artifactId>
-            <version>${spring-ai.version}</version>
             <scope>compile</scope>
         </dependency>
-        <!-- Source: https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-markdown-document-reader -->
+        <!-- Source: https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-pdf-document-reader -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-pdf-document-reader</artifactId>
-            <version>${spring-ai.version}</version>
             <scope>compile</scope>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/org.projectlombok/lombok -->
@@ -50,20 +44,19 @@
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <version>1.18.46</version>
-            <scope>compile</scope>
+            <scope>provided</scope>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/com.alibaba.cloud.ai/spring-ai-alibaba-starter-dashscope -->
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
-            <version>2.0.0-M1.1</version>
+            <version>${spring-ai-alibaba.version}</version>
             <scope>compile</scope>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-milvus-store -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-milvus-store</artifactId>
-            <version>${spring-ai.version}</version>
             <scope>compile</scope>
         </dependency>
         <dependency>
@@ -101,7 +94,6 @@
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-mcp-client-webflux</artifactId>
-            <version>${spring-ai.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>org.springframework.ai</groupId>
@@ -117,7 +109,6 @@
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-deepseek</artifactId>
-            <version>${spring-ai.version}</version>
         </dependency>
 
         <dependency>
@@ -128,7 +119,7 @@
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
-            <scope>runtime</scope>
+            <scope>test</scope>
         </dependency>
 
         <dependency>
@@ -158,17 +149,26 @@
 
     <build>
         <plugins>
+            <!-- 版本由根 pom 的 pluginManagement 锁定（4.1.0）。
+                 repackage 必须显式声明：否则 mvn package 产出的是普通 jar，
+                 没有可执行的主类清单与依赖，无法 java -jar 运行。 -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <configuration>
                     <parameters>true</parameters>
-                    <source>21</source>
-                    <target>21</target>
+                    <!-- 只用 release：source/target 与之并存是冗余配置 -->
                     <release>21</release>
                 </configuration>
             </plugin>

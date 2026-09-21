@@ -103,21 +103,25 @@ function startResize(e) {
   window.addEventListener('mouseup', onUp)
 }
 
+// Recursive setTimeout rather than setInterval: the next check is armed only once
+// this one settles, so a backend that hangs can't stack overlapping requests and
+// the poll interval stays honest. The request itself is silent (see api/index.js).
 async function checkHealth() {
   try {
     await getHealth()
     backendUp.value = true
   } catch {
     backendUp.value = false
+  } finally {
+    timer = setTimeout(checkHealth, 10000)
   }
 }
 
 onMounted(() => {
   loadSidebarPrefs()
   checkHealth()
-  timer = setInterval(checkHealth, 10000)
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => clearTimeout(timer))
 </script>
 
 <style scoped>

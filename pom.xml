@@ -18,10 +18,21 @@
     <properties>
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Spring AI 版本：由根 pom 统一声明，子模块不再各自重复定义 -->
+        <spring-ai.version>2.0.0-M1</spring-ai.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <!-- Spring AI BOM：统一管理 spring-ai-* 各模块版本，避免逐条手工对齐漂移。
+                 版本与 spring-ai-alibaba 2.0.0-M1.1 配套，勿单独升级。 -->
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-dependencies</artifactId>
@@ -31,5 +42,24 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!-- 显式锁定插件版本：否则 Maven 会取中央仓库的 latest，
+                     会把 spring-boot-maven-plugin 解析到里程碑版本（曾出现 4.2.0-M1）。 -->
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>4.1.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.14.1</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 
 </project>

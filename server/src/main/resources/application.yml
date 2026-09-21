@@ -16,7 +16,8 @@ spring:
   mail:
     host: ${SMTP_HOST:smtp.163.com}
     port: ${SMTP_PORT:465}
-    username: ${SMTP_USER:Jay09290011@163.com}
+    # 发信账号必须由环境变量提供，不设默认值（避免把真实邮箱写进仓库）
+    username: ${SMTP_USER:}
     password: ${SMTP_PASSWORD:}
     properties:
       mail.smtp.auth: true

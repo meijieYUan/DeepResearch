@@ -400,7 +400,7 @@ GET /api/chat/{threadId}/stream   →  text/event-stream
 DeepResearchAgent/
 ├── pom.xml                        # 父 POM，依赖管理（app + server 两模块）
 ├── docker-compose.yml             # MySQL + Milvus(+etcd+minio) 容器编排
-├── frontend/                      # Vue 3 前端 :5173
+├── frontend/                      # Vue 3 前端 :3000
 │   ├── vite.config.js
 │   └── src/
 │       ├── App.vue
@@ -695,7 +695,7 @@ mvn spring-boot:run    # → :8080
 
 # 4. 前端
 cd frontend
-npm install && npm run dev   # → :5173
+npm install && npm run dev   # → :3000
 
 # 5. 测试
 curl -X POST http://localhost:8080/api/chat/test-001 \

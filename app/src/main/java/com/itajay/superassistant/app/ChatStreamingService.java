@@ -105,10 +105,32 @@ public class ChatStreamingService {
      * thread and everything it produces is forwarded to the emitter.
      */
     public SseEmitter start(String threadId, String input, RunnableConfig config, boolean planEnabled) {
+        return start(threadId, input, config, planEnabled, null);
+    }
+
+    /**
+     * Variant with an {@code onAccepted} callback that runs <em>after</em> the
+     * one-run-per-thread slot is acquired but <em>before</em> the run is submitted.
+     * Callers use it for side effects (persisting the user message) that must not
+     * happen when the request is rejected because the thread is busy — otherwise a
+     * never-processed user message pollutes the conversation history. If the callback
+     * throws, the slot is released and the exception propagates to the caller.
+     */
+    public SseEmitter start(String threadId, String input, RunnableConfig config,
+                            boolean planEnabled, Runnable onAccepted) {
         SseEmitter emitter = new SseEmitter(TIMEOUT_MS);
 
         if (running.putIfAbsent(threadId, Boolean.TRUE) != null) {
             return rejected(threadId, "该会话已有任务在执行中，请等待其完成后再发送新消息");
+        }
+
+        if (onAccepted != null) {
+            try {
+                onAccepted.run();
+            } catch (RuntimeException e) {
+                running.remove(threadId);
+                throw e;
+            }
         }
 
         // Progress events from workflow tools reach the response stream through the

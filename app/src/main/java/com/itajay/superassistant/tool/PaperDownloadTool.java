@@ -281,6 +281,9 @@ public class PaperDownloadTool {
             failures.add(url + ": unsupported scheme (only http/https allowed)");
             return null;
         }
+        if (!isPublicHost(url, uri, failures)) {
+            return null;
+        }
 
         int attempts = Math.max(1, props.getMaxRetries());
         long backoff = props.getInitialBackoffMs();
@@ -352,6 +355,50 @@ public class PaperDownloadTool {
 
         failures.add(url + ": " + lastError + " (after " + attempts + " attempt(s))");
         return null;
+    }
+
+    /**
+     * SSRF guard: refuse hosts that resolve to non-public addresses.
+     *
+     * <p>Download URLs come from the model (and landing pages come from the network),
+     * so a prompt-injected or malicious page could point the tool at loopback, an
+     * internal service, or the cloud metadata address (169.254.169.254). Every hop of
+     * the redirect chain re-enters {@code fetchOnce}, so the whole chain is checked.</p>
+     *
+     * <p>This validates at name-resolution time; a DNS record that changes between the
+     * check and the connection (rebinding) is out of scope for a paper downloader.</p>
+     */
+    private boolean isPublicHost(String url, URI uri, List<String> failures) {
+        String host = uri.getHost();
+        if (host == null || host.isBlank()) {
+            failures.add(url + ": missing host");
+            return false;
+        }
+        java.net.InetAddress[] addresses;
+        try {
+            addresses = java.net.InetAddress.getAllByName(host);
+        } catch (java.net.UnknownHostException e) {
+            failures.add(url + ": unknown host");
+            return false;
+        }
+        for (java.net.InetAddress address : addresses) {
+            if (address.isLoopbackAddress() || address.isAnyLocalAddress()
+                    || address.isLinkLocalAddress() || address.isSiteLocalAddress()
+                    || address.isMulticastAddress() || isCarrierGradeNat(address)) {
+                log.warn("Blocked download from non-public address {} ({})", address.getHostAddress(), host);
+                failures.add(url + ": host resolves to a non-public address (blocked)");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 100.64.0.0/10 (RFC 6598 shared space) — not reachable as a public paper host. */
+    private static boolean isCarrierGradeNat(java.net.InetAddress address) {
+        byte[] bytes = address.getAddress();
+        return bytes.length == 4
+                && (bytes[0] & 0xFF) == 100
+                && (bytes[1] & 0xC0) == 64;
     }
 
     /** Writes the downloaded bytes to a temp file, validates it, then moves it into place. */

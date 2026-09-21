@@ -45,14 +45,16 @@ spring:
         sse:
           connections:
             email-server:
-              url: http://localhost:8081
+              url: ${MCP_EMAIL_URL:http://localhost:8081}
               sse-endpoint: /sse
 
+  # 数据源由 Spring Boot 自动配置装配（SaverConfig 不再手写 DataSource Bean）。
+  # 凭据一律走环境变量，冒号后为本地开发默认值；生产部署必须显式设置 DB_PASSWORD。
   datasource:
-    url: jdbc:mysql://localhost:3306/superassistant
+    url: ${DB_URL:jdbc:mysql://localhost:3306/superassistant}
     driver-class-name: com.mysql.cj.jdbc.Driver
-    username: root
-    password: 123456
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:123456}
 
 mybatis-plus:
   configuration:

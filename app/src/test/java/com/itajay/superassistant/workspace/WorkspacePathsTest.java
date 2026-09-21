@@ -20,7 +20,10 @@ class WorkspacePathsTest {
         // The working directory during tests is app/, so walking up to .git must find
         // the repository root. Otherwise output would land in app/investigation/.
         assertThat(WorkspacePaths.root().resolve(".git")).exists();
-        assertThat(WorkspacePaths.root().getFileName().toString()).isEqualTo("SuperAssistant");
+        // The root's identity is "the ancestor carrying .git", not a fixed folder name:
+        // checkout directory names differ per machine (this assertion used to hardcode
+        // the original author's clone name and failed everywhere else).
+        assertThat(WorkspacePaths.root().getFileName().toString()).isNotEqualTo("app");
     }
 
     @Test
