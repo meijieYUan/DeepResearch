@@ -250,15 +250,6 @@ public record ReviewResult(
                 List.of(synthetic));
     }
 
-    /** The schema the reviewer is instructed to emit, used to build its prompt. */
-    public static String outputSchema() {
-        return """
-                {"approved": true|false, "verdict": "PASS|REVISE", "summary": "总体意见",
-                 "issues": [{"level": "BLOCKER|MAJOR|MINOR", "target": "WRITER|ANALYST|RESEARCHER",
-                             "location": "章节定位", "check": "检查项编号", "problem": "问题",
-                             "evidence": "材料依据", "fix": "可执行的修改建议"}]}""";
-    }
-
     /** The issues, never null. */
     public List<ReviewIssue> issuesOrEmpty() {
         return issues == null ? List.of() : issues;

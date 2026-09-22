@@ -62,7 +62,7 @@ public class CompactHook extends AgentHook {
             new LinkedHashMap<>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, ThreadCallState> eldest) {
-                    return size() > CompactConfig.FILE_STATE_CACHE_MAX_ENTRIES;
+                    return size() > CompactConfig.THREAD_STATE_CACHE_MAX_ENTRIES;
                 }
             };
 
@@ -114,7 +114,9 @@ public class CompactHook extends AgentHook {
 
         int preTokens = CompactConfig.estimateTokens(originalMessages);
         if (preTokens < thresholds.warningTokens()) {
-            return CompletableFuture.completedFuture(replaceMessages(originalMessages));
+            // Nothing to do: returning the untouched list wrapped in ReplaceAllWith
+            // was a pointless state write on every call below the warning threshold.
+            return CompletableFuture.completedFuture(Map.of());
         }
 
         List<Message> working = new ArrayList<>(originalMessages);

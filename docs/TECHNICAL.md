@@ -146,7 +146,7 @@ afterL3 < criticalTokens(97.2K)  → 返回 L1–L3 结果
 冷却检查：距上次全量压缩 < cooldownCalls(5) 次调用 → 跳过 L4，保留 L1–L3 结果
         │
         ▼
-L4 ContextCompactor      同步 LLM 摘要 + 上下文恢复 → ReplaceAllWith 写回图状态
+L4 ContextCompactor      LLM 摘要（分块并行 + 总超时降级）+ 上下文恢复 → ReplaceAllWith 写回图状态
 ```
 
 | 层 | 实现类 | 行为 | 保护机制 |
@@ -154,7 +154,7 @@ L4 ContextCompactor      同步 LLM 摘要 + 上下文恢复 → ReplaceAllWith 
 | L1 | `ToolResultTruncator` | 单条结果 > 10K tokens：全文落盘 `.compact/tool_results/{threadId}/`，上下文内替换为 500 tokens 预览 + 文件指针 | 目录总量 > 512MB 时按最旧文件修剪 |
 | L2 | `ContextSnip` | ≥ 60 条消息才激活；移除连续重复 user 消息、瞬时错误（429 / timeout / 502-504 …）、低价值填充语 | 工具调用与工具结果**绝对保护**；最近 20 条消息保护 |
 | L3 | `MicroCompact` | 保留最近 5 个工具事务，更早事务仅替换**结果 payload**（保留 assistant 调用与 call id） | `ToolCallIntegrity` 保证不切断事务 |
-| L4 | `ContextCompactor` | 前缀交 LLM 总结（> 30K 字符自动分块 + 合并），保留安全后缀 | 边界回退到工具事务起点，绝不切断调用/结果配对 |
+| L4 | `ContextCompactor` | 前缀交 LLM 总结（> 30K 字符自动分块，分块摘要 **4 路并行**后合并；总超时 5 分钟，超时/失败降级保留 L1–L3 结果），保留安全后缀 | 边界回退到工具事务起点，绝不切断调用/结果配对 |
 
 **L4 产物**（写回图状态 → 随 checkpoint 持久化 → 供后续请求复用）：
 
@@ -166,7 +166,7 @@ L4 ContextCompactor      同步 LLM 摘要 + 上下文恢复 → ReplaceAllWith 
 ... 保留的最近 20 条原始消息
 ```
 
-设计要点：**摘要负责"发生过什么"，附件负责"继续工作需要的上下文"**。同时归档快照到 `.compact/snapshots/{threadId}/`（每线程保留最近 5 个）。
+设计要点：**摘要负责"发生过什么"，附件负责"继续工作需要的上下文"**。同时归档快照到 `.compact/snapshots/{threadId}/`（每线程保留最近 5 个；单条消息截断到 4K 字符、单份快照总量 2M 字符封顶——快照是排障辅助，checkpoint 才是权威状态）。`.compact/` 与 `plans/` 均锚定在 `WorkspacePaths.root()`（仓库根），不随启动目录漂移。
 
 Token 估算由 `TokenEstimator` 抽象，默认 `BpeTokenEstimator`（jtokkit O200K BPE），失败时回退 `HeuristicTokenEstimator`；`TokenBudgets` 提供预算内二分截断。
 
@@ -186,24 +186,26 @@ Token 估算由 `TokenEstimator` 抽象，默认 `BpeTokenEstimator`（jtokkit O
 | `sendEmail` | 邮件发送（审批前可编辑收件人/主题/正文） |
 | `sendEmailBatch` | 批量邮件发送（审批前可编辑参数） |
 
-**两阶段交互流程**：
+**两阶段交互流程**（两个 POST 的响应体本身就是 SSE 流，见 §9）：
 
 ```
 阶段 1: POST /api/chat/{threadId}
   → Agent 执行到高危操作
-  → 返回 { type: "INTERRUPTED", pendingApprovals: [...] }
+  → 流上推送 interruption 事件 { pendingApprovals: [...] }，随后 done 并关流
   → 前端渲染审批面板 [同意] [拒绝] [编辑]
 
 阶段 2: POST /api/chat/{threadId}/approve
   → 提交 decisions: [{toolId, result, editedArguments?}]
+  → 请求先过前置校验（decisions 非空、每条含 toolId/result、EDITED 必带合法 JSON 的
+    editedArguments）——校验失败返回明确错误且**不丢弃待审批状态**，可修正后重试
   → 后端 HITLHelper.approveOneByOne() 逐条应用决策
-  → RunnableConfig.addHumanFeedback() 注入 → Agent 恢复执行
+  → RunnableConfig.addHumanFeedback() 注入 → Agent 恢复执行（在同一响应流上继续输出）
   → 链式中断自动处理（多个高危操作可连续触发审批）
 ```
 
 `result` 可选值：`APPROVED` / `REJECTED` / `EDITED`。`EDITED` 时必填 `editedArguments` 提供修改后的工具参数。
 
-中断现场由 `PendingInterruptionStore` 以 `threadId` 为键暂存（含原始 `RunnableConfig` 与输入消息），恢复时据此重建 `RunnableConfig`。核心类：[SuperAssistant.java](../app/src/main/java/com/itajay/superassistant/app/SuperAssistant.java) · [HITLHelper.java](../app/src/main/java/com/itajay/superassistant/security/HITLHelper.java) · [ApprovalDecision.java](../app/src/main/java/com/itajay/superassistant/security/ApprovalDecision.java)
+中断现场由 `PendingInterruptionStore` 以 `threadId` 为键暂存（含原始 `RunnableConfig` 与输入消息），恢复时据此重建 `RunnableConfig`。条目 **30 分钟过期**（惰性 + 定时清扫），无人审批的中断不会永久占用内存；仍是单实例内存态——重启丢失、多副本互不可见，落库是已知跟进项。**审批悬置期间该会话拒绝新消息**（提示先处理审批），避免新运行复用中断 config 造成状态混淆。核心类：[SuperAssistant.java](../app/src/main/java/com/itajay/superassistant/app/SuperAssistant.java) · [HITLHelper.java](../app/src/main/java/com/itajay/superassistant/security/HITLHelper.java) · [ApprovalDecision.java](../app/src/main/java/com/itajay/superassistant/security/ApprovalDecision.java)
 
 ### 4. RAG 检索增强生成
 
@@ -220,8 +222,8 @@ Token 估算由 `TokenEstimator` 抽象，默认 `BpeTokenEstimator`（jtokkit O
 - TokenTextSplitter：chunkSize=800，maxChunks=500
 - API：`POST /knowledge/upload`（multipart file）
 - `RagHook` 通过 `ReplaceAllWith` 覆盖 `rag-agent` 的状态消息；历史上下文由 main-agent 持有，`rag-agent` 无独立 checkpoint
-- BM25 倒排索引持久化于 `rag.retrieval.bm25.index-path`（默认 `./data/bm25-index`）
-- `QueryTransformation`（查询压缩改写）已实现但未接入管线
+- BM25 倒排索引持久化于 `rag.retrieval.bm25.index-path`（默认 `./data/bm25-index`）。读取走 Lucene `SearcherManager`（NRT，检索不再每次重开索引、读写不互斥）；每个 chunk 记录来源文件名，**同名文件重复导入先删旧 chunk 再写新**；索引写入失败会显式告警（向量库有、关键字库缺是双写不一致，不再静默）
+- 检索链路逐级降级：查询扩展失败退回原查询、单路召回失败只损失该路、精排失败退回融合候选——外部依赖故障不再拖垮整个 RAG 回答
 
 ### 5. 持久记忆体系
 
@@ -262,10 +264,10 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | **FileOperationTool** | `readFile` / `writeFile` / `createFile` / `deleteFile` / `listFiles`，路径限制在 workspace 内 |
 | **MemoryTool** | `remember` / `recall` / `listMemories` / `deleteFact` / `consolidateMemories` |
 | **PlanTool** | `enterPlanMode` / `exitPlanMode` |
-| **TerminalTool** | `executeCommand`（纳入 HITL 审批） |
+| **TerminalTool** | `executeCommand`（纳入 HITL 审批）。工作目录强制限定在 workspace 内（绝对路径/`..` 逃逸被拒）；输出泵在独立线程、30s 超时可靠生效；计划模式的"只读命令"判定拒绝一切 shell 操作符（管道/重定向/命令替换）与 `find -delete`、`git config <key> <value>` 等变相写入 |
 | **CreateAgentTool** | 动态创建子 Agent 执行独立任务 |
 | **SkillResourceTool** | `readSkillResource`，只读读取 skill 的参考文件（路径限定在 skills 目录内），供子 Agent 加载参考指南 |
-| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重）。**仅 `research-agent` 使用** |
+| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用** |
 | **PaperTextTool** | `extractPaperText` / `listDownloadedPapers`，读取已下载 PDF 的正文（支持分页、超长截断）。**`analyst-agent` 与 `reviewer-agent` 使用** |
 | **PaperFigureTool** | `extractPaperFigures`，取出 PDF 里**原生嵌入的图片**并落盘为 PNG，**同时返回两种相对路径**（写进 analysis 文件的 `figures/…` 与写进文档的 `../analysis/figures/…`）。**仅 `analyst-agent` 使用** |
 | **DocumentWriteTool** | `writeResearchDocument`，把调研文档写入 `investigation/{课题方向}/document/`（仅限该目录、仅 Markdown） |
@@ -319,22 +321,31 @@ skill 采用渐进式披露（progressive disclosure）拆分：
 **四个子 Agent 刻意不挂 `SkillsAgentHook`。** 该 Hook 会额外注册一个框架自带的 `read_skill` 工具，它按 skill 的 frontmatter 名（`research-writing`，注意与目录名 `research_writing_skill` 不同）查找，且只返回 `SKILL.md`，够不到 `references/*.md`——正是子 Agent 真正需要的文件。两个命名口径不同、能力重叠的"读 skill"工具并列时，模型会开始猜：实测日志里出现了 `Skill not found: reviewer` / `reviewer_skill` / `reviewer-agent` 三次失败调用。现在每个子 Agent 的指令里直接写死唯一正确的调用
 `readSkillResource(skillName="research_writing_skill", relativePath="references/xxx.md")`。主 Agent 仍保留该 Hook，用于技能发现。
 
-### 9. 调研进度实时推送（SSE）
+### 9. 运行流式输出与调研进度推送（SSE）
 
 调研工作流耗时可达数分钟（检索 → 下载 → 精读 → 撰写 → 审查 → 修订），若前端静默等待，用户无法区分"仍在检索"和"已经卡死"。
 
+**POST 响应体就是运行本身**：`POST /api/chat/{threadId}`（及 `/approve`）返回 `text/event-stream`，一次运行的全部产出在同一条流上按事件推送，直到终止事件：
+
 ```
-GET /api/chat/{threadId}/stream   →  text/event-stream
+progress      工作流阶段进度（由工具经 ProgressChannelRegistry 扇入）
+delta         模型增量文本（逐 token）
+answer        运行完成的最终回答 { threadId, text, planEnabled, planActive }
+interruption  高危操作待审批 { pendingApprovals: [...] }（见 §3）
+error         运行失败 { message }
+done          终止标记，随后服务端关流
 ```
 
-- `ProgressChannelRegistry` 按 threadId 维护一条 `SseEmitter`（超时 30 分钟），`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。
+`GET /api/chat/{threadId}/stream` 保留为**调试用**的进度旁路监听（同一 threadId 可多路监听，publish 是多播）。
+
+- `ChatStreamingService` 保证**同一 threadId 同时只有一个运行**（第二个请求立即得到 error+done）；运行在**有界线程池**（上限 16 个并发运行）上执行，超限明确拒绝而非无界堆积。用户消息只在运行被接受后才落库——被拒请求不再污染对话历史。
+- 流超时由 `agent.stream.timeout-minutes` 配置（默认 60 分钟，须覆盖最长的调研运行）。超时只断开 HTTP 流，**运行本身继续**，答案仍写入持久化历史。
+- `ProgressChannelRegistry` 按 threadId 维护监听列表，`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。
 - 阶段枚举：`RESEARCHING` / `WRITING` / `REVIEWING` / `REVISING` / `DONE` / `FAILED`，事件体为 `ProgressEvent{stage, label, round, detail, timestamp}`。
 - 推送是**尽力而为**：没有客户端监听时 `publish` 是 no-op，客户端中途断开只是摘除该 emitter——**工作流绝不因无人监听而失败**。
-- 连接关闭前会先发一个 `done` 事件。少了它，`EventSource` 会把"正常关闭"当作掉线并自动重连，为一个已经结束的运行重新注册通道。
+- 连接关闭前会先发一个 `done` 事件。少了它，客户端会把"正常关闭"当作掉线，为一个已经结束的运行重开连接。前端另有无 `done` 兜底：流意外关闭时气泡退出 streaming 并标记「连接中断，回答可能不完整」。
 
-**为什么 POST 保持阻塞**：`POST /api/chat/{threadId}` 仍是同步阻塞调用（前端把 axios 超时设为 `0`），SSE 走一条**独立并发连接**。改成异步执行会破坏 `PlanContextHolder` 的 `ThreadLocal` 与 HITL 中断/恢复流程——两者都假设整个运行在同一条线程上。
-
-**已知取舍**：SSE 连接随页面销毁，刷新后无法续看进度；但 POST 的返回值仍是权威结果，刷新后可从历史记录看到最终答案。
+**已知取舍**：SSE 连接随页面销毁，刷新后无法续看进度；但运行在服务端继续、答案随 `ModelMessagePersistenceHook` 落库，刷新后可从历史记录看到最终答案。
 
 #### 调研产出目录
 
@@ -386,7 +397,7 @@ GET /api/chat/{threadId}/stream   →  text/event-stream
 | **Agent** | ReactAgent + StateGraph + MysqlSaver（checkpoint 持久化） |
 | **RAG** | QueryExpansion · DocumentRetrieval（向量 + BM25 + RRF）· LlmDocumentReranker |
 | **向量库** | Milvus 2.4.15 (localhost:9090 → 容器 19530) |
-| **数据库** | MySQL 8.0（`superassistant` + `superassistant_rag`） |
+| **数据库** | MySQL 8.0（`superassistant`） |
 | **ORM** | MyBatis Plus |
 | **文档解析** | PDF (ParagraphPdfDocumentReader) · Markdown · TXT/Code (TextReader) |
 | **Token 估算** | jtokkit O200K BPE（失败时回退启发式估算） |
@@ -401,32 +412,35 @@ DeepResearchAgent/
 ├── pom.xml                        # 父 POM，依赖管理（app + server 两模块）
 ├── docker-compose.yml             # MySQL + Milvus(+etcd+minio) 容器编排
 ├── frontend/                      # Vue 3 前端 :3000
-│   ├── vite.config.js
+│   ├── vite.config.js             # dev 代理 + manualChunks 分包（vendor/markdown/highlight）
 │   └── src/
-│       ├── App.vue
+│       ├── App.vue                # 外壳：侧栏（useResizablePanel）+ 健康检查
 │       ├── main.js
-│       ├── api/index.js           # axios 封装（chat / todos / knowledge）
+│       ├── api/index.js           # axios 封装 + SSE 流解析（支持 AbortSignal、silent 静默请求）
 │       ├── assets/style.css       # 全局样式与 CSS 变量
-│       ├── router/index.js        # 路由：/ /knowledge
-│       ├── components/ToastHost.vue
-│       ├── utils/{markdown.js,toast.js}
+│       ├── router/index.js        # 路由（懒加载）：/ /knowledge
+│       ├── composables/           # useThreads（会话+持久化）· useChatStream（SSE 生命周期）
+│       │                          # useTasks（任务面板）· useResizablePanel（拖拽，两视图共用）
+│       ├── components/            # ThreadSidebar · MessageItem（markdown 渲染缓存）
+│       │                          # ApprovalPanel（HITL 审批）· TaskPanel · ToastHost
+│       ├── utils/{markdown.js,toast.js,id.js}   # hljs 按需注册 · toast 去重 · 稳定 id
 │       └── views/
-│           ├── ChatView.vue       # 对话界面（HITL 审批面板 + 计划模式开关 + 任务进度）
-│           └── KnowledgeView.vue  # 知识库上传管理
+│           ├── ChatView.vue       # 对话界面（组合 composables 与子组件）
+│           └── KnowledgeView.vue  # 知识库上传管理（前端校验 + input 重置）
 ├── app/                           # 主应用模块 :8080
 │   ├── pom.xml
 │   └── src/main/java/com/itajay/superassistant/
 │       ├── SuperAssistantApplication.java  # @MapperScan + @ConfigurationPropertiesScan
 │       ├── app/                   # Controller 层
-│       │   ├── SuperAssistant.java       # 核心 API：对话 + HITL 审批
+│       │   ├── SuperAssistant.java       # 核心 API：对话 + HITL 审批（请求校验，响应即 SSE 流）
+│       │   ├── ChatStreamingService.java # 单次运行的流式执行（有界线程池，同 thread 串行）
 │       │   ├── TodoController.java       # Todo REST API
 │       │   ├── RagController.java        # 知识库文件上传 (/knowledge/upload)
 │       │   └── HealthController.java     # 健康检查 (/api/health)
 │       ├── config/                # Spring 配置
 │       │   ├── AgentConfig.java          # main-agent 组装 + Hooks/Interceptors 注册 + 系统提示词
 │       │   ├── ModelConfig.java          # DeepSeek ChatModel / ChatClient
-│       │   ├── McpConfig.java            # MCP Client 自动配置
-│       │   ├── SaverConfig.java          # 双数据源 (superassistant + superassistant_rag) + MysqlSaver
+│       │   ├── SaverConfig.java          # 单数据源 + MysqlSaver
 │       │   ├── VectorConfig.java         # Milvus 向量库
 │       │   ├── AgentGuardConfig.java     # 模型/工具异常兜底
 │       │   ├── CompactProperties.java    # agent.compact 配置绑定
@@ -438,7 +452,7 @@ DeepResearchAgent/
 │       │   ├── CompactHook.java          # BEFORE_AGENT 入口，order=10000
 │       │   ├── CompactThresholds.java    # 动态阈值（窗口 − 预留）× 比例
 │       │   ├── CompactConfig.java        # 静态调优常量
-│       │   ├── ContextCompactor.java     # L4：同步 LLM 摘要 + 上下文恢复
+│       │   ├── ContextCompactor.java     # L4：LLM 摘要（分块并行 + 总超时降级）+ 上下文恢复
 │       │   ├── ToolResultTruncator.java  # L1：工具结果截断 + 落盘
 │       │   ├── ContextSnip.java          # L2：低价值消息裁剪
 │       │   ├── MicroCompact.java         # L3：陈旧工具结果 payload 替换
@@ -469,7 +483,6 @@ DeepResearchAgent/
 │       │   ├── RagHook.java              # 检索 → 注入 system prompt
 │       │   ├── RagService.java           # 文档导入 + 切分 + 入库
 │       │   ├── QueryExpansion.java       # 多路查询扩展
-│       │   ├── QueryTransformation.java  # 查询压缩改写（当前未接入管线）
 │       │   ├── DocumentRetrieval.java    # 向量 + BM25 混合检索
 │       │   ├── Bm25Index.java            # BM25 倒排索引
 │       │   ├── Bm25DocumentRetriever.java
@@ -516,22 +529,17 @@ DeepResearchAgent/
 │       │   ├── WebSearchService.java
 │       │   ├── FileOperationService.java
 │       │   ├── TaskBreakdown.java
-│       │   ├── AgentRunLogService.java        # Agent 运行日志（已实现，暂无调用方）
 │       │   └── ChatMessagePersistenceService.java  # 回答持久化服务
 │       ├── entity/                # MyBatis Plus 实体
-│       │   ├── TodoTask.java
-│       │   └── AgentRunLog.java
+│       │   └── TodoTask.java
 │       ├── mapper/                # MyBatis Mapper
-│       │   ├── TodoTaskMapper.java
-│       │   └── AgentRunLogMapper.java
+│       │   └── TodoTaskMapper.java
 │       ├── skill/                 # Agent Skills
 │       │   └── SkillConfig.java           # ClasspathSkillRegistry
 │       └── resources/
 │           ├── application.yml
 │           ├── sql/
 │           │   ├── todo_task.sql          # todo_task 表
-│           │   ├── plan.sql               # plan_task / plan_step / agent_run_log（计划子系统已移除）
-│           │   ├── plan_agent_decouple.sql
 │           │   └── custom_chat_memory.sql # custom_chat_memory 表
 │           └── skills/
 │               └── research_writing_skill/
@@ -560,15 +568,15 @@ DeepResearchAgent/
 
 ### 核心对话
 
+两个 POST 的响应体**本身就是 SSE 流**（见 §9）：一次运行的进度、增量文本与终止事件都在同一条连接上。
+
 | Method | Path | Request | Response |
 |--------|------|---------|----------|
-| POST | `/api/chat/{threadId}` | `{"message":"...", "mode":"Default|PlanMode"}` | `{type:"ANSWER", response:"..."}` 或 `{type:"INTERRUPTED", pendingApprovals:[...]}` |
-| POST | `/api/chat/{threadId}/approve` | `{"decisions":[{"toolId","result","description?","editedArguments?"}]}` | 同 chat 响应格式 |
-| GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，事件名 `progress`（`ProgressEvent`）/ `done`（运行结束） |
+| POST | `/api/chat/{threadId}` | `{"message":"...", "mode":"Default|PlanMode"}` | `text/event-stream`：`progress` / `delta` / 终止事件（`answer` \| `interruption` \| `error`）/ `done` |
+| POST | `/api/chat/{threadId}/approve` | `{"decisions":[{"toolId","result","description?","editedArguments?"}]}` | 同 chat 流格式（恢复的运行继续在本流上输出） |
+| GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，调试用进度旁路监听（`progress` / `done`） |
 
-响应中额外包含 `planEnabled` / `planActive` 字段反映计划模式状态。
-
-`stream` 是独立于 POST 的第二条连接，需**在发 POST 之前**打开——工作流可能在毫秒内就推送第一个阶段事件。POST 返回后服务端关闭该流（先发 `done`）。
+`answer` / `interruption` 事件体中包含 `planEnabled` / `planActive` 字段反映计划模式状态。无法开始的请求（会话占用中、消息为空/过长、审批悬置时发新消息、decisions 校验失败、并发已达上限）同样以 `error` + `done` 事件流返回，HTTP 状态保持 200——状态行无法承载逐运行的语义。
 
 ### 知识库
 
@@ -606,8 +614,13 @@ DeepResearchAgent/
 ```bash
 DEEPSEEK_API_KEY=sk-xxxxxxxx    # DeepSeek API 密钥（对话/摘要/精排）
 EMBEDDING_KEY=sk-xxxxxxxx       # DashScope API 密钥（向量化）
+SMTP_USER=you@example.com       # 发信邮箱（MCP Email Server，无默认值）
 SMTP_PASSWORD=xxxxxxxx          # 邮箱 SMTP 密码（MCP Email Server）
-# 可选：SMTP_PORT（默认 465）
+# 可选：SMTP_HOST（默认 smtp.163.com）、SMTP_PORT（默认 465）
+# 可选（有本地开发默认值，生产必须显式设置）：
+#   DB_URL / DB_USERNAME / DB_PASSWORD   主库连接（默认 localhost:3306/superassistant, root/123456）
+#   MCP_EMAIL_URL                        MCP 邮件服务地址（默认 http://localhost:8081）
+#   MYSQL_ROOT_PASSWORD / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   docker-compose 基础设施凭据（见 .env.example）
 ```
 
 **`app/application.yml` 关键配置**：
@@ -615,10 +628,11 @@ SMTP_PASSWORD=xxxxxxxx          # 邮箱 SMTP 密码（MCP Email Server）
 ```yaml
 spring.ai.deepseek.api-key: ${DEEPSEEK_API_KEY}
 spring.ai.dashscope.api-key: ${EMBEDDING_KEY}
-spring.ai.mcp.client.sse.connections.email-server.url: http://localhost:8081
-spring.datasource.url: jdbc:mysql://localhost:3306/superassistant
-spring.datasource.username: root
-spring.datasource.password: 123456
+spring.ai.mcp.client.sse.connections.email-server.url: ${MCP_EMAIL_URL:http://localhost:8081}
+# 数据源由 Spring Boot 自动配置装配（SaverConfig 只负责把 MysqlSaver 接到该 DataSource 上）
+spring.datasource.url: ${DB_URL:jdbc:mysql://localhost:3306/superassistant}
+spring.datasource.username: ${DB_USERNAME:root}
+spring.datasource.password: ${DB_PASSWORD:123456}
 
 # RAG 检索与精排
 rag:
@@ -629,6 +643,10 @@ rag:
   rerank:
     enabled: true
     top-k: 5
+
+# 对话/进度 SSE 流的生命周期上限（分钟）；超时只断流，运行继续、答案仍落库
+agent.stream:
+  timeout-minutes: 60
 
 # 上下文压缩：动态阈值 =（模型窗口 − 输出预留 − 系统/工具预留）× 比例
 agent.compact:
@@ -660,7 +678,7 @@ agent.checkpoint-retention:
 
 ```
 Milvus    → localhost:9090
-MySQL     → localhost:3306（database: superassistant；另需 superassistant_rag）
+MySQL     → localhost:3306（database: superassistant）
 ```
 
 也可直接用项目根目录的 Docker Compose 启动 MySQL + Milvus（含 etcd / minio 依赖）：
@@ -675,9 +693,6 @@ docker compose ps
 ```bash
 mysql -u root -p superassistant < app/src/main/resources/sql/todo_task.sql
 mysql -u root -p superassistant < app/src/main/resources/sql/custom_chat_memory.sql
-# plan_task / plan_step / agent_run_log（计划子系统已移除，按需导入）
-mysql -u root -p superassistant < app/src/main/resources/sql/plan.sql
-mysql -u root -p superassistant < app/src/main/resources/sql/plan_agent_decouple.sql
 ```
 
 ## 快速启动
@@ -705,11 +720,10 @@ curl -X POST http://localhost:8080/api/chat/test-001 \
 
 ## HITL 审批流程（开发参考）
 
-审批触发时，`SuperAssistant.chat()` 返回的数据结构：
+审批触发时，POST 响应流上推送 `interruption` 事件（随后 `done` 并关流），事件数据结构：
 
 ```json
 {
-  "type": "INTERRUPTED",
   "threadId": "test-001",
   "message": "High-risk operations require approval",
   "planEnabled": false,
@@ -725,7 +739,7 @@ curl -X POST http://localhost:8080/api/chat/test-001 \
 }
 ```
 
-前端提交审批：
+前端提交审批（响应同样是 SSE 流，恢复的运行在这条流上继续输出直至新的终止事件）：
 
 ```json
 POST /api/chat/test-001/approve
@@ -740,7 +754,7 @@ POST /api/chat/test-001/approve
 }
 ```
 
-`result` 可选值：`APPROVED` / `REJECTED` / `EDITED`。`REJECTED` 时可选填 `description` 描述拒绝理由；`EDITED` 时必填 `editedArguments`。
+`result` 可选值：`APPROVED` / `REJECTED` / `EDITED`。`REJECTED` 时可选填 `description` 描述拒绝理由；`EDITED` 时必填 `editedArguments`（须为合法 JSON，请求前置校验，不合法时返回 `error` 事件且**保留**待审批状态供修正重试）。待审批状态 30 分钟过期。
 
 ## Database
 
@@ -749,8 +763,6 @@ POST /api/chat/test-001/approve
 | `todo_task` | 待办事项，MyBatis Plus 管理 |
 | `custom_chat_memory` | 对话渲染记录，`CustomJdbcChatMemoryRepository` 管理 |
 | `GRAPH_THREAD` / `GRAPH_CHECKPOINT` | MysqlSaver 图状态快照，`CheckpointRetentionService` 定时清理 |
-| `plan_task` / `plan_step` | 计划子系统遗留表（对应代码已移除，可忽略） |
-| `agent_run_log` | Agent 运行日志（`AgentRunLogService` 已实现，暂无调用方） |
 
 ## 已知限制
 
@@ -768,7 +780,7 @@ POST /api/chat/test-001/approve
 
 ## 注意事项
 
-- `SaverConfig` 配置了两个 DataSource Bean：`dataSource`（`superassistant` 库，`@Primary`）与 `ragDataSource`（`superassistant_rag` 库），后者供 `CustomJdbcChatMemoryRepository` 使用；数据库名均为**小写**。
+- `SaverConfig` 只把 `MysqlSaver` 接到 Spring Boot 自动配置的单个 DataSource（`superassistant` 库，由 `spring.datasource.*` 驱动，密码经 `DB_PASSWORD`）；此前手工构造的双数据源（含未被任何地方注入的 `ragDataSource`）已移除；数据库名均为**小写**。
 - **任务系统为线程维度**：`todo_task.thread_id` 是任务的归属键，`step_no` 编号与 `step_key` 去重都按会话计算。Agent 工具（`todoWrite` / `createTask` / `queryTodos` / `getReadyTasks`）一律从 `ToolContext` 的 `threadId` 绑定，**不由模型传入**；REST 查询接口必须带 `threadId`，缺省返回错误。
 - `HumanInTheLoopHook` 的恢复依赖 `RunnableConfig.Builder.addHumanFeedback(InterruptionMetadata)`，不要手动调用 `CompiledGraph.updateState()`。
 - MCP email 工具名称必须与 `@Tool` 注解暴露的名称一致：`sendEmail` / `sendEmailBatch`。
@@ -779,6 +791,6 @@ POST /api/chat/test-001/approve
 - `CompactHook` 必须在 `BEFORE_AGENT` hook 中最后执行（`getOrder() = 10000`），以保证 token 估算覆盖最终消息列表。
 - `PlanModeToolInterceptor` 在计划模式激活时隐藏 `writeFile`、`deleteFile`、`executeCommand`、`sendEmail`、`sendEmailBatch`；未启用计划模式时隐藏 `enterPlanMode` / `exitPlanMode`。
 - `compaction` 的 LRU 缓存（文件访问状态、线程调用计数）上限为 `CompactConfig.FILE_STATE_CACHE_MAX_ENTRIES`（100）。
-- 本地运行测试若使用 JDK 25，Mockito 会因 MockMaker 与新版 JDK 不兼容而报错（`AgentRunLogServiceTest` 使用 mock）；建议以 JDK 21 运行测试。
+- 本地运行测试若使用 JDK 25，Mockito 会因 MockMaker 与新版 JDK 不兼容而报错（`CheckpointRetentionServiceTest`、`ChatStreamingServiceTest` 等使用 mock）；建议以 JDK 21 运行测试。
 
 维护者：[itajay](mailto:author@itajay.com)

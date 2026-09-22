@@ -2,6 +2,7 @@ package com.itajay.superassistant.progress;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -29,8 +30,14 @@ public class ProgressChannelRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(ProgressChannelRegistry.class);
 
-    /** Long enough for a research run; the connection is closed as soon as the run ends. */
-    private static final long TIMEOUT_MS = 30 * 60 * 1000L;
+    /**
+     * Idle-connection cap; the connection is closed as soon as the run ends anyway.
+     * Must cover the longest expected workflow — configurable, and defaulted to match
+     * {@code ChatStreamingService}'s stream timeout (the initializer is the fallback
+     * for direct instantiation in tests).
+     */
+    @Value("${agent.stream.timeout-minutes:60}")
+    private long timeoutMinutes = 60;
 
     private final Map<String, CopyOnWriteArrayList<SseEmitter>> channels = new ConcurrentHashMap<>();
 
@@ -97,6 +104,10 @@ public class ProgressChannelRegistry {
                 list.remove(emitter);
             }
         }
+        if (list.isEmpty()) {
+            // Don't leave an empty shell in the map for every thread that ever listened.
+            channels.remove(threadId, list);
+        }
     }
 
     /**
@@ -119,7 +130,7 @@ public class ProgressChannelRegistry {
     }
 
     private SseEmitter newEmitter() {
-        return new SseEmitter(TIMEOUT_MS);
+        return new SseEmitter(timeoutMinutes * 60_000L);
     }
 
     private CopyOnWriteArrayList<SseEmitter> listFor(String threadId) {

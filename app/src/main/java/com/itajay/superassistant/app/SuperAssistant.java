@@ -73,6 +73,13 @@ public class SuperAssistant {
             return chatStreamingService.rejected(threadId,
                     "message 过长（上限 " + MAX_MESSAGE_CHARS + " 字符）");
         }
+        // A pending approval owns this thread's run state. Letting a new message ride
+        // on the interrupted config (the old buildConfig behavior) mixed two runs'
+        // semantics into one; make the user resolve the approval first.
+        if (pendingInterruptionStore.get(threadId) != null) {
+            return chatStreamingService.rejected(threadId,
+                    "该会话有待审批的高危操作，请先同意或拒绝后再发送新消息");
+        }
 
         String reqMode = request.mode() != null ? request.mode() : "Default";
         boolean planEnabled = "PlanMode".equalsIgnoreCase(reqMode);
@@ -166,13 +173,13 @@ public class SuperAssistant {
         return null;
     }
 
+    /**
+     * Builds a fresh config for a new run. Pending interruptions are handled by
+     * {@link #approve} (which resumes from the stored config); {@link #chat} refuses
+     * new messages while an approval is pending, so there is no interrupted-config
+     * path here anymore.
+     */
     private RunnableConfig buildConfig(String threadId) {
-        PendingInterruptionStore.PendingInterruption pending = pendingInterruptionStore.get(threadId);
-        if (pending != null) {
-            return RunnableConfig.builder(pending.config())
-                    .addMetadata("threadId", threadId)
-                    .build();
-        }
         return RunnableConfig.builder()
                 .threadId(threadId)
                 .addMetadata("threadId", threadId)

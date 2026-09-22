@@ -1,5 +1,6 @@
 package com.itajay.superassistant.service;
 
+import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -14,7 +15,12 @@ import java.util.stream.Stream;
 public class FileOperationService {
 
     private static final Logger log = LoggerFactory.getLogger(FileOperationService.class);
-    private static final Path BASE_PATH = Path.of(System.getProperty("user.dir"));
+    /**
+     * Same root as the investigation tools and the terminal ({@link WorkspacePaths},
+     * the nearest .git ancestor). Using {@code user.dir} here meant a start from a
+     * submodule gave the file tools a different workspace than everything else.
+     */
+    private static final Path BASE_PATH = WorkspacePaths.root();
 
     /**
      * Read file content with safety checks.
@@ -92,11 +98,43 @@ public class FileOperationService {
     }
 
     private Path resolveSafe(String filePath) {
-        Path target = BASE_PATH.resolve(filePath).normalize().toAbsolutePath();
+        if (filePath == null || filePath.isBlank()) {
+            throw new SecurityException("Access denied: empty path");
+        }
+        Path base = BASE_PATH.toAbsolutePath().normalize();
+        Path target = base.resolve(filePath).normalize().toAbsolutePath();
         // Security: prevent path traversal outside workspace
-        if (!target.startsWith(BASE_PATH.toAbsolutePath())) {
+        if (!target.startsWith(base)) {
             throw new SecurityException("Access denied: path outside workspace - " + filePath);
         }
-        return target;
+        return resolveSymlinksInsideWorkspace(target, base);
+    }
+
+    /**
+     * A path can pass the textual prefix check and still land outside the workspace
+     * through a symlink (a link inside the workspace pointing at C:\Windows, say).
+     * Resolve the real path of the nearest existing ancestor and re-check the prefix;
+     * for a fully new path this covers symlinked parent directories as well.
+     */
+    private Path resolveSymlinksInsideWorkspace(Path target, Path base) {
+        Path probe = target;
+        while (probe != null && !Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) {
+            probe = probe.getParent();
+        }
+        if (probe == null) {
+            return target;
+        }
+        try {
+            Path realBase = base.toRealPath();
+            Path realProbe = probe.toRealPath();
+            if (!realProbe.startsWith(realBase)) {
+                throw new SecurityException(
+                        "Access denied: path resolves outside workspace via symlink - " + target);
+            }
+            return realProbe.resolve(probe.relativize(target));
+        } catch (IOException e) {
+            throw new SecurityException(
+                    "Access denied: cannot resolve real path for - " + target, e);
+        }
     }
 }

@@ -40,20 +40,29 @@ public class FileReadState {
     /**
      * Scan messages for file read/write tool calls and rebuild the state.
      * Call this before compaction so the cache reflects the latest history.
+     *
+     * <p>Access times are derived from each message's <em>position</em> in the
+     * history, not from the scan's wall clock: stamping everything {@code now()}
+     * (the old behavior) made "most recent" degrade to insertion order of the scan,
+     * so {@link #getRecentFiles} actually returned the <em>earliest</em> files seen.
+     * Position-derived instants sit just below the real clock, so live
+     * {@link #recordAccess} observations always outrank scan entries.</p>
      */
     public synchronized void scanMessages(List<Message> messages) {
         if (messages == null) {
             return;
         }
-        for (Message msg : messages) {
+        Instant base = Instant.now().minusSeconds(messages.size() + 1L);
+        for (int i = 0; i < messages.size(); i++) {
+            Message msg = messages.get(i);
             if (msg instanceof AssistantMessage assistantMessage
                     && assistantMessage.hasToolCalls()) {
                 for (AssistantMessage.ToolCall call : assistantMessage.getToolCalls()) {
                     if (isFileAccessTool(call.name())) {
                         String path = extractFilePath(call.arguments());
                         if (path != null) {
-                            // put (not putIfAbsent): keep the newest access time.
-                            accessTimes.put(normalize(path), Instant.now());
+                            // put (not putIfAbsent): a later access to the same file wins.
+                            accessTimes.put(normalize(path), base.plusSeconds(i));
                         }
                     }
                 }

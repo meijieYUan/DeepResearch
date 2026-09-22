@@ -54,10 +54,17 @@ public final class CompactConfig {
     // ── Session memory ──
     /** Max entries in the fileStateCache LRU. */
     public static final int FILE_STATE_CACHE_MAX_ENTRIES = 100;
+    /** Max entries in the per-thread call-state LRU (separate concern from the file cache). */
+    public static final int THREAD_STATE_CACHE_MAX_ENTRIES = 500;
 
     // ── Storage paths ──
-    public static final Path TOOL_RESULTS_DIR = Path.of(".compact", "tool_results");
-    public static final Path COMPACT_SNAPSHOTS_DIR = Path.of(".compact", "snapshots");
+    // Anchored to the workspace root (nearest .git), not the JVM working directory:
+    // a start from a submodule used to scatter these under app/.compact/ while the
+    // file tools and plans/ lived at the repository root.
+    public static final Path TOOL_RESULTS_DIR =
+            com.itajay.superassistant.workspace.WorkspacePaths.root().resolve(".compact").resolve("tool_results");
+    public static final Path COMPACT_SNAPSHOTS_DIR =
+            com.itajay.superassistant.workspace.WorkspacePaths.root().resolve(".compact").resolve("snapshots");
     /** Max total bytes of truncated tool-result files before the oldest files are pruned. */
     public static final long TOOL_RESULT_DIR_MAX_BYTES = 512L * 1024 * 1024;
 

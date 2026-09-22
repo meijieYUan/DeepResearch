@@ -54,3 +54,7 @@ investigation/
 plans/
 .compact/
 
+### 本地凭据 ###
+# docker-compose / 应用的环境变量文件（含数据库、MinIO 密码），只提交 .env.example
+.env
+

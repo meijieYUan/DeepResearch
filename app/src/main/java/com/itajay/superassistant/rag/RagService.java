@@ -49,6 +49,7 @@ public class RagService {
             return 0;
         }
 
+        tagSource(documents, resource.getFilename());
         List<Document> chunks = splitDocuments(documents);
         log.info("Split into {} chunks from {}", chunks.size(), resource.getFilename());
 
@@ -64,6 +65,7 @@ public class RagService {
         for (Resource resource : resources) {
             List<Document> documents = readDocuments(resource);
             if (!documents.isEmpty()) {
+                tagSource(documents, resource.getFilename());
                 allChunks.addAll(splitDocuments(documents));
             }
         }
@@ -73,6 +75,16 @@ public class RagService {
             log.info("Batch stored {} chunks from {} resources", allChunks.size(), resources.size());
         }
         return allChunks.size();
+    }
+
+    /** Stamp the source file name onto each document; the splitter copies it to chunks. */
+    private void tagSource(List<Document> documents, String filename) {
+        if (filename == null || filename.isBlank()) {
+            return;
+        }
+        for (Document document : documents) {
+            document.getMetadata().put(Bm25Index.SOURCE_METADATA_KEY, filename);
+        }
     }
 
     private List<Document> readDocuments(Resource resource) {
@@ -115,9 +127,30 @@ public class RagService {
 
     /**
      * 同时写入向量库（Milvus）与 BM25 关键字索引（Lucene）。
+     *
+     * <p>BM25 侧按来源文件名先删旧再写新：同名文件重复导入不再累积重复 chunk。
+     * BM25 失败不再静默——向量库已写入而关键字索引缺失是双写不一致，必须显式告警
+     * （此前只留一行 error 日志，检索侧表现为"关键字召回悄悄变少"）。</p>
      */
     private void storeDocuments(List<Document> chunks) {
         vectorStore.add(chunks);
-        bm25Index.add(chunks);
+        try {
+            chunks.stream()
+                    .map(c -> c.getMetadata() == null ? null : c.getMetadata().get(Bm25Index.SOURCE_METADATA_KEY))
+                    .filter(java.util.Objects::nonNull)
+                    .map(String::valueOf)
+                    .distinct()
+                    .forEach(source -> {
+                        try {
+                            bm25Index.deleteBySource(source);
+                        } catch (java.io.IOException e) {
+                            log.warn("BM25 could not clear stale chunks of source '{}': {}", source, e.getMessage());
+                        }
+                    });
+            bm25Index.add(chunks);
+        } catch (java.io.IOException e) {
+            log.error("BM25 indexing FAILED — the vector store has these chunks but keyword "
+                    + "recall will miss them; re-upload the source to repair. Cause: {}", e.getMessage(), e);
+        }
     }
 }

@@ -2,6 +2,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: superassistant-mysql
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
       MYSQL_DATABASE: superassistant
@@ -24,21 +25,36 @@ services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.18
     container_name: superassistant-etcd
+    restart: unless-stopped
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
       ETCD_AUTO_COMPACTION_RETENTION: "1000"
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
       ETCD_SNAPSHOT_COUNT: "50000"
+      # healthcheck 用的 etcdctl 走 v3 API
+      ETCDCTL_API: "3"
     volumes:
       - etcd-data:/etcd
     command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   minio:
+    # 已知跟进项：MinIO 镜像版本维持 RELEASE.2023-03-20T20-16-18Z 不动。
+    # 升级到更新版本可能改变 minio-data volume 的数据布局/元数据格式，导致既有
+    # volume 不兼容，需要配套的数据迁移方案后再单独推进，本阶段不升级。
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     container_name: superassistant-minio
+    restart: unless-stopped
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # 新版 MinIO 使用 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD（旧的
+      # MINIO_ACCESS_KEY / MINIO_SECRET_KEY 已废弃）。
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - minio-data:/minio_data
     command: minio server /minio_data
@@ -47,22 +63,30 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+      start_period: 10s
 
   milvus:
     image: milvusdb/milvus:v2.4.15
     container_name: superassistant-milvus
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
+      # 与 minio 服务共用同一组凭据，避免改密码后 Milvus 连不上对象存储
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - milvus-data:/var/lib/milvus
     ports:
+      # 9090:19530 被应用侧 VectorConfig 硬编码依赖，本阶段保持不变
       - "9090:19530"
       - "9091:9091"
     depends_on:
-      - etcd
-      - minio
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s

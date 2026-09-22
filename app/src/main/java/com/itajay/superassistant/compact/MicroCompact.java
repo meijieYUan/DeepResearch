@@ -60,7 +60,14 @@ public final class MicroCompact {
             return messages;
         }
 
-        result.add(0, new SystemMessage(
+        // Insert the marker after any leading system message(s), never at index 0:
+        // some providers require the system prompt to be the first message, and
+        // displacing it can make the call fail or the prompt be silently ignored.
+        int insertAt = 0;
+        while (insertAt < result.size() && result.get(insertAt) instanceof SystemMessage) {
+            insertAt++;
+        }
+        result.add(insertAt, new SystemMessage(
                 "[MicroCompact: " + replacedResults
                 + " stale tool result payload(s) replaced. The most recent "
                 + keep + " tool transaction(s) are preserved.]"

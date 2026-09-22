@@ -70,6 +70,10 @@ public final class ContextCompactor {
 
     private static final int COMPACT_INPUT_MAX_CHARS = 30_000;
 
+    /** Snapshot volume caps: per message and per archive (see archiveSnapshot). */
+    private static final int MAX_SNAPSHOT_MESSAGE_CHARS = 4_000;
+    private static final long MAX_SNAPSHOT_TOTAL_CHARS = 2_000_000L;
+
     /** Bounded parallelism for chunk summarization; each task is one blocking LLM call. */
     private static final int SUMMARY_PARALLELISM = 4;
     /** Overall deadline for the parallel chunk phase; exceeding it degrades to L1-L3. */
@@ -324,11 +328,16 @@ public final class ContextCompactor {
                 if (!Files.isRegularFile(file)) {
                     continue;
                 }
-                String fullContent = Files.readString(file);
                 int fileBudget = Math.min(
                         remainingBudget, CompactConfig.POST_COMPACT_MAX_TOKENS_PER_FILE);
+                // Read only what the token budget can hold (~4 chars/token upper bound
+                // plus one char to detect truncation) instead of the whole file.
+                int charCap = fileBudget * 4;
+                String prefix = readPrefix(file, charCap + 1);
+                boolean fileTruncated = prefix.length() > charCap;
+                String fullContent = fileTruncated ? prefix.substring(0, charCap) : prefix;
                 String content = TokenBudgets.previewWithinTokenBudget(fullContent, fileBudget);
-                if (content.length() < fullContent.length()) {
+                if (content.length() < fullContent.length() || fileTruncated) {
                     content += "\n...[recovered file truncated]";
                 }
                 remainingBudget -= CompactConfig.estimateTokens(content);
@@ -363,6 +372,35 @@ public final class ContextCompactor {
             Path dir = CompactConfig.COMPACT_SNAPSHOTS_DIR.resolve(sanitize(threadId));
             Files.createDirectories(dir);
             Path file = dir.resolve("compact_" + Instant.now().toEpochMilli() + ".json");
+            // Snapshots used to embed every message verbatim — a run with large tool
+            // outputs produced tens-of-MB JSON files, and pruning was by count only.
+            // Cap per-message and total character volume; the snapshot is a debugging
+            // aid, not a lossless backup (the checkpoint remains the source of truth).
+            List<SnapshotMessage> snapshotMessages = new ArrayList<>(messages.size());
+            long totalChars = 0;
+            boolean budgetExhausted = false;
+            for (Message message : messages) {
+                String content = message.getText();
+                if (content != null) {
+                    if (content.length() > MAX_SNAPSHOT_MESSAGE_CHARS) {
+                        content = content.substring(0, MAX_SNAPSHOT_MESSAGE_CHARS)
+                                + "\n...[snapshot truncated]";
+                    }
+                    totalChars += content.length();
+                    if (totalChars > MAX_SNAPSHOT_TOTAL_CHARS) {
+                        budgetExhausted = true;
+                        break;
+                    }
+                }
+                snapshotMessages.add(new SnapshotMessage(
+                        message.getMessageType().name(), content));
+            }
+            if (budgetExhausted) {
+                snapshotMessages.add(new SnapshotMessage(
+                        "SYSTEM", "...[remaining messages omitted: snapshot char budget exhausted]"));
+                log.warn("Snapshot for thread={} truncated at {} total chars",
+                        threadId, MAX_SNAPSHOT_TOTAL_CHARS);
+            }
             Snapshot snapshot = new Snapshot(
                     threadId,
                     Instant.now(),
@@ -371,10 +409,7 @@ public final class ContextCompactor {
                     messages.size() - cutoff,
                     summary,
                     recoveredPaths,
-                    messages.stream()
-                            .map(message -> new SnapshotMessage(
-                                    message.getMessageType().name(), message.getText()))
-                            .toList()
+                    snapshotMessages
             );
             MAPPER.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), snapshot);
             pruneSnapshots(dir, snapshotKeep);
@@ -412,11 +447,16 @@ public final class ContextCompactor {
 
     static String loadPlanFile(String threadId) {
         try {
-            Path planFile = Path.of("plans", sanitize(threadId) + ".md");
+            // Anchored to the workspace root — PlanTool tells the agent to write
+            // plans/{threadId}.md through the file tools, which are rooted there.
+            // A plain relative path resolved against the JVM cwd, diverging whenever
+            // the app starts from a submodule.
+            Path planFile = com.itajay.superassistant.workspace.WorkspacePaths.root()
+                    .resolve("plans").resolve(sanitize(threadId) + ".md");
             if (!Files.exists(planFile)) {
                 return null;
             }
-            String content = Files.readString(planFile);
+            String content = readPrefix(planFile, 8001);
             if (content.length() > 8000) {
                 content = content.substring(0, 8000) + "\n...[plan truncated]";
             }
@@ -424,6 +464,28 @@ public final class ContextCompactor {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    /**
+     * Reads at most {@code maxChars} characters without loading the whole file —
+     * recovered attachments and the plan file are budget-capped anyway, so pulling
+     * a multi-hundred-MB file into a String just to cut it down was a memory spike
+     * waiting to happen.
+     */
+    private static String readPrefix(Path file, int maxChars) throws IOException {
+        StringBuilder builder = new StringBuilder(Math.min(maxChars, 8192));
+        try (java.io.BufferedReader reader = Files.newBufferedReader(file)) {
+            char[] buffer = new char[4096];
+            while (builder.length() < maxChars) {
+                int toRead = Math.min(buffer.length, maxChars - builder.length());
+                int read = reader.read(buffer, 0, toRead);
+                if (read <= 0) {
+                    break;
+                }
+                builder.append(buffer, 0, read);
+            }
+        }
+        return builder.toString();
     }
 
     static String sanitize(String value) {

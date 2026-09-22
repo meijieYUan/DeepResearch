@@ -199,6 +199,11 @@ public class ResearchWriteReviewWorkflow {
             return report;
 
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                // Restore the flag: swallowing it here used to leave the calling
+                // thread looking "not interrupted" while the run was being torn down.
+                Thread.currentThread().interrupt();
+            }
             log.error("ResearchWriteReview workflow failed [topic={}]", topicId, e);
             publish(threadId, ProgressStage.FAILED, rounds, "工作流异常终止");
             return "Research-write-review workflow failed: " + e.getMessage()
@@ -374,13 +379,16 @@ public class ResearchWriteReviewWorkflow {
         if (files.isEmpty()) {
             return "（没有任何精读结果文件——精读阶段未产出，这本身就是严重问题，请据此判定）";
         }
+        // One figures listing shared by every row: figuresOf used to re-list the
+        // directory per paper — O(papers × figures) disk IO on every review round.
+        List<Path> allFigures = AnalysisStore.figureFiles(topic);
         StringBuilder sb = new StringBuilder("共 ").append(files.size()).append(" 篇：\n");
         for (Path file : files) {
             AnalysisStore.AnalysisMeta meta = AnalysisStore.readMeta(file);
             sb.append("- ").append(meta.shortName())
                     .append(" — ").append(meta.sourceLevel())
                     .append(" — ").append(WorkspacePaths.relative(file))
-                    .append(" — 图片 ").append(figuresOf(topic, meta.shortName())).append(" 张")
+                    .append(" — 图片 ").append(figuresOf(allFigures, meta.shortName())).append(" 张")
                     .append('\n');
         }
         return sb.toString().stripTrailing();
@@ -419,9 +427,9 @@ public class ResearchWriteReviewWorkflow {
      * here by hand is how a counter silently reports zero: the tool writes
      * {@code {短名}_Fig2.png}, and a prefix of {@code {短名}_p} matches no such file.</p>
      */
-    private long figuresOf(String topic, String paperShortName) {
+    private long figuresOf(List<Path> figureFiles, String paperShortName) {
         String prefix = AnalysisStore.nameFor(paperShortName) + "_";
-        return AnalysisStore.figureFiles(topic).stream()
+        return figureFiles.stream()
                 .filter(p -> p.getFileName().toString().startsWith(prefix))
                 .count();
     }

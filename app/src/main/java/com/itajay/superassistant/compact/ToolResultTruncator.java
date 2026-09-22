@@ -38,15 +38,17 @@ public final class ToolResultTruncator {
             return messages;
         }
 
-        long totalToolResultTokens = 0;
+        // Cheap gate: stop at the first oversized result. The old scan BPE-encoded
+        // every tool response twice (once for a log-only total, once inside
+        // shouldTruncate) even when nothing needed truncating — the common case.
         boolean hasOversized = false;
+        outer:
         for (Message message : messages) {
             if (message instanceof ToolResponseMessage responseMessage) {
                 for (ToolResponseMessage.ToolResponse response : responseMessage.getResponses()) {
-                    int tokens = CompactConfig.estimateTokens(response.responseData());
-                    totalToolResultTokens += tokens;
                     if (CompactConfig.shouldTruncate(response.responseData())) {
                         hasOversized = true;
+                        break outer;
                     }
                 }
             }
@@ -65,8 +67,7 @@ public final class ToolResultTruncator {
             }
         }
 
-        log.info("ToolResultTruncator: truncated oversized result(s); total tool tokens={}",
-                totalToolResultTokens);
+        log.info("ToolResultTruncator: truncated oversized tool result(s)");
         return List.copyOf(result);
     }
 
@@ -83,6 +84,7 @@ public final class ToolResultTruncator {
             }
 
             String original = response.responseData();
+            int originalTokens = CompactConfig.estimateTokens(original);
             String savedPath = saveToDisk(threadId, response.id(), original, storageDir);
             if (savedPath == null) {
                 replacements.add(response);
@@ -92,11 +94,11 @@ public final class ToolResultTruncator {
                     original, CompactConfig.TOOL_RESULT_PREVIEW_TOKENS);
             replacements.add(new ToolResponseMessage.ToolResponse(
                     response.id(), response.name(),
-                    buildTruncatedContent(original, preview, savedPath)));
+                    buildTruncatedContent(originalTokens, preview, savedPath)));
             changed = true;
             log.info("Truncated tool result [id={}, name={}]: {} -> {} estimated tokens; saved to {}",
                     response.id(), response.name(),
-                    CompactConfig.estimateTokens(original),
+                    originalTokens,
                     CompactConfig.estimateTokens(preview),
                     savedPath);
         }
@@ -111,12 +113,17 @@ public final class ToolResultTruncator {
     }
 
     private static String buildTruncatedContent(
-            String original, String preview, String savedPath) {
+            int originalTokens, String preview, String savedPath) {
         return preview
                 + "\n\n[Tool output truncated. Original estimated tokens: "
-                + CompactConfig.estimateTokens(original)
+                + originalTokens
                 + ". Full content: " + savedPath + ".]";
     }
+
+    /** Minimum gap between directory-wide prune scans (they walk up to 512MB). */
+    private static final long PRUNE_INTERVAL_MS = 5 * 60 * 1000L;
+    private static final java.util.concurrent.atomic.AtomicLong lastPruneAt =
+            new java.util.concurrent.atomic.AtomicLong(0L);
 
     private static String saveToDisk(
             String threadId, String toolCallId, String content, Path storageDir) {
@@ -126,7 +133,14 @@ public final class ToolResultTruncator {
             Path file = dir.resolve(
                     sanitize(toolCallId) + "_" + Instant.now().toEpochMilli() + ".txt");
             Files.writeString(file, content);
-            pruneOversized(storageDir);
+            // Pruning walks the whole storage tree; doing it on every save turned a
+            // burst of truncations into O(n × files) disk IO. Once per interval is
+            // plenty — the cap is a hygiene bound, not a hard quota.
+            long now = System.currentTimeMillis();
+            long last = lastPruneAt.get();
+            if (now - last >= PRUNE_INTERVAL_MS && lastPruneAt.compareAndSet(last, now)) {
+                pruneOversized(storageDir);
+            }
             return file.toAbsolutePath().toString();
         } catch (IOException e) {
             log.error("Failed to save truncated tool result to disk", e);

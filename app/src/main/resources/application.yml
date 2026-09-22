@@ -103,6 +103,10 @@ agent:
     cooldown-calls: 5
     # 每个线程保留的全量压缩快照数量
     snapshot-keep: 5
+  stream:
+    # 对话/进度 SSE 流的生命周期上限（分钟）。超时只断开 HTTP 流，运行本身继续，
+    # 答案仍会写入持久化历史。调研工作流可长达数十分钟，默认给到 60。
+    timeout-minutes: 60
   progress:
     # 调研工作流的 SSE 进度推送（GET /api/chat/{threadId}/stream）
     # 心跳间隔：调研运行会在单次子 Agent 调用里停留数分钟，没有心跳时

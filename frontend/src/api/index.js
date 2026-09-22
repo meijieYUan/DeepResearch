@@ -99,5 +99,7 @@ export const queryTodos = (threadId, status, priority, keyword) =>
 export const uploadKnowledge = (file) => {
   const fd = new FormData()
   fd.append('file', file)
-  return api.post('/knowledge/upload', fd)
+  // `silent`: the upload view renders failures inline, so the global toast would
+  // only duplicate the same message.
+  return api.post('/knowledge/upload', fd, { silent: true })
 }

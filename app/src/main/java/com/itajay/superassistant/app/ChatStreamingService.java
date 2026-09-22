@@ -14,6 +14,7 @@ import com.itajay.superassistant.security.PendingInterruptionStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
@@ -22,7 +23,10 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -60,18 +64,35 @@ public class ChatStreamingService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatStreamingService.class);
 
-    /** Long enough for a research run; matches the progress channel timeout. */
-    private static final long TIMEOUT_MS = 30 * 60 * 1000L;
+    /**
+     * Stream lifetime cap. A research workflow can run for a long time; when this
+     * fires the HTTP stream closes but the run itself continues and the answer still
+     * lands in the persisted history. Configurable via {@code agent.stream.timeout-minutes}
+     * (the field initializer is the default for direct instantiation in tests).
+     */
+    @Value("${agent.stream.timeout-minutes:60}")
+    private long timeoutMinutes = 60;
+
+    /**
+     * Hard cap on concurrently executing runs. Each run occupies its thread for its
+     * whole (potentially hour-long) lifetime, so an unbounded pool let a burst of
+     * distinct threadIds exhaust memory/threads without limit. Overflow is refused
+     * with a clear message instead of queueing invisibly.
+     */
+    private static final int MAX_CONCURRENT_RUNS = 16;
 
     private final AgentRunner agentRunner;
     private final ProgressChannelRegistry progressChannels;
     private final PendingInterruptionStore pendingInterruptionStore;
 
-    private final ExecutorService runner = Executors.newCachedThreadPool(task -> {
-        Thread thread = new Thread(task, "chat-stream");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ExecutorService runner = new ThreadPoolExecutor(
+            0, MAX_CONCURRENT_RUNS, 60L, TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            task -> {
+                Thread thread = new Thread(task, "chat-stream");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private final ConcurrentHashMap<String, Boolean> running = new ConcurrentHashMap<>();
 
@@ -118,7 +139,7 @@ public class ChatStreamingService {
      */
     public SseEmitter start(String threadId, String input, RunnableConfig config,
                             boolean planEnabled, Runnable onAccepted) {
-        SseEmitter emitter = new SseEmitter(TIMEOUT_MS);
+        SseEmitter emitter = new SseEmitter(timeoutMs());
 
         if (running.putIfAbsent(threadId, Boolean.TRUE) != null) {
             return rejected(threadId, "该会话已有任务在执行中，请等待其完成后再发送新消息");
@@ -138,8 +159,24 @@ public class ChatStreamingService {
         // disconnects, which must not stop the run (see run()).
         progressChannels.attach(threadId, emitter);
 
-        runner.submit(() -> run(threadId, input, config, planEnabled, emitter));
+        try {
+            runner.submit(() -> run(threadId, input, config, planEnabled, emitter));
+        } catch (RejectedExecutionException e) {
+            running.remove(threadId);
+            try {
+                emitter.complete(); // fires onCompletion → detaches from the registry
+            } catch (Exception ignored) {
+                // best effort
+            }
+            log.warn("Run refused, pool saturated ({} concurrent runs) [thread={}]",
+                    MAX_CONCURRENT_RUNS, threadId);
+            return rejected(threadId, "服务端并发任务已达上限（" + MAX_CONCURRENT_RUNS + "），请稍后再试");
+        }
         return emitter;
+    }
+
+    private long timeoutMs() {
+        return timeoutMinutes * 60_000L;
     }
 
     /**
@@ -149,7 +186,7 @@ public class ChatStreamingService {
      * per-run meaning once the body is an event stream.
      */
     public SseEmitter rejected(String threadId, String message) {
-        SseEmitter emitter = new SseEmitter(TIMEOUT_MS);
+        SseEmitter emitter = new SseEmitter(timeoutMs());
         send(emitter, "error", Map.of("message", message == null ? "Unknown error" : message));
         send(emitter, "done", Map.of());
         emitter.complete();

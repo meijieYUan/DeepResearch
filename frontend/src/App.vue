@@ -45,6 +45,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import ToastHost from './components/ToastHost.vue'
 import { getHealth } from './api'
+import { useResizablePanel } from './composables/useResizablePanel'
 
 const route = useRoute()
 const isChat = computed(() => route.path === '/')
@@ -52,56 +53,12 @@ const isChat = computed(() => route.path === '/')
 const backendUp = ref(true)
 let timer = null
 
-const SIDEBAR_KEY = 'sa_sidebar'
-const SIDEBAR_DEFAULT = 232
-const SIDEBAR_MIN = 180
-const SIDEBAR_MAX = 420
-
-const sidebarWidth = ref(SIDEBAR_DEFAULT)
-const collapsed = ref(false)
-const resizing = ref(false)
-
-function loadSidebarPrefs() {
-  try {
-    const p = JSON.parse(localStorage.getItem(SIDEBAR_KEY) || '{}')
-    if (typeof p.width === 'number') sidebarWidth.value = clampWidth(p.width)
-    collapsed.value = !!p.collapsed
-  } catch { /* keep defaults */ }
-}
-
-function saveSidebarPrefs() {
-  localStorage.setItem(SIDEBAR_KEY, JSON.stringify({ width: sidebarWidth.value, collapsed: collapsed.value }))
-}
-
-function clampWidth(w) {
-  return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(w)))
-}
-
-function toggleCollapse() {
-  collapsed.value = !collapsed.value
-  saveSidebarPrefs()
-}
-
-function startResize(e) {
-  e.preventDefault()
-  const startX = e.clientX
-  const startW = sidebarWidth.value
-  resizing.value = true
-  document.body.style.userSelect = 'none'
-  document.body.style.cursor = 'col-resize'
-
-  const onMove = (ev) => { sidebarWidth.value = clampWidth(startW + ev.clientX - startX) }
-  const onUp = () => {
-    resizing.value = false
-    document.body.style.userSelect = ''
-    document.body.style.cursor = ''
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
-    saveSidebarPrefs()
-  }
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
-}
+// Drag-to-resize + collapse, persisted under 'sa_sidebar'. ChatView's thread
+// sidebar uses the same composable under its own key.
+const {
+  width: sidebarWidth, collapsed, resizing,
+  load: loadSidebarPrefs, toggle: toggleCollapse, startResize
+} = useResizablePanel({ storageKey: 'sa_sidebar', defaultWidth: 232, min: 180, max: 420 })
 
 // Recursive setTimeout rather than setInterval: the next check is armed only once
 // this one settles, so a backend that hangs can't stack overlapping requests and
