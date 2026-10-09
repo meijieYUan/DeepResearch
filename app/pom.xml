@@ -83,9 +83,15 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- 必须是 boot4 starter：boot3 版把 MybatisPlusAutoConfiguration 排到
+             org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration 之后，
+             而该 FQN 在 Spring Boot 4 已迁到 org.springframework.boot.jdbc.autoconfigure.*。
+             排序线索失效后，MyBatis-Plus 会先于数据源被评估，@ConditionalOnSingleCandidate(DataSource)
+             落空 → 没有 SqlSessionFactory → @MapperScan 的 Mapper 报
+             "Property 'sqlSessionFactory' or 'sqlSessionTemplate' are required"。 -->
         <dependency>
             <groupId>com.baomidou</groupId>
-            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+            <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
             <version>${mybatis-plus.version}</version>
         </dependency>
 
