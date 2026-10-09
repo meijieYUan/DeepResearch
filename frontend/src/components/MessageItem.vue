@@ -13,28 +13,23 @@
           <span></span><span></span><span></span>
         </div>
         <div v-else class="stream-content" v-html="html" @click="handleCopyClick"></div>
-        <!-- Workflow stage, streamed on the same connection: the user can tell
-             "still searching / reading paper 3/6" from "stuck" while the model
-             itself has nothing incremental to say. -->
-        <div v-if="msg.streaming && progress && progress.stage" class="progress-stage">
-          <span class="progress-stage-dot" :class="{ failed: progress.failed }"></span>
-          <span class="progress-stage-label">{{ progress.stage }}</span>
-          <span v-if="progress.round > 1" class="progress-stage-round">第 {{ progress.round }} 轮</span>
-          <span v-if="progress.detail" class="progress-stage-detail">{{ progress.detail }}</span>
-        </div>
+        <ResearchProgress v-if="msg.progress?.runs?.length" :progress="msg.progress" />
       </div>
       <!-- The connection closed without the run's terminal event (no done /
            answer / interruption): the text above is only what got through,
            so say so rather than passing a truncated answer off as final. -->
       <div v-if="msg.incomplete" class="incomplete-note">
         <AlertTriangle :size="12" />
-        <span>连接中断，回答可能不完整</span>
+        <span>{{ incompleteLabel }}</span>
       </div>
-      <ApprovalPanel
-        v-if="msg.approvals"
-        :approvals="msg.approvals"
-        @submit="$emit('submit-approvals', msg)"
-      />
+      <div v-if="msg.error" class="incomplete-note" role="alert">{{ msg.error }}</div>
+      <fieldset v-if="msg.approvals" class="approval-gate" :disabled="approvalDisabled">
+        <ApprovalPanel
+          :approvals="msg.approvals"
+          @submit="!approvalDisabled && $emit('submit-approvals', msg)"
+        />
+        <p v-if="msg.approvalsSubmitted" class="approval-note">审批已提交</p>
+      </fieldset>
     </div>
   </div>
 </template>
@@ -44,12 +39,11 @@ import { computed } from 'vue'
 import { AlertTriangle, Bot, User } from 'lucide-vue-next'
 import { renderMarkdown, handleCopyClick } from '../utils/markdown'
 import ApprovalPanel from './ApprovalPanel.vue'
+import ResearchProgress from './ResearchProgress.vue'
 
 const props = defineProps({
   msg: { type: Object, required: true },
-  // Workflow stage of the run currently streaming into this bubble, or null for
-  // every other message — only the streaming bubble is ever given one.
-  progress: { type: Object, default: null }
+  approvalDisabled: { type: Boolean, default: false }
 })
 defineEmits(['submit-approvals'])
 
@@ -61,6 +55,16 @@ defineEmits(['submit-approvals'])
 // renderMarkdown(msg.content) inline in the v-for, which re-parsed every
 // historical message on every frame of a stream.
 const html = computed(() => (props.msg.role === 'assistant' ? renderMarkdown(props.msg.content) : ''))
+const incompleteLabel = computed(() => {
+  switch (props.msg.transportStatus) {
+    case 'connection_lost': return '连接已断开，回答可能不完整；后台任务可能仍在继续'
+    case 'stopped': return '已停止接收，回答可能不完整；后台任务可能仍在继续'
+    case 'unknown': return '已恢复历史记录，任务状态未知；回答可能不完整'
+    case 'done': return '传输已结束，但未收到完整回答'
+    case 'error': return '传输出现错误，已保留收到的部分回答'
+    default: return '连接中断，回答可能不完整'
+  }
+})
 </script>
 
 <style scoped>
@@ -94,22 +98,12 @@ const html = computed(() => (props.msg.role === 'assistant' ? renderMarkdown(pro
 .typing-dots span:nth-child(3) { animation-delay: .32s; }
 @keyframes dotBounce { 0%, 60%, 100% { opacity: .3; transform: scale(.8); } 30% { opacity: 1; transform: scale(1); } }
 
-/* Workflow stage, streamed over SSE while a long request runs */
-.progress-stage {
-  display: flex; align-items: center; gap: 7px;
-  padding: 0 14px 10px; font-size: 12.5px; color: var(--text2);
+.approval-gate { margin: 0; padding: 0; border: 0; min-width: 0; }
+.approval-gate:disabled { opacity: .7; }
+.approval-note { font-size: 12px; color: var(--text2); margin-top: 6px; }
+@media (prefers-reduced-motion: reduce) {
+  .message, .typing-dots span { animation: none; }
 }
-.progress-stage-dot {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--accent, #4f8cff);
-  animation: stagePulse 1.6s ease-in-out infinite; flex: none;
-}
-.progress-stage-dot.failed { background: var(--danger, #e5484d); animation: none; }
-@keyframes stagePulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
-.progress-stage-round {
-  margin-left: 2px; padding: 1px 6px; border-radius: 999px;
-  background: var(--surface2, rgba(127,127,127,.14)); font-size: 11px; opacity: .85;
-}
-.progress-stage-detail { opacity: .75; }
 
 @media (max-width: 720px) {
   .msg-body { max-width: 86%; }

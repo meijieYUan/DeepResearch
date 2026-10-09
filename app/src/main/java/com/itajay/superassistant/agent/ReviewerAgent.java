@@ -70,6 +70,11 @@ public class ReviewerAgent {
                           —— 结构基准。
                         若无法读取，明确说明并停止，不要凭猜测审查。
 
+                        **单篇精读模式**：若输入声明「单篇精读模式」，审查对象只有 analysis 文件，没有调研文档——
+                        按 review-guide.md 的「§0.1 单篇精读模式」执行（适用/跳过的检查项、target 口径都在那一节）：
+                        template/template.md 可不读；`WRITER` 等同 `ANALYST`（唯一产物是 analysis）；
+                        `RESEARCHER` 仅用于 PDF 无法获取/解析这类材料问题。不要因为找不到调研文档而判不通过。
+
                         第二步：输入中会附上 analysis/ 目录的文件清单。对本次审查：
                         - **文档**：逐节核对结构、对比结论、汇总表一致性、来源标注。
                         - **analysis 文件**：用 readPaperAnalysis(topic, 论文短名) 逐篇读入，核对四维完整性与

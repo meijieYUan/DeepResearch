@@ -46,7 +46,7 @@
           v-for="msg in messages"
           :key="msg.id"
           :msg="msg"
-          :progress="msg.streaming ? progressState : null"
+          :approval-disabled="loading || msg.approvalsSubmitted"
           @submit-approvals="onSubmitApprovals"
         />
 
@@ -84,7 +84,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ArrowDown, MessageSquare, PanelLeftClose, PanelLeftOpen, Send } from 'lucide-vue-next'
 import MessageItem from '../components/MessageItem.vue'
 import TaskPanel from '../components/TaskPanel.vue'
@@ -124,20 +124,7 @@ const stream = useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown
 })
-const {
-  loading,
-  progressStage, progressRound, progressFailed, progressDetail,
-  resetProgress, stopStream, send, submitApprovals
-} = stream
-
-// The streaming bubble's stage, bundled for MessageItem. Only the streaming
-// message is handed one, so a settled transcript never re-renders for progress.
-const progressState = computed(() => ({
-  stage: progressStage.value,
-  round: progressRound.value,
-  failed: progressFailed.value,
-  detail: progressDetail.value
-}))
+const { loading, stopStream, send, submitApprovals } = stream
 
 // --- composer ---------------------------------------------------------------
 const input = ref('')
@@ -174,8 +161,8 @@ function onSend() {
 }
 
 function onSubmitApprovals(msg) {
-  stickToBottom.value = true
-  submitApprovals(msg)
+  if (loading.value || msg.approvalsSubmitted) return
+  if (submitApprovals(msg)) { stickToBottom.value = true; scrollDown(true) }
 }
 
 // --- scroll -----------------------------------------------------------------
@@ -211,7 +198,6 @@ function scrollToBottom() { scrollDown(true) }
 // The thread store's side effects that live in this view / its siblings.
 threadStore.setHooks({
   stopStream,
-  resetProgress,
   clearInput,
   refreshTasks,
   scrollDown

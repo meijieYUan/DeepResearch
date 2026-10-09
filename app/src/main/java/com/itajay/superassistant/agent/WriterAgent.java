@@ -60,8 +60,11 @@ public class WriterAgent {
                         （论文短名 / 来源等级 / 一句话定位 / 文件路径）。
                         **不要调用 analyzePapers(topic) 批量分析**——结果已经在索引里，重复调用只会浪费时间。
                         - 索引只会告诉你"有哪些论文、各自讲了什么"，**不含四维正文**。
-                        - 若索引报告有论文失败，先对每篇失败论文调用 analyzePapers(topic, "该论文短名")
-                          单篇重试一次；重试仍失败才是正文读不到，按 ABSTRACT_ONLY 处理并在文档中标注。
+                        - 保留输入中的原始 brief（课题名称、范围与用户要求）。调用单篇重试或 reanalyzePaper 时，
+                          都通过可选 requirements 原样转传该 brief，不要用审查意见替换它；局部 metadata 兜底
+                          只用于未显式提供 requirements 时。
+                        - 若索引报告有论文失败，先对每篇失败论文调用 analyzePapers(topic, "该论文短名", requirements)
+                          单篇重试一次，requirements 使用原始 brief；重试仍失败按实际来源等级诚实降级并在文档中标注。
 
                         第三步：**按需读取**。用 readPaperAnalysis(topic, 论文短名) 读取你真正需要的几篇的完整四维信息。
                         - 不要为了"读全"把所有论文一次性读进来——需要哪篇读哪篇，这是本次分工的关键。
@@ -91,15 +94,20 @@ public class WriterAgent {
                         - 保存后把返回的 path 一并告知主 Agent。
 
                         修订轮次：
-                        若输入中包含"审查意见"，说明上一轮未通过审查。请**只针对列出的问题**修订，其余部分保持不变。
-                        - target=ANALYST 的问题：分析文件本身有误。先调用 reanalyzePaper(topic, 论文短名, reason)
-                          重做那几篇的提取，再读回重写文档中受影响的对比结论。不要自己改写 analysis 文件。
+                        若输入中包含"审查意见"及上一轮旧稿正文，说明需要内容修订。以工作流提供的磁盘 ReadBack
+                        正文为底稿，保留未受问题影响的内容；不要用上一轮最终回复或记忆重建文档。
+                        旧稿正文或实际路径缺失时如实报告，不凭空推倒重写。审查输出格式异常由工作流即时补审，
+                        不要据此自检改写正确产物。
+                        - target=ANALYST 的问题：分析文件本身有误。先调用 reanalyzePaper(topic, 论文短名, reason, requirements)，
+                          reason 写审查问题，requirements 原样转传原始 brief；重做提取后读回并更新旧稿中受影响的
+                          对比结论。不要自己改写 analysis 文件。
                         - target=WRITER 的问题：文档写法问题，直接修订。
                         - 修订后重新调用 writeResearchDocument 覆盖保存（同名文档会被覆盖）。
                         - 不要重写整篇文档，也不要引入材料中没有的内容。
 
                         红线：不得编造论文标题、作者、年份、会议、公式、引用、实验数据、开源链接；
-                        blockquote 必须是论文原文或材料提供的原句。
+                        作者引文必须保持原语言并与论文原句逐字匹配，中文释义不得冒充引文；
+                        明确标注的元数据、图注与路径可用 blockquote，但不按作者原句逐字核验。
                         图片引用**只能**逐字来自 analysis 文件里的「文档引用：」行；不得引用 skill 目录下的
                         任何资源（`papper*.png`、`example/`、`template/`）——那些是示例文档自带的素材，
                         与本次调研的论文无关，写进正式文档就是凭空引用。

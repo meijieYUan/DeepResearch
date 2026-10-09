@@ -1,5 +1,6 @@
 package com.itajay.superassistant.workflow;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -65,7 +66,8 @@ public record ReviewResult(
             return Target.parse(target);
         }
 
-        /** True when this finding is severe enough to block delivery. */
+        /** True when this finding is severe enough to block delivery; not a schema field. */
+        @JsonIgnore
         public boolean isBlocker() {
             return level != null && level.trim().equalsIgnoreCase("BLOCKER");
         }
@@ -133,43 +135,63 @@ public record ReviewResult(
                 // A result with no verdict cannot be trusted as an approval.
                 return unparseable(raw, "缺少 verdict 字段");
             }
-            boolean approved = "PASS".equalsIgnoreCase(parsed.verdict().trim());
+            String verdict = parsed.verdict().trim().toUpperCase(Locale.ROOT);
+            if (!verdict.equals("PASS") && !verdict.equals("REVISE")) {
+                return unparseable(raw, "verdict 必须为 PASS 或 REVISE");
+            }
+            boolean approved = verdict.equals("PASS");
             List<ReviewIssue> issues = parsed.issues() == null ? List.of() : parsed.issues();
+            if (issues.stream().anyMatch(i -> i == null || i.problem() == null || i.problem().isBlank())) {
+                return unparseable(raw, "issue 缺少可执行的问题描述");
+            }
+            if (!approved && issues.isEmpty()) {
+                return unparseable(raw, "REVISE 未列出可执行的问题");
+            }
             String summary = parsed.summary() == null ? "" : parsed.summary();
             if (approved && issues.stream().anyMatch(ReviewIssue::isBlocker)) {
                 // Contradictory output: a BLOCKER cannot coexist with PASS. Treat the
                 // finding as authoritative — the more conservative reading.
                 return new ReviewResult(false, "REVISE", summary, issues);
             }
-            return new ReviewResult(approved, parsed.verdict(), summary, issues);
+            return new ReviewResult(approved, verdict, summary, issues);
         } catch (Exception e) {
             return unparseable(raw, e.getMessage());
         }
     }
 
+    /** PARSE is reserved for an unusable review, not a defect in the artifact. */
+    public boolean executionFailed() {
+        List<ReviewIssue> findings = issuesOrEmpty();
+        return !approved && !findings.isEmpty()
+                && findings.stream().allMatch(i -> "PARSE".equals(i.check()));
+    }
+
     /** True when at least one finding needs a new research pass. */
     public boolean needsResearcher() {
-        return issuesOrEmpty().stream().anyMatch(i -> i.targetEnum() == Target.RESEARCHER);
+        return !executionFailed() && issuesOrEmpty().stream().anyMatch(i -> i.targetEnum() == Target.RESEARCHER);
     }
 
     /** True when at least one finding needs a single paper re-read. */
     public boolean needsAnalyst() {
-        return issuesOrEmpty().stream().anyMatch(i -> i.targetEnum() == Target.ANALYST);
+        return !executionFailed() && issuesOrEmpty().stream().anyMatch(i -> i.targetEnum() == Target.ANALYST);
     }
 
     /** The findings a rewrite alone can address. */
     public List<ReviewIssue> writerIssues() {
-        return issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.WRITER).toList();
+        return executionFailed() ? List.of()
+                : issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.WRITER).toList();
     }
 
     /** The findings that need a paper re-read before the document is rewritten. */
     public List<ReviewIssue> analystIssues() {
-        return issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.ANALYST).toList();
+        return executionFailed() ? List.of()
+                : issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.ANALYST).toList();
     }
 
     /** The findings only a new research pass can address. */
     public List<ReviewIssue> researcherIssues() {
-        return issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.RESEARCHER).toList();
+        return executionFailed() ? List.of()
+                : issuesOrEmpty().stream().filter(i -> i.targetEnum() == Target.RESEARCHER).toList();
     }
 
     /** Renders the issues routed to one agent, for passing back as revision input. */

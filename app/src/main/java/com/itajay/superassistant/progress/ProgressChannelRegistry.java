@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Fans progress events out to every connection listening for a conversation thread.
@@ -65,11 +66,10 @@ public class ProgressChannelRegistry {
         if (threadId == null || threadId.isBlank()) {
             throw new IllegalArgumentException("threadId is required");
         }
-        CopyOnWriteArrayList<SseEmitter> list = listFor(threadId);
-        list.add(emitter);
+        AtomicBoolean detached = new AtomicBoolean();
         Runnable remove = () -> {
-            list.remove(emitter);
-            channels.remove(threadId, list);
+            detached.set(true);
+            removeEmitter(threadId, emitter);
         };
         emitter.onCompletion(remove);
         emitter.onTimeout(() -> {
@@ -80,6 +80,22 @@ public class ProgressChannelRegistry {
             log.debug("SSE channel errored [thread={}]: {}", threadId, e.getMessage());
             remove.run();
         });
+        // Wire callbacks before exposing the emitter to publishers. A callback can
+        // run during registration or addition; remember it and remove again after
+        // addition so a finished connection is never left behind in the fan-out.
+        channels.compute(threadId, (key, list) -> {
+            if (detached.get()) {
+                return list;
+            }
+            if (list == null) {
+                list = new CopyOnWriteArrayList<>();
+            }
+            list.add(emitter);
+            return list;
+        });
+        if (detached.get()) {
+            removeEmitter(threadId, emitter);
+        }
     }
 
     /**
@@ -101,12 +117,8 @@ public class ProgressChannelRegistry {
                 // Client disconnected mid-send. Drop this listener; the run and the
                 // other listeners carry on.
                 log.debug("Dropping SSE channel [thread={}]: {}", threadId, e.getMessage());
-                list.remove(emitter);
+                removeEmitter(threadId, emitter);
             }
-        }
-        if (list.isEmpty()) {
-            // Don't leave an empty shell in the map for every thread that ever listened.
-            channels.remove(threadId, list);
         }
     }
 
@@ -123,7 +135,7 @@ public class ProgressChannelRegistry {
                 try {
                     emitter.send(SseEmitter.event().comment("keepalive"));
                 } catch (IOException | IllegalStateException e) {
-                    entry.getValue().remove(emitter);
+                    removeEmitter(entry.getKey(), emitter);
                 }
             }
         }
@@ -133,7 +145,12 @@ public class ProgressChannelRegistry {
         return new SseEmitter(timeoutMinutes * 60_000L);
     }
 
-    private CopyOnWriteArrayList<SseEmitter> listFor(String threadId) {
-        return channels.computeIfAbsent(threadId, k -> new CopyOnWriteArrayList<>());
+    private void removeEmitter(String threadId, SseEmitter emitter) {
+        channels.computeIfPresent(threadId, (key, list) -> {
+            list.remove(emitter);
+            // Keep the mapping while other subscribers remain. This runs atomically
+            // with attach so a concurrent subscriber cannot join an orphaned list.
+            return list.isEmpty() ? null : list;
+        });
     }
 }

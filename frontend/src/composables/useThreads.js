@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { toast } from '../utils/toast'
 import { newId } from '../utils/id'
+import { sanitizeResearchProgress } from '../utils/researchProgress'
 
 // The two localStorage keys this store owns, defined once so no component has
 // to know the strings.
@@ -42,7 +43,15 @@ function sanitizeMessage(raw) {
   }
   // Keep the "may be incomplete" flag across reloads: the truncation is a
   // property of the stored answer, not of this session.
-  if (raw.incomplete) msg.incomplete = true
+  if (raw.incomplete || raw.streaming || raw.transportStatus === 'running') msg.incomplete = true
+  const progress = sanitizeResearchProgress(raw.progress, { restored: true })
+  if (progress) msg.progress = progress
+  const transportStatus = typeof raw.transportStatus === 'string' ? raw.transportStatus : progress?.transportStatus
+  if (['running', 'done', 'stopped', 'error', 'connection_lost', 'unknown'].includes(transportStatus)) {
+    msg.transportStatus = transportStatus === 'running' ? 'unknown' : transportStatus
+  }
+  if (typeof raw.error === 'string' && raw.error) msg.error = raw.error.slice(0, 1024)
+  if (raw.approvalsSubmitted === true) msg.approvalsSubmitted = true
   if (Array.isArray(raw.approvals)) {
     msg.approvals = raw.approvals.map(sanitizeApproval).filter(Boolean)
   }
@@ -77,7 +86,6 @@ function sanitizeThread(raw, key) {
 export function useThreads() {
   const h = {
     stopStream: () => {},
-    resetProgress: () => {},
     clearInput: () => {},
     refreshTasks: () => {},
     scrollDown: () => {}
@@ -122,7 +130,12 @@ export function useThreads() {
         lastActive: t.lastActive,
         messages: (t.messages || []).map(m => {
           const c = { id: m.id, role: m.role, content: m.content }
-          if (m.incomplete) c.incomplete = true
+          if (m.incomplete || m.streaming) c.incomplete = true
+          if (m.transportStatus) c.transportStatus = m.transportStatus
+          if (typeof m.error === 'string') c.error = m.error.slice(0, 1024)
+          const progress = sanitizeResearchProgress(m.progress)
+          if (progress) c.progress = progress
+          if (m.approvalsSubmitted) c.approvalsSubmitted = true
           if (m.approvals) {
             c.approvals = m.approvals.map(a => ({
               toolId: a.toolId, toolName: a.toolName,
@@ -151,6 +164,7 @@ export function useThreads() {
   }
 
   function newThread() {
+    h.stopStream()
     const id = newId('thr')
     threads.value[id] = { id, title: '', lastActive: Date.now(), messages: [] }
     activeThreadId.value = id
@@ -163,12 +177,8 @@ export function useThreads() {
 
   function switchThread(id) {
     if (id !== activeThreadId.value) {
-      // Leaving a conversation mid-answer cancels its stream: the reader would
-      // keep running invisibly otherwise, and its bubble must not be left
-      // streaming. Then drop the progress state, which describes the run that
-      // was just cancelled — not the conversation being opened.
-      h.stopStream(activeThreadId.value)
-      h.resetProgress()
+      // Settle the departing bubble; its progress remains in message history.
+      h.stopStream()
     }
     activeThreadId.value = id
     persistActive(id)

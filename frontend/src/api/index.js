@@ -47,39 +47,58 @@ export async function streamChatEvents(threadId, path, body, handlers, signal) {
     const handler = handlers['on' + name.charAt(0).toUpperCase() + name.slice(1)]
     if (handler) handler(data)
   }
+  let eventName = 'message'
+  let dataLines = []
+  let buffer = ''
+  let terminal = false
   const dispatchFrame = () => {
-    if (dataLines.length === 0) { eventName = 'message'; return }
+    if (dataLines.length === 0 && eventName !== 'done') { eventName = 'message'; return }
     const raw = dataLines.join('\n')
     dataLines = []
     const name = eventName
     eventName = 'message'
-    try {
-      const payload = raw ? JSON.parse(raw) : {}
-      if (name === 'done') handlers.onDone?.(payload)
-      else if (name === 'message') { /* an unnamed frame carries nothing we render */ }
-      else dispatch(name, payload)
-    } catch { /* a malformed frame is not worth breaking the stream over */ }
+    let payload
+    try { payload = raw ? JSON.parse(raw) : {} }
+    catch { return } // Only malformed JSON is ignored; handler errors propagate.
+    if (name === 'done') {
+      terminal = true
+      handlers.onDone?.(payload)
+    } else if (name !== 'message') dispatch(name, payload)
   }
-
-  let eventName = 'message'
-  let dataLines = []
-  let buffer = ''
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
+  const consumeLine = line => {
+    line = line.replace(/\r$/, '')
+    if (line === '') dispatchFrame()
+    else if (line.startsWith('event:')) eventName = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+  }
+  const consumeBuffer = () => {
     let nl
-    while ((nl = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, nl).replace(/\r$/, '')
+    while (!terminal && (nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl)
       buffer = buffer.slice(nl + 1)
-      if (line === '') { dispatchFrame(); continue }
-      if (line.startsWith('event:')) eventName = line.slice(6).trim()
-      else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
+      consumeLine(line)
     }
   }
-  dispatchFrame()
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  try {
+    while (!terminal) {
+      const { done, value } = await reader.read()
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
+      consumeBuffer()
+      if (done) {
+        // EOF may end inside the last line rather than after a blank separator.
+        if (!terminal && buffer) consumeLine(buffer)
+        if (!terminal) dispatchFrame()
+        break
+      }
+    }
+  } finally {
+    // Cancel unread frames after done, or on abort / handler / reader failure.
+    // A cleanup failure must not replace the original exception.
+    try { await reader.cancel() } catch { /* already closed / aborted */ }
+    reader.releaseLock()
+  }
 }
 
 export const chatStream = (threadId, message, mode, handlers, signal) =>
@@ -89,7 +108,7 @@ export const approveStream = (threadId, decisions, handlers, signal) =>
   streamChatEvents(threadId, '/approve', { decisions }, handlers, signal)
 
 // Todos — every query is scoped to a conversation threadId
-export const getTodos = (threadId) => api.get('/todos', { params: { threadId } })
+export const getTodos = (threadId) => api.get('/todos', { params: { threadId }, silent: true })
 export const getPendingTodos = (threadId) => api.get('/todos/pending', { params: { threadId } })
 export const getOverdueTodos = (threadId) => api.get('/todos/overdue', { params: { threadId } })
 export const queryTodos = (threadId, status, priority, keyword) =>

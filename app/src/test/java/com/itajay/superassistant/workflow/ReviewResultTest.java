@@ -134,6 +134,39 @@ class ReviewResultTest {
     }
 
     @Test
+    void executionFailuresAreSeparateFromContentFindings() {
+        ReviewResult result = ReviewResult.parse("not a review");
+        assertThat(result.approved()).isFalse();
+        assertThat(result.issues()).extracting(ReviewResult.ReviewIssue::check).containsExactly("PARSE");
+        assertThat(result.needsResearcher()).isFalse();
+        assertThat(result.needsAnalyst()).isFalse();
+        assertThat(result.writerIssues()).isEmpty();
+    }
+
+    @Test
+    void aContradictoryPassWithABlockerIsContentRevisionNotFormatRecovery() {
+        ReviewResult result = ReviewResult.parse("""
+                {"verdict":"PASS","issues":[{"level":"BLOCKER","target":"ANALYST",
+                "check":"F1","problem":"原文与结论不符"}]}
+                """);
+        assertThat(result.executionFailed()).isFalse();
+        assertThat(result.approved()).isFalse();
+        assertThat(result.needsAnalyst()).isTrue();
+    }
+
+    @Test
+    void unusableVerdictsAndFindingsFailClosed() {
+        for (String raw : new String[]{
+                "{\"verdict\":\"UNKNOWN\",\"issues\":[]}",
+                "{\"verdict\":\"REVISE\",\"issues\":[]}",
+                "{\"verdict\":\"PASS\",\"issues\":[null]}"}) {
+            ReviewResult result = ReviewResult.parse(raw);
+            assertThat(result.approved()).as(raw).isFalse();
+            assertThat(result.issues()).extracting(ReviewResult.ReviewIssue::check).containsExactly("PARSE");
+        }
+    }
+
+    @Test
     void routesFindingsToTheAgentThatCanFixThem() {
         ReviewResult result = ReviewResult.parse("""
                 {"verdict": "REVISE", "approved": false, "summary": "混合问题",
@@ -290,7 +323,7 @@ class ReviewResultTest {
         assertThat(format).contains("verdict").contains("summary").contains("issues")
                 .contains("level").contains("target").contains("problem");
         // Derived by the workflow from the verdict, so it must not be asked for.
-        assertThat(format).doesNotContain("approved");
+        assertThat(format).doesNotContain("approved").doesNotContain("\"blocker\"");
     }
 
     @Test

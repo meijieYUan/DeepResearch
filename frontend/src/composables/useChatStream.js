@@ -1,6 +1,7 @@
-import { ref } from 'vue'
+import { getCurrentScope, onScopeDispose, ref, watch } from 'vue'
 import { chatStream, approveStream } from '../api'
 import { newId } from '../utils/id'
+import { reduceResearchProgress, setProgressTransport } from '../utils/researchProgress'
 
 const TITLE_MAX = 40
 
@@ -16,215 +17,154 @@ const TITLE_MAX = 40
  */
 export function useChatStream({
   threads, activeThreadId, planMode, planActive,
-  saveThreads, refreshTasks, scrollDown
+  saveThreads, refreshTasks, scrollDown,
+  requestChat = chatStream, requestApproval = approveStream
 }) {
   // A run is in flight: the composer stays disabled until the stream settles.
   const loading = ref(false)
 
-  // Workflow progress, streamed on the same connection as the answer.
-  const progressStage = ref('')
-  const progressRound = ref(1)
-  const progressFailed = ref(false)
-  const progressDetail = ref('')
-
-  function resetProgress() {
-    progressStage.value = ''
-    progressRound.value = 1
-    progressFailed.value = false
-    progressDetail.value = ''
-  }
-
-  // The single in-flight stream, if any. send() and submitApprovals() register
-  // their AbortController and finalize hook here, so an unmount, a thread
-  // switch, or a delete can stop the run and settle its bubble instead of
-  // leaking the reader and leaving the bubble spinning. Only one run is ever in
-  // flight, because the composer is disabled while `loading`.
   let liveStream = null
+  let generation = 0
 
-  // Stops the in-flight stream, optionally only when it belongs to `threadId`
-  // (an unrelated switch must not kill a run in another conversation). Aborting
-  // first stops the reader from delivering more frames; finalize then settles
-  // the bubble so it can never be left stuck in the streaming state. No-op when
-  // idle, and the finalize hook is idempotent, so a double call is harmless.
   function stopStream(threadId = null) {
-    const s = liveStream
-    if (!s || (threadId !== null && s.threadId !== threadId)) return
-    liveStream = null
-    s.controller.abort()
-    s.finalize({ incomplete: true })
+    const slot = liveStream
+    if (!slot || (threadId !== null && slot.threadId !== threadId)) return
+    // Settle before detaching: queued handlers, RAFs and the old finally then
+    // lose ownership, even if the user goes A -> B -> A synchronously.
+    slot.finalize('stopped', true)
+    slot.controller.abort()
+    if (liveStream === slot) {
+      liveStream = null
+      generation++
+      loading.value = false
+    }
   }
 
-  // The single entry point for a streamed run. It owns the AbortController and
-  // the end-of-stream bookkeeping, so however the transport ends — terminal
-  // event, abrupt close, network failure, or abort — the bubble is settled and
-  // `loading` is released. `launch` receives the handlers and the abort signal.
-  function runStream(threadId, bubble, launch) {
-    const controller = new AbortController()
-    const handlers = makeStreamHandlers(threadId, bubble)
-    const slot = { threadId, controller, finalize: handlers.finalize }
+  watch(activeThreadId, () => stopStream(), { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(() => stopStream())
+
+  function runStream(threadId, messageId, launch) {
+    const slot = {
+      threadId, messageId, generation: ++generation,
+      controller: new AbortController(), finalized: false, receivedAnswer: false,
+      pendingDelta: '', raf: null, finalize: null
+    }
     liveStream = slot
     loading.value = true
-
-    launch(controller.signal, handlers)
-      .catch(err => {
-        // An abort is not a failure: stopStream already settled the bubble.
-        if (err?.name === 'AbortError') return
-        finalizeFailure(threadId, bubble, err?.message || 'Request failed')
-      })
-      .finally(() => {
-        // The backstop for a stream that closed without a terminal event (the
-        // server never sent `done`): without it the bubble would stream forever.
-        handlers.finalize({ incomplete: true })
-        if (liveStream === slot) liveStream = null
-        loading.value = false
-        scrollDown()
-      })
-  }
-
-  // Everything one streamed run does to the transcript. The target is addressed
-  // by threadId and re-resolved from threads.value on every event: loadThreads()
-  // can swap in a fresh object graph, and a handler that had closed over the old
-  // thread (or bubble) object would then write into an orphan that no view
-  // renders — the answer would silently vanish. If the thread or bubble is gone,
-  // the event is dropped rather than resurrecting stale state.
-  //
-  // `finalize` (attached to the returned handlers) is the one settle path,
-  // shared by the server's `done` event and the transport's fallback in
-  // runStream.
-  function makeStreamHandlers(threadId, bubble) {
-    resetProgress()
-    let pendingDelta = ''
-    let flushScheduled = false
-    let finalized = false
-
+    const ownsSlot = () => liveStream === slot && generation === slot.generation
     const liveThread = () => threads.value[threadId] || null
-    // Resolve the bubble through the reactive array, never the closure variable.
-    // The array stores the raw object it was pushed, so writing to `bubble`
-    // directly notifies no effect: the memoised markdown computed in MessageItem
-    // would never invalidate and streamed text would never paint (and the same
-    // applies to `streaming` / `incomplete`). `t.messages[idx]` is the proxy, so
-    // every read and write below is tracked.
-    const liveBubble = () => {
-      const t = liveThread()
-      if (!t) return null
-      const idx = (t.messages || []).indexOf(bubble)
-      return idx >= 0 ? t.messages[idx] : null
+    // IDs survive loadThreads replacing all reactive message objects.
+    const liveBubble = () => liveThread()?.messages?.find(m => m.id === messageId) || null
+    const accepts = () => ownsSlot() && !slot.finalized && activeThreadId.value === threadId && !!liveBubble()
+    const cancelFrame = () => {
+      if (slot.raf !== null) globalThis.cancelAnimationFrame?.(slot.raf)
+      slot.raf = null
     }
     const flushDeltas = () => {
-      if (!pendingDelta) return
       const b = liveBubble()
-      if (b) b.content += pendingDelta
-      pendingDelta = ''
+      if (b && slot.pendingDelta) b.content += slot.pendingDelta
+      slot.pendingDelta = ''
     }
-    const touch = (t) => { if (t) t.lastActive = Date.now() }
-
+    const persist = () => {
+      const t = liveThread()
+      if (t) t.lastActive = Date.now()
+      saveThreads()
+      scrollDown()
+    }
+    const setTransport = (b, status) => {
+      b.transportStatus = status
+      if (b.progress) b.progress = setProgressTransport(b.progress, status)
+    }
+    slot.finalize = (status, incomplete = false, error = '') => {
+      if (!ownsSlot() || slot.finalized) return
+      cancelFrame()
+      flushDeltas()
+      slot.finalized = true
+      const b = liveBubble()
+      if (!b) return
+      b.streaming = false
+      b.incomplete = incomplete
+      if (error) b.error = String(error).slice(0, 1024)
+      setTransport(b, status)
+      persist()
+    }
+    const reconcilePlan = p => {
+      if (p.planEnabled !== undefined) planMode.value = p.planEnabled
+      if (p.planActive !== undefined) planActive.value = p.planActive
+    }
     const handlers = {
       onProgress(p) {
-        progressStage.value = p.label || ''
-        progressRound.value = p.round || 1
-        progressFailed.value = p.stage === 'FAILED'
-        progressDetail.value = p.detail || ''
-        scrollDown()
+        if (!accepts()) return
+        const b = liveBubble()
+        b.progress = reduceResearchProgress(b.progress, p)
+        b.progress = setProgressTransport(b.progress, b.transportStatus)
+        persist()
       },
       onDelta(d) {
-        pendingDelta += d.text || ''
-        // Coalesce token deltas into one DOM update per frame; re-rendering the
-        // markdown for every chunk is wasted work the eye cannot see.
-        if (!flushScheduled) {
-          flushScheduled = true
-          requestAnimationFrame(() => {
-            flushScheduled = false
+        if (!accepts() || slot.receivedAnswer) return
+        slot.pendingDelta += typeof d?.text === 'string' ? d.text : ''
+        if (slot.raf === null) {
+          if (typeof globalThis.requestAnimationFrame !== 'function') { flushDeltas(); scrollDown(); return }
+          slot.raf = globalThis.requestAnimationFrame(() => {
+            slot.raf = null
+            if (!accepts()) return
             flushDeltas()
             scrollDown()
           })
         }
       },
       onAnswer(p) {
-        if (p.planEnabled !== undefined) planMode.value = p.planEnabled
-        if (p.planActive !== undefined) planActive.value = p.planActive
-        // The server's final text wins: it is the same run read from its settled
-        // state, so a lost delta cannot leave the transcript truncated — drop the
-        // unflushed tail instead of appending it after the authoritative text.
-        pendingDelta = ''
+        if (!accepts()) return
+        reconcilePlan(p)
+        cancelFrame()
         const b = liveBubble()
-        if (b) {
-          b.content = p.text || b.content
-          b.streaming = false
-          b.incomplete = false
-        }
-        touch(liveThread())
-        saveThreads()
+        if (typeof p.text === 'string' && p.text) { slot.pendingDelta = ''; b.content = p.text }
+        else flushDeltas()
+        b.streaming = false
+        b.incomplete = false
+        slot.receivedAnswer = true
+        persist()
         refreshTasks()
-        scrollDown()
       },
       onInterruption(p) {
-        if (p.planEnabled !== undefined) planMode.value = p.planEnabled
-        if (p.planActive !== undefined) planActive.value = p.planActive
-        const t = liveThread()
-        if (!t) return
-        // The empty placeholder has nothing to show — the approval panel takes over.
-        const idx = t.messages.indexOf(bubble)
-        if (idx >= 0) t.messages.splice(idx, 1)
-        const approvals = (p.pendingApprovals || []).map(a => ({
+        if (!accepts()) return
+        reconcilePlan(p)
+        cancelFrame()
+        flushDeltas()
+        // Reuse the bubble, keeping its id, partial text and progress snapshot.
+        const b = liveBubble()
+        if (typeof p.message === 'string' && p.message) b.content += (b.content ? '\n\n' : '') + p.message
+        b.approvals = (Array.isArray(p.pendingApprovals) ? p.pendingApprovals : []).map(a => ({
           ...a, id: newId('app'), decision: null, editing: false, editedArgs: a.arguments
         }))
-        t.messages.push({
-          id: newId('msg'), role: 'assistant',
-          content: p.message || '', approvals, threadId: p.threadId
-        })
-        touch(t)
-        saveThreads()
+        b.streaming = false
+        b.incomplete = false
+        slot.receivedAnswer = true
+        persist()
         refreshTasks()
-        scrollDown()
       },
       onError(p) {
-        const b = liveBubble()
-        if (b) {
-          b.content = '⚠️ Error: ' + (p.message || 'Unknown error')
-          b.streaming = false
-        }
-        touch(liveThread())
-        saveThreads()
-        scrollDown()
+        if (!accepts()) return
+        slot.finalize('error', true, p?.message || 'Unknown error')
       },
-      // The server's terminal frame. Reaching it with the bubble still streaming
-      // means no answer / interruption ever arrived, so the run was cut short.
-      onDone() { handlers.finalize({ incomplete: true }) }
+      onDone() {
+        if (!accepts()) return
+        // Transport done is NOT business PASS. Preserve the workflow's status.
+        slot.finalize('done', !slot.receivedAnswer)
+      }
     }
-
-    // Settles the bubble exactly once, however the run ended.
-    handlers.finalize = ({ incomplete = false } = {}) => {
-      if (finalized) return
-      finalized = true
-      const b = liveBubble()
-      if (!b) return
-      // Paint whatever the last coalescing frame had not yet flushed.
-      flushDeltas()
-      if (!b.streaming) return
-      b.streaming = false
-      if (incomplete) b.incomplete = true
-      touch(liveThread())
-      saveThreads()
-      scrollDown()
-    }
-
-    return handlers
-  }
-
-  // The stream itself failed to open (network, non-200): nothing was ever streamed.
-  function finalizeFailure(threadId, bubble, message) {
-    const t = threads.value[threadId]
-    if (!t) return
-    const idx = (t.messages || []).indexOf(bubble)
-    if (idx < 0) return
-    // Same proxy resolution as liveBubble: the raw object would not notify.
-    const b = t.messages[idx]
-    if (!b.streaming) return
-    b.content = '⚠️ Error: ' + message
-    b.streaming = false
-    t.lastActive = Date.now()
-    saveThreads()
-    scrollDown()
+    Promise.resolve().then(() => {
+      if (!accepts()) return
+      return launch(slot.controller.signal, handlers)
+    }).catch(err => {
+      if (!accepts()) return
+      slot.finalize(err?.name === 'AbortError' ? 'stopped' : 'error', true, err?.name === 'AbortError' ? '' : err?.message || 'Request failed')
+    }).finally(() => {
+      if (!ownsSlot()) return
+      if (!slot.finalized) slot.finalize('connection_lost', true)
+      // An old finally must never release a newer request's loading flag.
+      if (ownsSlot()) { liveStream = null; loading.value = false }
+    })
   }
 
   /**
@@ -235,7 +175,7 @@ export function useChatStream({
   function send(text, mode) {
     const threadId = activeThreadId.value
     const t = threadId ? threads.value[threadId] : null
-    if (!t) return false
+    if (!t || loading.value || liveStream) return false
     // The first user turn names the conversation.
     if (!t.title && t.messages.length === 0) {
       t.title = text.length > TITLE_MAX ? text.substring(0, TITLE_MAX) + '...' : text
@@ -247,10 +187,10 @@ export function useChatStream({
 
     // The streaming bubble: created up front, filled by deltas, finalized by the
     // terminal event. See makeStreamHandlers for the whole lifecycle.
-    const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true }
+    const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
     t.messages.push(bubble)
-    runStream(threadId, bubble, (signal, handlers) =>
-      chatStream(threadId, text, mode, handlers, signal))
+    runStream(threadId, bubble.id, (signal, handlers) =>
+      requestChat(threadId, text, mode, handlers, signal))
     return true
   }
 
@@ -260,23 +200,26 @@ export function useChatStream({
    * interrupt again on the next risky tool call.
    */
   function submitApprovals(msg) {
-    const decisions = msg.approvals.map(a => {
+    if (loading.value || liveStream) return false
+    const threadId = activeThreadId.value
+    const t = threads.value[threadId]
+    const source = t?.messages?.find(m => m.id === msg?.id)
+    if (!source || source.approvalsSubmitted || !source.approvals?.length) return false
+    if (!source.approvals.every(a => !a.editing && ['APPROVED', 'REJECTED', 'EDITED'].includes(a.decision))) return false
+    const decisions = source.approvals.map(a => {
       const d = { toolId: a.toolId, result: a.decision }
       if (a.decision === 'EDITED' && a.editedArgs) d.editedArguments = a.editedArgs
       return d
     })
-    const threadId = activeThreadId.value
-    const t = threads.value[threadId]
-    if (!t) return
-    const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true }
+    // An approval group is single-flight and cannot be replayed after completion.
+    source.approvalsSubmitted = true
+    const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
     t.messages.push(bubble)
-    runStream(threadId, bubble, (signal, handlers) =>
-      approveStream(threadId, decisions, handlers, signal))
+    saveThreads()
+    runStream(threadId, bubble.id, (signal, handlers) =>
+      requestApproval(threadId, decisions, handlers, signal))
+    return true
   }
 
-  return {
-    loading,
-    progressStage, progressRound, progressFailed, progressDetail,
-    resetProgress, stopStream, send, submitApprovals
-  }
+  return { loading, stopStream, send, submitApprovals }
 }

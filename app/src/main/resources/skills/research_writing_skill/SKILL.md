@@ -1,6 +1,6 @@
 ---
 name: research-writing
-description: "科研课题调研与文献综述撰写。当用户需要对某个研究方向或课题进行论文调研、文献检索、撰写调研报告/综述文档时触发。流程为：检索候选论文 → 摘要级相关性判定 → 下载相关论文 → 逐篇精读并把四维信息落盘到 analysis/，同时从 PDF 截取该论文自己的图 → 撰写对比型调研文档 → 质量审查（文档与精读结果均审）→ 未通过则按问题归属回退修订（最多 2 轮）。"
+description: "科研课题调研与文献综述撰写。当用户需要对某个研究方向或课题进行论文调研、文献检索、撰写调研报告/综述文档时触发。流程为：检索候选论文 → 摘要级相关性判定 → 下载相关论文 → 逐篇精读并把四维信息落盘到 analysis/，同时从 PDF 截取该论文自己的图 → 撰写对比型调研文档 → 质量审查（文档与精读结果均审）→ 未通过则按问题归属回退修订（最多 2 轮内容审查、最多 1 次内容修订）。"
 ---
 
 # 科研课题调研写作
@@ -69,7 +69,13 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 ## 工作流程总览
 
-**整个流程由 `researchWriteReview` 工作流编排**（Java 代码驱动，见 `workflow/ResearchWriteReviewWorkflow.java`），主 Agent 只调用这一个入口，不单独调用四个子 Agent。工作流内部按下图执行，并在审查未通过时按问题归属回退：
+**整个流程由 `researchWriteReview` 工作流编排**（Java 代码驱动，见 `workflow/ResearchWriteReviewWorkflow.java`），主 Agent 不单独调用四个子 Agent。工作流内部按下图执行，并在审查未通过时按问题归属回退：
+
+> **两个工作流入口的分工**：综述/对比型调研文档走 `researchWriteReview`（下图全流程）；
+> 只想精读**一篇确定的论文**（URL/arXiv/DOI、本地 PDF、已下载论文短名）走 `deepReadPaper`
+> （`workflow/PaperDeepReadWorkflow.java`）——「获取 → 单篇精读 → 审查 → 重做」轻量闭环，
+> **只交付 `analysis/{论文短名}.md`**，不写调研文档。审查在单篇模式下只审 analysis
+> （`review-guide.md` §0.1：`WRITER` 等同 `ANALYST`，`RESEARCHER` 级问题如实上报不回环）。
 
 ```
 用户课题
@@ -87,7 +93,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
    │      用 extractPaperText 逐篇读正文，公式逐字核对
    │      概要与作者意图 / 方法框架 / 关键机制与创新点 / 训练目标
    │      → 落盘 investigation/{课题方向}/analysis/{论文短名}.md
-   │      用 listPaperFigures 看图注选图，再用 extractPaperFigures 截取（只截方法框架图/关键机制图，一般 1-4 张，没有就一张不截并降级为"图见原文 Fig. N"）
+   │      用 listPaperFigures 看图注选图，再用 extractPaperFigures 截取（只截方法框架图/关键机制图，每篇 0-4 张，上限 4 张；没有合格图就不截并诚实降级）
    │      → 落盘 analysis/figures/{论文短名}_Fig{N}.png
    │
    ├─ 第四步 撰写调研文档 ─────────────── writer-agent
@@ -99,13 +105,14 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
    ├─ 第五步 质量检查 ─────────────────── reviewer-agent
    │      审文档（对比结论、结构、汇总表）
    │      审 analysis 文件（公式逐字符比对原文、来源等级）
-   │      输出 {approved, verdict, issues[]}，每条 issue 带 target
+   │      模型只输出 {verdict, summary, issues[]}，每条 issue 带 target；Java 派生 approved
    │
-   └─ 第六步 判定与修订回边 ───────────── 工作流（最多 2 轮）
-          approved=true            → 交付，向用户汇报
-          target=WRITER 的问题      → 回到第四步，只重写文档
+   └─ 第六步 判定与修订回边 ───────────── 工作流（最多 2 轮内容审查、最多 1 次内容修订）
+          Java 派生 approved=true  → 交付，向用户汇报
+          target=WRITER 的问题      → 回到第四步，只修订文档
           target=ANALYST 的问题     → 重做该篇精读（reanalyzePaper）后回到第四步
           target=RESEARCHER 的问题  → 回到第二步，重跑 research 后接第四步
+          审查格式异常             → 每份产物至多即时补审 1 次，不消耗内容审查或修订额度
 ```
 
 **第二步是整个流程的质量源头**：检索质量与下载下来的 PDF 是后续所有环节的唯一输入。一旦下载了不相关的论文，后面每一步都在错误的材料上浪费算力。因此下载前必须完成摘要级相关性判定，详细规则见 `references/research-guide.md`。
@@ -158,7 +165,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 产出通过 `writePaperAnalysis(topic, paperShortName, sourceLevel, oneLineSummary, content)` 落盘到 `investigation/{课题方向}/analysis/{论文短名}.md`。**来源等级由 analyst 如实声明**，写在文件头部，供后续核对。
 
-图片先用 `listPaperFigures(topic, pathOrName)` 取图注索引（只读文字，不落盘），再用 `extractPaperFigures(topic, pathOrName, figures = "Fig. 2")` 按图号截取，落盘到 `analysis/figures/`，**只截方法框架图或关键机制图，一般 1-4 张；论文中不存在这类图时一张不截，写降级行**。图号来自图注，所以文件名 `{论文短名}_Fig{N}.png` 里的号就是论文里的号。返回表同时给出"analysis 里怎么引用"与"文档里怎么引用"两种完整相对路径，analyst 把后者另起一行写进精读结果；扫描版或矢量图形取不到图时，如实降级为「图见原文 Fig. N（p.X）」，不引用别处的图。
+图片先用 `listPaperFigures(topic, pathOrName)` 取图注索引（只读文字，不落盘），再用 `extractPaperFigures(topic, pathOrName, figures = "Fig. 2")` 按图号截取，落盘到 `analysis/figures/`，**只截方法框架图或关键机制图，每篇 0-4 张，上限 4 张；论文中不存在这类图时一张不截，写降级行**。图号来自图注，所以文件名 `{论文短名}_Fig{N}.png` 里的号就是论文里的号。返回表同时给出"analysis 里怎么引用"与"文档里怎么引用"两种完整相对路径，analyst 把后者另起一行写进精读结果；扫描版或矢量图形取不到图时，如实降级为「图见原文 Fig. N（p.X）」，不引用别处的图。
 
 ## 第四步：撰写调研文档
 
@@ -202,17 +209,16 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 执行细则见 `references/review-guide.md`。`reviewer-agent` 审查**两个对象**：最终文档，以及 `analysis/` 目录下的精读结果。后者是必须的——公式与细节实际承载在 analysis 文件里，不审它就等于放弃事实核对。
 
-`reviewer-agent` 按检查项逐条核验，输出**结构化审批结论**——既包含给主 Agent 汇报的内容，也包含工作流判定所需的 `approved` 标记：
+`reviewer-agent` 按检查项逐条核验，模型只输出 `verdict`、`summary`、`issues` 三个字段。字段与类型以框架随消息附上的、由 **`ReviewResult.Payload` 生成的 schema** 为唯一权威；下例仅说明字段含义，不维护另一套 schema：
 
 ```json
 {
-  "approved": false,
-  "verdict": "PASS 或 REVISE",
+  "verdict": "REVISE",
   "summary": "给主 Agent 的总体意见：整体质量评价、主要问题归纳、修改优先级建议",
   "issues": [
     {
-      "level": "BLOCKER|MAJOR|MINOR",
-      "target": "WRITER|ANALYST|RESEARCHER",
+      "level": "MAJOR",
+      "target": "ANALYST",
       "location": "章节定位，如 # 2. LCP-Diffusion / ## 2.4 训练目标，或 analysis/LCP-Diffusion.md 的 1.3 节",
       "check": "检查项编号，如 F14",
       "problem": "问题",
@@ -223,7 +229,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 }
 ```
 
-**`approved` 必须与 `verdict` 一致**：`verdict=PASS` 时 `approved=true`，`verdict=REVISE` 时 `approved=false`。出现 BLOCKER 时无论计数如何都不得 `approved=true`。
+**模型不输出 `approved`**：它由 Java 从 `verdict` 派生，只有明确的 `PASS` 且无 BLOCKER 才可通过。`issues` 中有 BLOCKER 时 `verdict` 必须是 `REVISE`；矛盾输出不得放行。
 
 **`target` 决定工作流回退到哪一步**（这是本字段存在的唯一理由，必须逐条填写）：
 
@@ -237,13 +243,13 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 
 ## 第六步：判定与修订回边
 
-工作流读取 `approved`：
+工作流读取 Java 从 `verdict` 派生的 `approved`：
 
 - `approved=true` → 流程结束，向用户交付文档。
-- `approved=false` → 按上表三档分流：issues 含 `RESEARCHER` 级问题则重跑 `research → write`；否则带 `ANALYST` 级问题回 `write`（writer 先 `reanalyzePaper` 再改文档）；全部为 `WRITER` 级问题则只重跑 `write`。**最多 2 轮**。
-- 2 轮后仍未通过 → 停止循环，**如实向用户报告遗留问题与影响范围，不得强行放行**。
+- `approved=false` 且仍有内容修订额度 → 按上表三档分流：issues 含 `RESEARCHER` 级问题则重跑 `research → write`；否则带 `ANALYST` 级问题回 `write`（writer 先 `reanalyzePaper` 再改文档）；全部为 `WRITER` 级问题则只重跑 `write`。
+- **最多 2 轮内容审查、最多 1 次内容修订**：初稿审查 → 必要时修订一次 → 复审；不是两次重做。第 2 轮内容审查仍未通过 → 停止循环，**如实向用户报告遗留问题与影响范围，不得强行放行**。
 
-**审查输出无法解析时（JSON 格式错误、字段缺失、模型未按要求输出），工作流一律按"未通过"处理**，并追加一条说明"审查输出无法解析，未完成事实核验"的问题项。**不得静默放行**——放行一份未经核验的文档，等于让整个审查环节形同虚设。
+**审查输出格式异常仅指解析器标记的 `PARSE` 执行失败：空输出、坏 JSON、未知或缺失 `verdict`、空 `REVISE`（没有问题项）、缺失 `problem`（无法执行的问题项）。由工作流对每份产物至多即时补审 1 次，不消耗内容审查或修订额度**。补审仅纠正审查输出，不交给 writer 改动正确产物；补审仍异常则按未通过处理并如实报告"审查输出异常，未完成事实核验"，停止循环。`PASS + BLOCKER` 保留有证据的 BLOCKER 并按内容 `REVISE` 处理，走内容修订而非格式补审；`target`、`location`、`fix` 缺失仍按解析器的兼容口径处理，不单独视为 `PARSE`。**不得静默放行**——放行一份未经核验的文档，等于让整个审查环节形同虚设。
 
 交付时向用户汇报：检索了多少篇论文、判定通过多少篇、最终选取几篇、每篇的核心贡献概览、经过几轮修订，以及任何因无法获取全文而降低信息可信度的地方。**同时告知 `analysis/` 目录的位置**——精读结果是给用户看的产物，他可以直接打开其中任意一篇查看详细分析。
 
@@ -253,7 +259,7 @@ description: "科研课题调研与文献综述撰写。当用户需要对某个
 - **不越权**：`research-agent` 只做检索、读取与下载，不写入、不删除、不发送邮件；`analyst-agent` 除通过 `writePaperAnalysis` 落盘**自己那一篇**的分析文件、通过 `extractPaperFigures` 落盘这一篇的图之外，只能只读地调用 `extractPaperText`；`writer-agent` 除通过 `writeResearchDocument` 落盘文档外**没有写入能力**，既不碰 PDF、不能截图也不能改写 analysis 文件（要重做只能调 `reanalyzePaper`）；`reviewer-agent` 只读不写。
 - **不越界精读**：`research-agent` 没有读取 PDF 正文的工具，这是有意为之。它的职责到"下载"为止，不得尝试用 `webCrawl` 或其他方式绕过读取正文。
 - **不复述**：文档不得把 analysis 文件的四维正文抄回来。每篇只留 2-4 句定位 + 相对链接；公式与细节留在 analysis 文件里。这一条是文档体量可控的前提，抄回来就会重新逼近模型单次输出上限。
-- **不凭空引用图片**：正式文档的图片路径只能逐字取自 `analysis/{论文短名}.md` 里的 `> 文档引用：` 行，也就是 `extractPaperFigures` 从该论文 PDF 截出的图。**不得引用 skill 目录下的任何文件**（`example/` 的 `papper*.png`、`template/` 都不行），不得引用别的论文的图，不得写绝对路径。取不到图就写「图见原文 Fig. N（p.X）」——这是合规产出，不是缺失。范例引用自己的图与正式产出引用截取的图，是两件互不通用的事。
+- **不凭空引用图片**：正式文档的图片路径只能逐字取自 `analysis/{论文短名}.md` 里的 `> 文档引用：` 行，也就是 `extractPaperFigures` 从该论文 PDF 截出的图。**不得引用 skill 目录下的任何文件**（`example/` 的 `papper*.png`、`template/` 都不行），不得引用别的论文的图，不得写绝对路径。取不到图时诚实降级，只有已核实位置才写「图见原文 Fig. N（p.X）」；没有合格图或位置未核实则说明限制，不编造图号或页码——这是合规产出，不是缺失。范例引用自己的图与正式产出引用截取的图，是两件互不通用的事。
 - **不重复失败**：同一 URL 或同一检索式失败两次即改变策略（换站点、换关键词、走降级链），不做无意义重试。
 - **诚实标注降级**：无法获取全文时，在材料与文档中显式标注信息来源等级，不得把摘要级信息伪装成全文级信息。
-- **不放行未核验的文档**：审查输出无法解析时按未通过处理；2 轮修订后仍有 BLOCKER 时如实报告，不得为了让流程"收敛"而降低标准。
+- **不放行未核验的文档**：每份产物的审查格式异常至多即时补审 1 次，仍异常则停止并报告；最多 2 轮内容审查、最多 1 次内容修订后仍未通过时如实报告，不得为了让流程"收敛"而降低标准。

@@ -8,10 +8,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
 /**
  * Shared helpers for the two paper tools: locating a downloaded PDF, and reporting
@@ -153,6 +155,113 @@ final class PaperStore {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * Copies a locally available PDF into the topic's {@code papers/}, the same place a
+     * download would have landed it. Used by the single-paper deep-read workflow, which
+     * must not re-download a paper the user already has on disk.
+     *
+     * <p>Holds the same bar as a download: the file must carry the {@code %PDF-} magic,
+     * parse under PDFBox, and fit the size ceiling. A local file is no more trustworthy
+     * than a fetched one — it may be an error page saved with a {@code .pdf} name.</p>
+     *
+     * <p>If the target already exists <em>and parses</em>, nothing is copied: same dedup
+     * stance as {@code downloadPaper}. A target that exists but does not parse is
+     * replaced — it cannot be read anyway, and keeping it would poison every later step.</p>
+     *
+     * @param maxBytes size ceiling; the caller takes it from {@code PaperDownloadProperties}
+     * @return the target path in {@code papers/}, always parseable
+     * @throws IOException when the source is unreadable or the copy fails
+     * @throws IllegalArgumentException when the source is not a usable PDF or exceeds the ceiling
+     */
+    static Path importPdf(Path source, String topic, String shortName, long maxBytes) throws IOException {
+        if (source == null || !Files.isRegularFile(source)) {
+            throw new IllegalArgumentException("本地 PDF 不存在：" + source);
+        }
+        if (Files.size(source) > maxBytes) {
+            throw new IllegalArgumentException("本地 PDF 超过大小上限（" + Files.size(source) + " bytes）：" + source);
+        }
+        if (!hasPdfMagic(source) || pageCount(source) == null) {
+            throw new IllegalArgumentException("本地文件不是可解析的 PDF：" + source);
+        }
+
+        Path papersRoot = papersRoot(topic);
+        String safeName = WorkspacePaths.slugify(shortName, "论文短名");
+        Path target = papersRoot.resolve(safeName + ".pdf").normalize();
+        if (!target.startsWith(papersRoot)) {
+            throw new IllegalArgumentException("resolved path escapes the papers directory: " + target);
+        }
+
+        if (Files.isRegularFile(target) && pageCount(target) != null) {
+            return target;
+        }
+
+        // Temp + move keeps an interrupted copy from leaving a half-written PDF under the
+        // final name — same discipline as saveAndReport in the downloader.
+        Files.createDirectories(papersRoot);
+        Path temp = Files.createTempFile(papersRoot, ".import-", ".part");
+        try {
+            Files.copy(source, temp, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+            temp = null;
+        } finally {
+            if (temp != null) {
+                Files.deleteIfExists(temp);
+            }
+        }
+        return target;
+    }
+
+    /**
+     * Finds a PDF with this short name under any topic's {@code papers/}, so the
+     * deep-read workflow can reuse a paper a previous investigation already downloaded
+     * instead of fetching it again.
+     *
+     * <p>Topics are scanned in directory-name order so the pick is deterministic when
+     * several topics hold the same file name. Only parseable PDFs count — a corrupt
+     * leftover is not a paper worth reusing.</p>
+     */
+    static Optional<Path> findPdfAcrossTopics(String shortName) {
+        String fileName;
+        try {
+            fileName = WorkspacePaths.slugify(shortName, "论文短名") + ".pdf";
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
+        Path root = WorkspacePaths.investigationRoot();
+        if (!Files.isDirectory(root)) {
+            return Optional.empty();
+        }
+        try (var stream = Files.list(root)) {
+            return stream
+                    .filter(Files::isDirectory)
+                    .sorted()
+                    .map(topicDir -> topicDir.resolve(WorkspacePaths.PAPERS_SUBDIR).resolve(fileName))
+                    .filter(Files::isRegularFile)
+                    .filter(p -> pageCount(p) != null)
+                    .findFirst();
+        } catch (IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Every valid PDF starts with this — same check the downloader applies to fetched bytes. */
+    private static boolean hasPdfMagic(Path file) throws IOException {
+        byte[] head;
+        try (InputStream in = Files.newInputStream(file)) {
+            head = in.readNBytes(5);
+        }
+        if (head.length < 5) {
+            return false;
+        }
+        byte[] magic = {'%', 'P', 'D', 'F', '-'};
+        for (int i = 0; i < magic.length; i++) {
+            if (head[i] != magic[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Hex SHA-256 of a file, or null if it cannot be read. */

@@ -1,12 +1,24 @@
 package com.itajay.superassistant.progress;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -171,6 +183,279 @@ class ProgressChannelRegistryTest {
     void everyStageHasALabel() {
         for (ProgressStage stage : ProgressStage.values()) {
             assertThat(stage.label()).as("%s needs a display label", stage).isNotBlank();
+        }
+    }
+
+    @Test
+    void aCustomLabelOverridesOnlyTheLabelNotTheStage() {
+        // The single-paper deep-read finishes as "精读完成", but the stage must stay
+        // DONE/FAILED — the frontend detects failure from the stage enum name.
+        ProgressEvent event = ProgressEvent.of(ProgressStage.FAILED, 2, "未通过审查", "精读失败");
+
+        assertThat(event.label()).isEqualTo("精读失败");
+        assertThat(event.stage()).isEqualTo(ProgressStage.FAILED);
+    }
+
+    @Test
+    void anExplicitNullLabelFallsBackToTheStageLabel() {
+        assertThat(ProgressEvent.of(ProgressStage.DONE, 1, "", null).label())
+                .isEqualTo(ProgressStage.DONE.label());
+    }
+
+    @ParameterizedTest
+    @EnumSource(Lifecycle.class)
+    void lifecycleRemovalKeepsTheOtherSubscriberAndCleansUpTheLast(Lifecycle lifecycle) {
+        RecordingEmitter first = new RecordingEmitter();
+        RecordingEmitter survivor = new RecordingEmitter();
+        registry.attach("thread-1", first);
+        registry.attach("thread-1", survivor);
+
+        first.fire(lifecycle);
+        assertThat(channels().get("thread-1")).containsExactly(survivor);
+
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        registry.heartbeat();
+
+        assertThat(first.sendAttempts.get()).isZero();
+        assertThat(survivor.progressSends.get()).isEqualTo(1);
+        assertThat(survivor.heartbeatSends.get()).isEqualTo(1);
+
+        survivor.fire(lifecycle);
+        assertThat(channels()).doesNotContainKey("thread-1");
+    }
+
+    @ParameterizedTest
+    @EnumSource(SendFailure.class)
+    void failedPublishRemovesOnlyTheFaultySubscriber(SendFailure failure) {
+        RecordingEmitter dead = new RecordingEmitter();
+        RecordingEmitter survivor = new RecordingEmitter();
+        dead.failure = failure;
+        registry.attach("thread-1", dead);
+        registry.attach("thread-1", survivor);
+
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        registry.heartbeat();
+
+        assertThat(channels().get("thread-1")).containsExactly(survivor);
+        assertThat(dead.sendAttempts.get()).isEqualTo(1);
+        assertThat(survivor.progressSends.get()).isEqualTo(2);
+        assertThat(survivor.heartbeatSends.get()).isEqualTo(1);
+
+        survivor.failure = failure;
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        assertThat(channels()).doesNotContainKey("thread-1");
+    }
+
+    @ParameterizedTest
+    @EnumSource(SendFailure.class)
+    void failedHeartbeatRemovesOnlyTheFaultySubscriberAndCleansUpTheLast(SendFailure failure) {
+        RecordingEmitter dead = new RecordingEmitter();
+        RecordingEmitter survivor = new RecordingEmitter();
+        dead.failure = failure;
+        registry.attach("thread-1", dead);
+        registry.attach("thread-1", survivor);
+
+        registry.heartbeat();
+        registry.heartbeat();
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+
+        assertThat(channels().get("thread-1")).containsExactly(survivor);
+        assertThat(dead.sendAttempts.get()).isEqualTo(1);
+        assertThat(survivor.heartbeatSends.get()).isEqualTo(2);
+        assertThat(survivor.progressSends.get()).isEqualTo(1);
+
+        survivor.failure = failure;
+        registry.heartbeat();
+        assertThat(channels()).doesNotContainKey("thread-1");
+    }
+
+    @ParameterizedTest
+    @EnumSource(Lifecycle.class)
+    void repeatedLateCallbacksCannotRemoveANewSubscriber(Lifecycle lifecycle) {
+        RecordingEmitter old = new RecordingEmitter();
+        registry.attach("thread-1", old);
+        old.fire(lifecycle);
+        assertThat(channels()).doesNotContainKey("thread-1");
+
+        RecordingEmitter current = new RecordingEmitter();
+        registry.attach("thread-1", current);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            for (Lifecycle lateCallback : Lifecycle.values()) {
+                old.fire(lateCallback);
+            }
+        }
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        registry.heartbeat();
+
+        assertThat(channels().get("thread-1")).containsExactly(current);
+        assertThat(current.progressSends.get()).isEqualTo(1);
+        assertThat(current.heartbeatSends.get()).isEqualTo(1);
+    }
+
+    @ParameterizedTest
+    @EnumSource(Lifecycle.class)
+    void lifecycleCallbackDuringRegistrationDoesNotLeaveADeadSubscriber(Lifecycle lifecycle) {
+        RecordingEmitter emitter = new RecordingEmitter();
+        emitter.finishDuringRegistration = lifecycle;
+
+        registry.attach("thread-1", emitter);
+        registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+        registry.heartbeat();
+
+        assertThat(channels()).doesNotContainKey("thread-1");
+        assertThat(emitter.sendAttempts.get()).isZero();
+    }
+
+    @Test
+    void concurrentAttachAndLastSubscriberRemovalNeverLoseTheNewSubscriber() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            for (int attempt = 0; attempt < 100; attempt++) {
+                RecordingEmitter old = new RecordingEmitter();
+                RecordingEmitter current = new RecordingEmitter();
+                registry.attach("thread-1", old);
+                CyclicBarrier start = new CyclicBarrier(2);
+                Future<?> attach = executor.submit(() -> {
+                    await(start);
+                    registry.attach("thread-1", current);
+                });
+                Future<?> remove = executor.submit(() -> {
+                    await(start);
+                    old.fire(Lifecycle.COMPLETION);
+                });
+                attach.get(5, TimeUnit.SECONDS);
+                remove.get(5, TimeUnit.SECONDS);
+
+                assertThat(channels().get("thread-1")).containsExactly(current);
+                registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+                registry.heartbeat();
+                assertThat(current.progressSends.get()).isEqualTo(1);
+                assertThat(current.heartbeatSends.get()).isEqualTo(1);
+
+                current.fire(Lifecycle.COMPLETION);
+                assertThat(channels()).doesNotContainKey("thread-1");
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void completionWhileAttachRegistersCallbacksDoesNotResurrectTheSubscriber() throws Exception {
+        CountDownLatch callbacksRegistered = new CountDownLatch(1);
+        CountDownLatch finishRegistration = new CountDownLatch(1);
+        RecordingEmitter emitter = new RecordingEmitter() {
+            @Override
+            public void onError(Consumer<Throwable> callback) {
+                super.onError(callback);
+                callbacksRegistered.countDown();
+                await(finishRegistration);
+            }
+        };
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> attach = executor.submit(() -> registry.attach("thread-1", emitter));
+            await(callbacksRegistered);
+            emitter.fire(Lifecycle.COMPLETION);
+            finishRegistration.countDown();
+            attach.get(5, TimeUnit.SECONDS);
+
+            assertThat(channels()).doesNotContainKey("thread-1");
+            registry.publish("thread-1", ProgressEvent.of(ProgressStage.WRITING, 1));
+            registry.heartbeat();
+            assertThat(emitter.sendAttempts.get()).isZero();
+        } finally {
+            finishRegistration.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, CopyOnWriteArrayList<SseEmitter>> channels() {
+        return (Map<String, CopyOnWriteArrayList<SseEmitter>>) ReflectionTestUtils.getField(registry, "channels");
+    }
+
+    private static void await(CyclicBarrier barrier) {
+        try {
+            barrier.await(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new AssertionError("Concurrent attach/removal did not reach the barrier", e);
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("Lifecycle callback registration did not reach the latch");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while waiting for callback registration", e);
+        }
+    }
+
+    private enum Lifecycle { COMPLETION, TIMEOUT, ERROR }
+
+    private enum SendFailure { IO, ILLEGAL_STATE }
+
+    /** Records sends and invokes the lifecycle callbacks without a servlet container. */
+    private static class RecordingEmitter extends SseEmitter {
+        private final List<Runnable> completionCallbacks = new CopyOnWriteArrayList<>();
+        private final List<Runnable> timeoutCallbacks = new CopyOnWriteArrayList<>();
+        private final List<Consumer<Throwable>> errorCallbacks = new CopyOnWriteArrayList<>();
+        private final AtomicInteger sendAttempts = new AtomicInteger();
+        private final AtomicInteger progressSends = new AtomicInteger();
+        private final AtomicInteger heartbeatSends = new AtomicInteger();
+        private SendFailure failure;
+        private Lifecycle finishDuringRegistration;
+
+        @Override
+        public void onCompletion(Runnable callback) {
+            completionCallbacks.add(callback);
+            if (finishDuringRegistration == Lifecycle.COMPLETION) {
+                callback.run();
+            }
+        }
+
+        @Override
+        public void onTimeout(Runnable callback) {
+            timeoutCallbacks.add(callback);
+            if (finishDuringRegistration == Lifecycle.TIMEOUT) {
+                callback.run();
+            }
+        }
+
+        @Override
+        public void onError(Consumer<Throwable> callback) {
+            errorCallbacks.add(callback);
+            if (finishDuringRegistration == Lifecycle.ERROR) {
+                callback.accept(new IOException("socket closed during registration"));
+            }
+        }
+
+        @Override
+        public void send(SseEventBuilder builder) throws IOException {
+            sendAttempts.incrementAndGet();
+            if (failure == SendFailure.IO) {
+                throw new IOException("socket closed");
+            }
+            if (failure == SendFailure.ILLEGAL_STATE) {
+                throw new IllegalStateException("emitter completed");
+            }
+            if (builder.build().stream().anyMatch(data -> data.getData() instanceof ProgressEvent)) {
+                progressSends.incrementAndGet();
+            } else {
+                heartbeatSends.incrementAndGet();
+            }
+        }
+
+        private void fire(Lifecycle lifecycle) {
+            switch (lifecycle) {
+                case COMPLETION -> completionCallbacks.forEach(Runnable::run);
+                case TIMEOUT -> timeoutCallbacks.forEach(Runnable::run);
+                case ERROR -> errorCallbacks.forEach(callback -> callback.accept(new IOException("socket closed")));
+            }
         }
     }
 

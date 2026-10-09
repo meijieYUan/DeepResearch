@@ -60,7 +60,7 @@ MUSE 指出，当 layout control、text control 与 subject synthesis 同时注�
 
 > 图注原文：Fig. {n} Overview of MUSE.
 
-这一篇的核心机制不容易从框架图看出来，所以再补一张关键机制图——**每篇至多两张**，这是上限：
+这一篇的核心机制不容易从框架图看出来，所以再补一张关键机制图。本例放两张只是演示；正式产出**每篇 0-4 张，上限 4 张**，没有合格图可不放，不为凑数补图。
 
 ![MUSE 中 DCA 的拼接式 attention](papper3_component.png)
 

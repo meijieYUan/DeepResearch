@@ -9,6 +9,9 @@ import com.itajay.superassistant.agent.ResearchAgent;
 import com.itajay.superassistant.agent.ReviewerAgent;
 import com.itajay.superassistant.agent.WriterAgent;
 import com.itajay.superassistant.progress.ProgressChannelRegistry;
+import com.itajay.superassistant.progress.ProgressContext;
+import com.itajay.superassistant.progress.ProgressEvent.Operation;
+import com.itajay.superassistant.progress.ProgressEvent.Status;
 import com.itajay.superassistant.progress.ProgressEvent;
 import com.itajay.superassistant.progress.ProgressStage;
 import com.itajay.superassistant.tool.AnalysisStore;
@@ -20,6 +23,7 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -28,6 +32,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 /**
@@ -55,8 +61,8 @@ public class ResearchWriteReviewWorkflow {
 
     private static final Logger log = LoggerFactory.getLogger(ResearchWriteReviewWorkflow.class);
 
-    /** Total write+review rounds. Matches the limit documented in review-guide.md. */
-    private static final int MAX_ROUNDS = 2;
+    /** Two content-review rounds allow at most one content revision. */
+    private static final int MAX_REVIEW_ROUNDS = 2;
 
     /** Guard against a pathological research output being fed straight back in. */
     private static final int MAX_MATERIAL_CHARS = 200_000;
@@ -70,20 +76,30 @@ public class ResearchWriteReviewWorkflow {
      */
     private static final int MAX_TOPIC_CHARS = 60;
 
-    private final ResearchAgent researchAgent;
-    private final WriterAgent writerAgent;
-    private final ReviewerAgent reviewerAgent;
+    private final WorkflowAgentRun researchRun;
+    private final WorkflowAgentRun writerRun;
+    private final WorkflowAgentRun reviewerRun;
     private final PaperAnalysisTool paperAnalysisTool;
     private final ProgressChannelRegistry progress;
 
+    @Autowired
     public ResearchWriteReviewWorkflow(ResearchAgent researchAgent,
                                        WriterAgent writerAgent,
                                        ReviewerAgent reviewerAgent,
                                        PaperAnalysisTool paperAnalysisTool,
                                        ProgressChannelRegistry progress) {
-        this.researchAgent = researchAgent;
-        this.writerAgent = writerAgent;
-        this.reviewerAgent = reviewerAgent;
+        this((input, config) -> invoke(researchAgent.reactAgent, input, config, "research-agent"),
+                (input, config) -> invoke(writerAgent.reactAgent, input, config, "writer-agent"),
+                (input, config) -> invoke(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
+                paperAnalysisTool, progress);
+    }
+
+    ResearchWriteReviewWorkflow(WorkflowAgentRun researchRun, WorkflowAgentRun writerRun,
+                               WorkflowAgentRun reviewerRun, PaperAnalysisTool paperAnalysisTool,
+                               ProgressChannelRegistry progress) {
+        this.researchRun = researchRun;
+        this.writerRun = writerRun;
+        this.reviewerRun = reviewerRun;
         this.paperAnalysisTool = paperAnalysisTool;
         this.progress = progress;
     }
@@ -124,6 +140,10 @@ public class ResearchWriteReviewWorkflow {
         // blockers, blaming the writer for a mismatch the workflow had created.
         String brief = topic;
         String topicId = topicIdentifier(brief);
+        ProgressContext run = new ProgressContext(threadId, UUID.randomUUID().toString(),
+                ProgressEvent.Workflow.RESEARCH_WRITE_REVIEW, ProgressStage.RESEARCHING, 0, topicId, null);
+        ProgressContext activity = run;
+        publish(run, Operation.WORKFLOW, Status.RUNNING, "开始调研工作流");
         log.info("ResearchWriteReview workflow started [topic={}, brief={}, thread={}]",
                 topicId, truncate(brief), threadId);
 
@@ -137,18 +157,20 @@ public class ResearchWriteReviewWorkflow {
         // renames on a revision round — one run wrote "...-survey.md" first and
         // "Training-free-....md" second — so the reviewer kept re-reading the unrevised
         // draft and the loop could never converge. The workflow owns the layout.
-        String documentPath = documentPathFor(topicId);
+        String documentPath = null;
 
         try {
-            publish(threadId, ProgressStage.RESEARCHING, 1, "开始检索与筛选论文");
-            materials = invoke(researchAgent.reactAgent, researchInput(topicId, brief),
-                    configFor(threadId), "research-agent");
+            documentPath = documentPathFor(topicId);
+            activity = run.at(ProgressStage.RESEARCHING, 1);
+            publish(activity, Operation.STAGE, Status.RUNNING, "开始检索与筛选论文");
+            materials = researchRun.invoke(researchInput(topicId, brief), activity.childConfig(brief));
+            publish(activity, Operation.STAGE, Status.SUCCEEDED, "检索与筛选完成");
 
-            while (rounds < MAX_ROUNDS) {
+            while (rounds < MAX_REVIEW_ROUNDS) {
                 rounds++;
 
-                publish(threadId, ProgressStage.WRITING, rounds,
-                        rounds == 1 ? "开始精读论文并撰写文档" : "按审查意见修订文档");
+                activity = run.at(ProgressStage.ANALYZING, rounds);
+                publish(activity, Operation.STAGE, Status.RUNNING, "开始精读论文");
                 // The workflow, not the writer, drives the batch analysis and waits on
                 // it here (Java-side; the model never polls). The final index then
                 // travels in the writer's input — the "analysis complete" callback the
@@ -156,43 +178,60 @@ public class ResearchWriteReviewWorkflow {
                 // everything is already analysed this is just an enumeration plus a
                 // render, and it lets the index reflect any reanalyzePaper the writer
                 // did in the previous round.
-                String analysisIndex = paperAnalysisTool.analyzeTopicSync(topicId, threadId, rounds);
-                documentOutput = invoke(writerAgent.reactAgent,
-                        writerInput(topicId, brief, materials, analysisIndex, review),
-                        configFor(threadId), "writer-agent");
+                String analysisIndex = paperAnalysisTool.analyzeTopicSync(topicId, threadId, rounds, brief, activity);
+                publish(activity, Operation.STAGE, Status.SUCCEEDED, "精读批次处理结束，逐篇结果见清单");
+                activity = run.at(rounds == 1 ? ProgressStage.WRITING : ProgressStage.REVISING, rounds);
+                publish(activity, Operation.STAGE, Status.RUNNING,
+                        rounds == 1 ? "开始撰写文档" : "按审查意见修订文档");
+                documentOutput = writerRun.invoke(
+                        writerInput(topicId, brief, materials, analysisIndex, review, reviewed),
+                        activity.childConfig(brief));
+                publish(activity, Operation.STAGE, Status.SUCCEEDED,
+                        rounds == 1 ? "文档写作阶段结束" : "文档修订阶段结束");
 
-                publish(threadId, ProgressStage.REVIEWING, rounds, "开始质量审查");
+                activity = run.at(ProgressStage.REVIEWING, rounds);
+                ProgressContext reviewContext = activity;
+                AtomicInteger reviewAttempt = new AtomicInteger(1);
+                publish(activity, Operation.STAGE, Status.RUNNING, "开始质量审查");
+                publishReview(reviewContext, Status.RUNNING, "开始质量审查", 1);
                 reviewed = readBack(documentPath, documentOutput);
                 documentPath = reviewed.path();
-                review = ReviewResult.parse(invoke(reviewerAgent.reactAgent,
-                        reviewInput(topicId, brief, materials, reviewed.content(), documentPath), "reviewer-agent"));
+                review = null; // An exception must not retain the previous artifact's verdict.
+                review = ReviewRunner.run(reviewerRun,
+                        reviewInput(topicId, brief, materials, reviewed.content(), documentPath),
+                        reviewContext.childConfig(brief), () -> publishReview(reviewContext, Status.RETRYING,
+                                "审查输出格式不可用，补审同一份文档（不返工内容）", reviewAttempt.incrementAndGet()));
+                Status verdict = review.executionFailed() ? Status.FAILED
+                        : review.approved() ? Status.PASS : Status.REVISE;
+                publishReview(reviewContext, verdict, "审查结果：" + verdict, reviewAttempt.get());
+                publish(reviewContext, Operation.STAGE, verdict, "质量审查结束：" + verdict);
 
-                if (review.approved()) {
+                if (review.executionFailed() || review.approved()) {
                     break;
                 }
-                if (rounds >= MAX_ROUNDS) {
+                if (rounds >= MAX_REVIEW_ROUNDS) {
                     break;
                 }
 
                 // Route the next round by cause. Only a material-level finding is worth
                 // re-running the (expensive) research pass; a prose-level one is not.
                 if (review.needsResearcher()) {
-                    publish(threadId, ProgressStage.RESEARCHING, rounds + 1,
-                            "审查要求补充材料，重新检索");
-                    materials = invoke(researchAgent.reactAgent,
-                            researchRevisionInput(topicId, materials, review),
-                            configFor(threadId), "research-agent");
-                } else {
-                    publish(threadId, ProgressStage.REVISING, rounds,
-                            review.needsAnalyst() ? "审查指出精读结果有误，重做后修订" : "审查未通过，仅修订文档");
+                    activity = run.at(ProgressStage.RESEARCHING, rounds + 1);
+                    publish(activity, Operation.STAGE, Status.RUNNING, "审查要求补充材料，重新检索");
+                    materials = researchRun.invoke(
+                            researchRevisionInput(topicId, brief, materials, review), activity.childConfig(brief));
+                    publish(activity, Operation.STAGE, Status.SUCCEEDED, "补充材料检索结束");
                 }
             }
 
             String report = report(topicId, reviewed, review, rounds);
             ProgressStage finalStage = review != null && review.approved()
                     ? ProgressStage.DONE : ProgressStage.FAILED;
-            publish(threadId, finalStage, rounds,
-                    review != null && review.approved() ? "文档通过审查" : "文档未通过审查，已输出遗留问题");
+            publish(run.at(finalStage, rounds), Operation.WORKFLOW,
+                    finalStage == ProgressStage.DONE ? Status.SUCCEEDED : Status.FAILED,
+                    review != null && review.approved() ? "文档通过审查"
+                            : review != null && review.executionFailed() ? "审查未完成，文档质量未经验证"
+                            : "文档未通过审查，已输出遗留问题");
 
             log.info("ResearchWriteReview workflow finished [topic={}, rounds={}, approved={}]",
                     topicId, rounds, review != null && review.approved());
@@ -205,7 +244,11 @@ public class ResearchWriteReviewWorkflow {
                 Thread.currentThread().interrupt();
             }
             log.error("ResearchWriteReview workflow failed [topic={}]", topicId, e);
-            publish(threadId, ProgressStage.FAILED, rounds, "工作流异常终止");
+            if (activity.stage() == ProgressStage.REVIEWING) {
+                publishReview(activity, Status.FAILED, "审查执行异常终止", null);
+            }
+            publish(activity, Operation.STAGE, Status.FAILED, "阶段异常终止");
+            publish(run.at(ProgressStage.FAILED, rounds), Operation.WORKFLOW, Status.FAILED, "工作流异常终止");
             return "Research-write-review workflow failed: " + e.getMessage()
                     + (documentOutput == null ? "" : "\n(An earlier draft may still have been written.)")
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)";
@@ -238,9 +281,12 @@ public class ResearchWriteReviewWorkflow {
     }
 
     /** Research revision pass: the previous material plus the findings that need more of it. */
-    private String researchRevisionInput(String topic, String previousMaterials, ReviewResult review) {
+    private String researchRevisionInput(String topic, String brief, String previousMaterials, ReviewResult review) {
         return """
-                课题：%s
+                课题方向：%s
+
+                原始调研要求（补充检索仍须遵守年份、数量、语言和范围）：
+                %s
 
                 这是对同一课题的**补充检索**。上一轮的材料如下（仅供参考，不要原样重抄）：
 
@@ -254,12 +300,12 @@ public class ResearchWriteReviewWorkflow {
                 %s
 
                 沿用同一课题方向，以便复用已下载的论文；已下载的论文无需重复下载。
-                """.formatted(topic, truncate(previousMaterials), review.renderFor(ReviewResult.Target.RESEARCHER));
+                """.formatted(topic, brief.strip(), truncate(previousMaterials), review.renderFor(ReviewResult.Target.RESEARCHER));
     }
 
     /** Writer input for round 1 (materials only) and later rounds (materials plus findings). */
     private String writerInput(String topicId, String brief, String materials,
-                               String analysisIndex, ReviewResult previousReview) {
+                               String analysisIndex, ReviewResult previousReview, ReadBack previousDocument) {
         StringBuilder sb = new StringBuilder();
         sb.append("课题方向：").append(topicId).append("\n\n");
         sb.append("本次调研的要求：\n").append(brief.strip()).append("\n\n");
@@ -274,6 +320,7 @@ public class ResearchWriteReviewWorkflow {
                 : analysisIndex.strip()).append("\n--- 索引结束 ---\n\n");
         sb.append("""
                 你**不需要**调用 analyzePapers(topic) 批量分析——结果已经在上面。
+                失败篇目单篇重试 analyzePapers 或审查重做 reanalyzePaper 时，requirements 原样传上面的本次调研要求。
                 请按需读取（readPaperAnalysis）、按 template/template.md 撰写对比型文档，
                 最后调用 writeResearchDocument 保存。课题方向必须与材料中使用的完全一致。
 
@@ -290,12 +337,24 @@ public class ResearchWriteReviewWorkflow {
                 """.formatted(documentName(topicId)));
 
         if (previousReview != null) {
+            boolean completeDraft = previousDocument != null && previousDocument.onDisk()
+                    && previousDocument.content() != null && !previousDocument.content().isBlank()
+                    && previousDocument.content().length() <= MAX_MATERIAL_CHARS;
+            if (previousDocument != null) {
+                sb.append("\n上一版送审路径：").append(previousDocument.path()).append('\n');
+                sb.append(completeDraft ? "以下是上一版从磁盘读回的完整正文，作为本轮修订基线。\n"
+                        : "⚠️ 上一版未取得完整磁盘正文（或超出长度限制），下文仅供参考；"
+                        + "不能声称已精确保留未涉及部分。请根据分析文件恢复完整文档并如实说明限制。\n");
+                sb.append("--- 上一版送审正文 ---\n").append(truncate(previousDocument.content()))
+                        .append("\n--- 上一版正文结束 ---\n");
+            }
             String analystIssues = previousReview.renderFor(ReviewResult.Target.ANALYST);
             if (!analystIssues.isEmpty()) {
                 sb.append("""
 
                         这是修订轮次：上一轮未通过审查，且**部分问题出在精读结果本身**。
-                        请先对下列论文调用 reanalyzePaper(topic, 论文短名, reason) 重做精读，
+                        请先对下列论文调用 reanalyzePaper(topic, 论文短名, reason, requirements) 重做精读，
+                        requirements 原样使用上面的原始调研要求，不要用审查意见替代。
                         然后读回重做后的结果，并检查文档中依赖这些分析的对比结论是否需要同步修订：
 
                         --- 需要重做精读的论文 ---
@@ -303,14 +362,13 @@ public class ResearchWriteReviewWorkflow {
             }
 
             String writerIssues = previousReview.renderFor(ReviewResult.Target.WRITER);
-            sb.append("""
-
-                    这是修订轮次：上一轮文档未通过审查。请**只针对以下问题**修订，
-                    其余部分保持不变；不要重写整篇文档，也不要引入材料中没有的内容。
-                    """);
+            sb.append("\n这是内容修订轮次：上一版文档未通过审查。请针对下面的问题及其依赖结论修订。\n");
+            if (completeDraft) {
+                sb.append("以给出的上一版完整正文为基线，未受影响部分保持不变，不要无关重写。\n");
+            }
+            sb.append("不得引入材料中没有的内容；补充材料或更新精读后，同步修正受影响的清单、定位及对比结论。\n");
             if (writerIssues.isEmpty()) {
-                sb.append("（本轮没有属于文档写法的问题，问题都在上面的精读结果里——")
-                        .append("重做精读后对照更新受影响的结论即可。）\n");
+                sb.append("（本轮没有文档写法问题，请依据更新后的材料或精读结果，只调整受影响内容。）\n");
             } else {
                 sb.append("\n--- 审查意见（仅需你处理的部分）---\n")
                         .append(writerIssues).append("\n--- 审查意见结束 ---\n");
@@ -360,78 +418,9 @@ public class ResearchWriteReviewWorkflow {
                 某篇的 analysis 本身写错（公式与原文不符、来源等级标错、四维缺失）填 ANALYST；
                 文档自身的写法或结论有问题填 WRITER。
                 """.formatted(topicId, brief.strip(), documentPath == null ? "(未知)" : documentPath,
-                truncate(materials), analysisInventory(topicId), figureInventory(topicId),
+                truncate(materials), AnalysisInventory.analysisInventory(topicId),
+                AnalysisInventory.figureInventory(topicId),
                 truncate(document));
-    }
-
-    /**
-     * The reviewer's checklist of what analyses exist, read from disk.
-     *
-     * <p>Deliberately not a count the workflow remembered: an inventory built from
-     * the files cannot disagree with what the reviewer will actually open.</p>
-     *
-     * <p>Each row carries the number of extracted figures, so a paper with none is
-     * visibly a paper that fell back to "图见原文 Fig. N (p.X)" rather than one the
-     * reviewer has to open the analysis file to notice.</p>
-     */
-    private String analysisInventory(String topic) {
-        List<Path> files = AnalysisStore.markdownFiles(topic);
-        if (files.isEmpty()) {
-            return "（没有任何精读结果文件——精读阶段未产出，这本身就是严重问题，请据此判定）";
-        }
-        // One figures listing shared by every row: figuresOf used to re-list the
-        // directory per paper — O(papers × figures) disk IO on every review round.
-        List<Path> allFigures = AnalysisStore.figureFiles(topic);
-        StringBuilder sb = new StringBuilder("共 ").append(files.size()).append(" 篇：\n");
-        for (Path file : files) {
-            AnalysisStore.AnalysisMeta meta = AnalysisStore.readMeta(file);
-            sb.append("- ").append(meta.shortName())
-                    .append(" — ").append(meta.sourceLevel())
-                    .append(" — ").append(WorkspacePaths.relative(file))
-                    .append(" — 图片 ").append(figuresOf(allFigures, meta.shortName())).append(" 张")
-                    .append('\n');
-        }
-        return sb.toString().stripTrailing();
-    }
-
-    /**
-     * The list of figure paths that actually exist, so the reviewer's broken-link
-     * check is a comparison against disk rather than a guess.
-     *
-     * <p>Both the analysis-relative and document-relative forms are listed: the
-     * reviewer sees the document, which cites the {@code ../analysis/figures/…} form,
-     * and the analysis file, which cites {@code figures/…}. Listing both means a
-     * mismatch is caught regardless of which file it appears in.</p>
-     */
-    private String figureInventory(String topic) {
-        List<Path> files = AnalysisStore.figureFiles(topic);
-        if (files.isEmpty()) {
-            return "（一篇都没有截到图。若文档里出现了 ![..](..)，即为凭空引用；"
-                    + "若通篇写「图见原文 Fig. N (p.X)」则是合规降级。）";
-        }
-        StringBuilder sb = new StringBuilder("共 ").append(files.size()).append(" 张：\n");
-        for (Path file : files) {
-            String name = file.getFileName().toString();
-            sb.append("- ").append(name)
-                    .append("  →  文档写 ../analysis/figures/").append(name)
-                    .append("；analysis 写 figures/").append(name).append('\n');
-        }
-        return sb.toString().stripTrailing();
-    }
-
-    /**
-     * How many extracted figures start with the given paper short name.
-     *
-     * <p>The prefix comes from {@link AnalysisStore#nameFor} rather than from the caller's
-     * string, so it is the same derivation the figure tool used to name the files. Building it
-     * here by hand is how a counter silently reports zero: the tool writes
-     * {@code {短名}_Fig2.png}, and a prefix of {@code {短名}_p} matches no such file.</p>
-     */
-    private long figuresOf(List<Path> figureFiles, String paperShortName) {
-        String prefix = AnalysisStore.nameFor(paperShortName) + "_";
-        return figureFiles.stream()
-                .filter(p -> p.getFileName().toString().startsWith(prefix))
-                .count();
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -443,8 +432,11 @@ public class ResearchWriteReviewWorkflow {
         StringBuilder sb = new StringBuilder();
         sb.append("Research-write-review workflow result\n");
         sb.append("课题: ").append(topic).append('\n');
-        sb.append("审查结论: ").append(approved ? "通过 (PASS)" : "未通过 (REVISE)").append('\n');
-        sb.append("修订轮次: ").append(rounds).append('/').append(MAX_ROUNDS).append('\n');
+        sb.append("审查结论: ").append(review != null && review.executionFailed()
+                ? "审查未完成（输出格式不可用）" : approved ? "通过 (PASS)" : "未通过 (REVISE)").append('\n');
+        sb.append("内容审查轮次: ").append(rounds).append('/').append(MAX_REVIEW_ROUNDS).append('\n');
+        sb.append("内容修订次数: ").append(Math.max(0, rounds - 1)).append('/')
+                .append(MAX_REVIEW_ROUNDS - 1).append('\n');
         sb.append("文档路径: ").append(reviewed == null ? "(未产出文档)" : reviewed.path()).append('\n');
         sb.append(analysisCoverage(topic)).append('\n');
         if (reviewed != null && !reviewed.onDisk()) {
@@ -457,8 +449,10 @@ public class ResearchWriteReviewWorkflow {
 
         if (approved) {
             sb.append("\n文档已通过质量审查，可以直接交付用户。\n");
+        } else if (review != null && review.executionFailed()) {
+            sb.append("\n⚠️ 审查输出在补审后仍不可用，文档质量未经验证；已保留产物，不据此触发内容返工。\n");
         } else if (review != null) {
-            sb.append("\n⚠️ 文档在 ").append(rounds).append(" 轮修订后仍未通过审查。")
+            sb.append("\n⚠️ 文档在 ").append(rounds).append(" 轮内容审查后仍未通过。")
                     .append("请向用户如实说明以下遗留问题，不得声称文档已核验通过。\n");
             sb.append("\n遗留问题（").append(review.issuesOrEmpty().size()).append(" 条）:\n");
             for (ReviewResult.ReviewIssue issue : review.issuesOrEmpty()) {
@@ -681,19 +675,14 @@ public class ResearchWriteReviewWorkflow {
      * <p>Sub-agents are invoked directly rather than through {@code AgentTool} so the
      * workflow controls the hand-off. Each is a fresh run with no shared state,
      * which is why every input is assembled explicitly above.</p>
-     */
-    private String invoke(ReactAgent agent, String input, String name) {
-        return invoke(agent, input, null, name);
-    }
-
-    /**
-     * Same, with a run config. The config carries the conversation threadId, which
+     *
+     * <p>The config carries the conversation threadId, which
      * is how the sub-agent's own tool calls (e.g. {@code downloadPaper}) get a
      * populated {@code ToolContext} — without it, per-paper progress events would
      * have no channel to reach. The thread runs alone, so reusing the conversation's
-     * threadId cannot collide with another run.
+     * threadId cannot collide with another run.</p>
      */
-    private String invoke(ReactAgent agent, String input, RunnableConfig config, String name) {
+    private static String invoke(ReactAgent agent, String input, RunnableConfig config, String name) {
         Optional<OverAllState> result;
         try {
             result = config == null ? agent.invoke(input) : agent.invoke(input, config);
@@ -706,11 +695,6 @@ public class ResearchWriteReviewWorkflow {
             log.warn("{} returned no output", name);
         }
         return output;
-    }
-
-    /** The conversation's thread as a run config, or null when the thread is unknown. */
-    private static RunnableConfig configFor(String threadId) {
-        return threadId == null ? null : RunnableConfig.builder().threadId(threadId).build();
     }
 
     /**
@@ -755,6 +739,15 @@ public class ResearchWriteReviewWorkflow {
         return ToolContextHelper.getConfig(toolContext)
                 .flatMap(com.alibaba.cloud.ai.graph.RunnableConfig::threadId)
                 .orElse(null);
+    }
+
+    private void publish(ProgressContext context, Operation operation, Status status, String detail) {
+        progress.publish(context.threadId(), context.event(operation, status, detail));
+    }
+
+    private void publishReview(ProgressContext context, Status status, String detail, Integer attempt) {
+        progress.publish(context.threadId(), context.event(Operation.REVIEW, status, detail,
+                null, null, attempt, 2));
     }
 
     private void publish(String threadId, ProgressStage stage, int round, String detail) {

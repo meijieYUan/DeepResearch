@@ -13,6 +13,7 @@ import com.itajay.superassistant.compact.CompactHook;
 import com.itajay.superassistant.interceptor.LoopGuardToolInterceptor;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.CreateAgentTool;
+import com.itajay.superassistant.workflow.PaperDeepReadWorkflow;
 import com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow;
 import com.itajay.superassistant.interceptor.PlanModeToolInterceptor;
 import com.itajay.superassistant.prompt.PromptSubmitHook;
@@ -60,6 +61,15 @@ public class AgentConfig {
               **not** pass review, tell the user the remaining issues as-is — never present an unverified document
               as finished work. The per-paper analyses are kept on disk; mention their location, since the user can
               open them directly.
+            - **Single-paper deep read**: when the user names ONE specific paper (a URL/arXiv/DOI, a local PDF
+              path, or a paper already under `investigation/`) and wants a close reading rather than a survey,
+              call `deepReadPaper` once and wait. It reuses or downloads the PDF, writes one four-dimension
+              analysis file under `investigation/{topic}/analysis/`, and reviews it against the PDF (at most 2 content reviews
+              and 1 content revision; at most one immediate format-only re-review per artifact, outside those limits).
+              No research document is produced — the analysis file is the deliverable. Report the
+              analysis path, the source level (FULL_TEXT vs ABSTRACT_ONLY — always name the credibility limit of
+              an abstract-only read), the figure count, and any remaining issues honestly. Pass `forceRedo=true`
+              only when the user explicitly wants an existing analysis redone.
             - **Knowledge questions**: delegate professional/domain questions to the RAG agent.
 
             ## Safety Rules (CRITICAL — violations are unacceptable)
@@ -104,6 +114,7 @@ public class AgentConfig {
                                  RagAgent ragAgent,
                                  CreateAgentTool createAgentTool,
                                  ResearchWriteReviewWorkflow researchWriteReviewWorkflow,
+                                 PaperDeepReadWorkflow paperDeepReadWorkflow,
                                  SkillsAgentHook skillsAgentHook,
                                  MysqlSaver mysqlSaver,
                                  ModelMessagePersistenceHook modelMessagePersistenceHook,
@@ -143,7 +154,8 @@ public class AgentConfig {
                 .model(chatModel)
                 .instruction(MAIN_AGENT_INSTRUCTION)
                 .methodTools(todoTool, webSearchTool, fileOperationTool, memoryTool,
-                             planTool, terminalTool, createAgentTool, researchWriteReviewWorkflow)
+                             planTool, terminalTool, createAgentTool, researchWriteReviewWorkflow,
+                             paperDeepReadWorkflow)
                 .tools(ragTool)
                 .hooks(compactHook, skillsAgentHook, humanInTheLoopHook,
                        modelCallLimitHook, modelMessagePersistenceHook)

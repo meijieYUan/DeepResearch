@@ -28,6 +28,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -71,6 +72,9 @@ public class PaperDownloadTool {
             "arxiv\\.org/(?:abs|pdf)/([0-9]{4}\\.[0-9]{4,5}|[a-z-]+(?:\\.[A-Z]{2})?/[0-9]{7})",
             Pattern.CASE_INSENSITIVE);
 
+    /** A bare DOI ("10.1234/foo.bar") pasted without a resolver URL. */
+    private static final Pattern BARE_DOI = Pattern.compile("^10\\.\\d{4,}/\\S+$");
+
     private final PaperDownloadProperties props;
     private final ProgressChannelRegistry progress;
     private final HttpClient httpClient;
@@ -102,6 +106,17 @@ public class PaperDownloadTool {
             @ToolParam(description = "Short name used as the filename, e.g. 'MS-Diffusion'. Letters, digits, dash, underscore, dot only.") String shortName,
             ToolContext toolContext) {
 
+        return downloadPaperInternal(topic, url, shortName, threadIdOf(toolContext));
+    }
+
+    /**
+     * The download itself, addressed by thread id rather than {@link ToolContext}.
+     *
+     * <p>Split out so workflows — which hold a thread id but are not inside a tool
+     * call — can download with the same progress events. The {@code @Tool} form above
+     * is a thin adapter over this.</p>
+     */
+    public String downloadPaperInternal(String topic, String url, String shortName, String threadId) {
         if (url == null || url.isBlank()) {
             return "Error: url is required.";
         }
@@ -126,8 +141,7 @@ public class PaperDownloadTool {
         // Already downloaded? Dedup is keyed on the resolved file name, so re-running
         // the same paper under the same short name is a no-op. A different shortName
         // for the same paper will fetch it again.
-        String normalizedUrl = url.trim();
-        String threadId = threadIdOf(toolContext);
+        String normalizedUrl = normalizeUrl(url.trim());
         if (Files.isRegularFile(target)) {
             Integer pages = PaperStore.pageCount(target);
             if (pages != null) {
@@ -630,6 +644,277 @@ public class PaperDownloadTool {
                 + "path: " + WorkspacePaths.relative(target) + "\n"
                 + "pages: " + pages + "\n"
                 + "sha256: " + (hash == null ? "n/a" : hash);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Acquire (single-paper deep-read workflow entry)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /** Where a paper source string points. */
+    public enum SourceKind {
+        /** An existing PDF file on disk (absolute, working-dir-relative, or project-relative). */
+        LOCAL_FILE,
+        /** A fetchable reference: direct PDF link, arXiv page, DOI, or publisher landing page. */
+        URL,
+        /** The short name of a paper already under some {@code investigation/{topic}/papers/}. */
+        SHORT_NAME
+    }
+
+    /**
+     * Where {@link #acquirePaper} actually got the PDF from — reported verbatim to the
+     * user, who needs to know whether a run re-downloaded something they already had.
+     */
+    public enum Origin {
+        LOCAL_COPY, REUSED_IN_TOPIC, COPIED_FROM_OTHER_TOPIC, DOWNLOAD, NOT_FOUND
+    }
+
+    /**
+     * The outcome of {@link #acquirePaper}: the resolved identity plus where the file
+     * came from. A record rather than prose because the workflow drives its report and
+     * its later stages off these fields.
+     */
+    public record AcquireResult(boolean ok, String topic, String shortName, String pdfRelativePath,
+                                Origin origin, String detail) {
+    }
+
+    /**
+     * Classifies a paper reference so naming and acquisition agree on what it is.
+     *
+     * <p>Order matters: an existing local file wins over URL-shaped text (a file named
+     * {@code 10.1234/x.pdf} is a file), and URL detection is generous — {@code doi:},
+     * a bare {@code 10.x/...} DOI, and schemeless {@code arxiv.org/...} all count,
+     * because users paste those and {@link #downloadPaperInternal} knows how to fetch
+     * them.</p>
+     */
+    public static SourceKind classifySource(String paper) {
+        if (paper == null || paper.isBlank()) {
+            return SourceKind.SHORT_NAME;
+        }
+        String value = paper.trim();
+        if (asLocalPdf(value) != null) {
+            return SourceKind.LOCAL_FILE;
+        }
+        String lower = value.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("http://") || lower.startsWith("https://")
+                || lower.startsWith("doi:") || lower.contains("arxiv.org")
+                || lower.contains("doi.org") || BARE_DOI.matcher(value).find()) {
+            return SourceKind.URL;
+        }
+        return SourceKind.SHORT_NAME;
+    }
+
+    /**
+     * The paper's short name (its future file name), derived from the reference or
+     * given explicitly.
+     *
+     * <p>The derivation is the same rule in every branch: strip the extension, take the
+     * identifying tail (file name, last path segment, arXiv id), then
+     * {@link WorkspacePaths#slugify} it — the same sanitisation the PDF file name gets,
+     * so {@code papers/X.pdf} and {@code analysis/X.md} stay paired.</p>
+     */
+    public static String inferShortName(String paper, SourceKind kind, String explicit) {
+        if (explicit != null && !explicit.isBlank()) {
+            return WorkspacePaths.slugify(stripPdfExtension(explicit.trim()), "论文短名");
+        }
+        String value = paper == null ? "" : paper.trim();
+        String raw = switch (kind) {
+            // The file name textually — the file may not exist yet at naming time,
+            // and taking the whole path would smear the directory into the short name.
+            case LOCAL_FILE -> {
+                String name = value.replace('\\', '/');
+                int slash = name.lastIndexOf('/');
+                yield slash >= 0 ? name.substring(slash + 1) : name;
+            }
+            case URL -> inferNameFromUrl(value);
+            case SHORT_NAME -> value;
+        };
+        return WorkspacePaths.slugify(stripPdfExtension(raw), "论文短名");
+    }
+
+    /**
+     * Gets a PDF under {@code papers/{shortName}.pdf}, preferring what is already on disk
+     * over any fetch — the single-paper workflow's "local wins" rule in one place.
+     *
+     * <p>Order: an already-in-topic file, then a local file the caller pointed at, then
+     * the same short name under another topic (copied, so topics stay isolated), and only
+     * then a download. When {@code topic} is omitted, an existing copy's topic is adopted
+     * so a re-run lands beside the paper it reuses; otherwise the short name becomes the
+     * topic.</p>
+     *
+     * <p>Classification is re-derived from the source text rather than passed in: the
+     * existence check at the heart of {@link SourceKind#LOCAL_FILE} is authoritative, and
+     * this method must stay correct even when called without a prior classification.</p>
+     */
+    public AcquireResult acquirePaper(String topic, String paper, String shortName, String threadId) {
+        SourceKind kind = classifySource(paper);
+        String safeName;
+        try {
+            safeName = inferShortName(paper, kind, shortName);
+        } catch (IllegalArgumentException e) {
+            return new AcquireResult(false, topic, shortName, null, Origin.NOT_FOUND, e.getMessage());
+        }
+
+        // Existing copies decide the topic when the caller did not name one: a paper
+        // already under investigation/X/ belongs to X, and re-homing it would split the
+        // PDF from analyses written against it.
+        String effectiveTopic = topic;
+        Path elsewhere = null;
+        if (effectiveTopic == null || effectiveTopic.isBlank()) {
+            elsewhere = PaperStore.findPdfAcrossTopics(safeName).orElse(null);
+            effectiveTopic = elsewhere == null ? safeName
+                    : elsewhere.getParent().getParent().getFileName().toString();
+        }
+
+        Path papersRoot;
+        Path target;
+        try {
+            papersRoot = WorkspacePaths.papersDir(effectiveTopic);
+            target = papersRoot.resolve(safeName + ".pdf").normalize();
+            if (!target.startsWith(papersRoot)) {
+                return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                        "resolved path escapes the papers directory: " + target);
+            }
+        } catch (IllegalArgumentException e) {
+            return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND, e.getMessage());
+        }
+        String relative = WorkspacePaths.relative(target);
+
+        // 1. The target topic already has a parseable copy — nothing to fetch.
+        if (Files.isRegularFile(target) && PaperStore.pageCount(target) != null) {
+            return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.REUSED_IN_TOPIC,
+                    "课题下已有论文，跳过获取");
+        }
+
+        // 2. A local file the caller pointed at: import it. Existence was checked by
+        //    classifySource, but re-check — the file may have vanished since.
+        Path local = asLocalPdf(paper == null ? "" : paper.trim());
+        if (local != null) {
+            try {
+                PaperStore.importPdf(local, effectiveTopic, safeName, props.getMaxPdfBytes());
+                publishDownload(threadId, "已导入本地论文：" + safeName);
+                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.LOCAL_COPY,
+                        "已从本地复制：" + WorkspacePaths.relative(local));
+            } catch (IllegalArgumentException | IOException e) {
+                return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                        "本地 PDF 导入失败：" + e.getMessage());
+            }
+        }
+        if (kind == SourceKind.LOCAL_FILE) {
+            // It looked like a local PDF when classified but is gone now — do not fall
+            // through to a cross-topic guess or a download under its name.
+            return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                    "本地 PDF 不存在或不可读：" + paper);
+        }
+
+        // 3. The same short name under another topic: copy it (never move — the other
+        //    topic's analyses reference it).
+        Path found = elsewhere != null ? elsewhere
+                : PaperStore.findPdfAcrossTopics(safeName).orElse(null);
+        if (found != null) {
+            try {
+                PaperStore.importPdf(found, effectiveTopic, safeName, props.getMaxPdfBytes());
+                String sourceTopic = found.getParent().getParent().getFileName().toString();
+                publishDownload(threadId, "已复用其他课题的论文：" + safeName + "（来自 " + sourceTopic + "）");
+                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.COPIED_FROM_OTHER_TOPIC,
+                        "复用自课题 " + sourceTopic + "：" + WorkspacePaths.relative(found));
+            } catch (IllegalArgumentException | IOException e) {
+                return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                        "复用其他课题的论文失败：" + e.getMessage());
+            }
+        }
+
+        // 4. Nothing on disk. Only a URL can be fetched; a bare short name with no
+        //    existing paper is a lookup miss, and inventing a download target is worse
+        //    than saying so.
+        if (kind == SourceKind.URL) {
+            String result = downloadPaperInternal(effectiveTopic, paper.trim(), safeName, threadId);
+            if (result.startsWith("OK:")) {
+                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.DOWNLOAD,
+                        "已下载");
+            }
+            return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND, result);
+        }
+
+        return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                "找不到论文 \"" + safeName + "\"：本地无此文件，各课题 papers/ 下也没有同名 PDF。"
+                        + "请给出 PDF 路径或 URL，或检查论文短名是否正确。");
+    }
+
+    /** An existing PDF at this reference (absolute, working-dir, or project-root relative), or null. */
+    static Path asLocalPdf(String paper) {
+        if (paper == null || paper.isBlank()) {
+            return null;
+        }
+        String value = paper.trim();
+        if (!WorkspacePaths.hasExtension(value, ".pdf")) {
+            return null;
+        }
+        for (String form : new String[]{value, value.replace('\\', '/')}) {
+            try {
+                Path normalized = Path.of(form).toAbsolutePath().normalize();
+                if (Files.isRegularFile(normalized)) {
+                    return normalized;
+                }
+            } catch (RuntimeException e) {
+                // Invalid path syntax on this platform ("http://..." on Windows):
+                // not a local file, try the next form and then give up.
+            }
+        }
+        try {
+            Path normalized = WorkspacePaths.root().resolve(value.replace('\\', '/')).normalize();
+            if (Files.isRegularFile(normalized)) {
+                return normalized;
+            }
+        } catch (RuntimeException e) {
+            // Same story for the project-root-relative form.
+        }
+        return null;
+    }
+
+    /** The identifying tail of a URL reference: arXiv id, DOI suffix, or the last path segment. */
+    private static String inferNameFromUrl(String value) {
+        Matcher arxiv = ARXIV_ID.matcher(value);
+        if (arxiv.find()) {
+            return arxiv.group(1);
+        }
+        String withoutQuery = value.split("[?#]", 2)[0];
+        int slash = withoutQuery.lastIndexOf('/');
+        String tail = slash >= 0 ? withoutQuery.substring(slash + 1) : withoutQuery;
+        if (!tail.isBlank()) {
+            return tail;
+        }
+        // A URL that ends in "/" — the host name is better than an empty name.
+        return withoutQuery.replaceAll("^https?://", "").split("/", 2)[0];
+    }
+
+    private static String stripPdfExtension(String name) {
+        return WorkspacePaths.hasExtension(name, ".pdf")
+                ? name.substring(0, name.length() - ".pdf".length())
+                : name;
+    }
+
+    /**
+     * Expands the reference forms users paste without a scheme into fetchable URLs:
+     * {@code doi:10.x/y} and bare {@code 10.x/y} onto the DOI resolver, and a
+     * schemeless {@code arxiv.org/...} onto https. Anything already absolute is
+     * returned unchanged.
+     */
+    static String normalizeUrl(String url) {
+        String value = url.trim();
+        String lower = value.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("http://") || lower.startsWith("https://")) {
+            return value;
+        }
+        if (lower.startsWith("doi:")) {
+            return "https://doi.org/" + value.substring(4).trim();
+        }
+        if (BARE_DOI.matcher(value).find()) {
+            return "https://doi.org/" + value;
+        }
+        if (lower.startsWith("arxiv.org/") || lower.startsWith("www.arxiv.org/")) {
+            return "https://" + value;
+        }
+        return value;
     }
 
     private String formatFailures(List<String> failures) {

@@ -9,6 +9,7 @@ package com.itajay.superassistant.progress;
 public enum ProgressStage {
 
     RESEARCHING("正在检索并下载论文"),
+    ANALYZING("正在精读论文"),
     WRITING("正在精读论文并撰写调研文档"),
     REVIEWING("正在审查文档质量"),
     REVISING("审查未通过，正在修订"),

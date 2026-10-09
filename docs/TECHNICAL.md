@@ -62,7 +62,7 @@
 
 ### 1. 多智能体协作与计划模式
 
-- **主 Agent（main-agent）**：基于 Spring AI Alibaba ReactAgent 实现统一入口和任务路由。`rag-agent` 通过 `AgentTool.create(...)` 包装为 `ToolCallback` 直接挂载；**调研四件套（research / analyst / writer / reviewer）不再逐个暴露**——它们是 `ResearchWriteReviewWorkflow` 的阶段，单独暴露会让主 Agent 跳过审查闸门或乱序执行。主 Agent 只调用 `researchWriteReview` 这一个入口。
+- **主 Agent（main-agent）**：基于 Spring AI Alibaba ReactAgent 实现统一入口和任务路由。`rag-agent` 通过 `AgentTool.create(...)` 包装为 `ToolCallback` 直接挂载；**调研四件套（research / analyst / writer / reviewer）不再逐个暴露**——它们是 `ResearchWriteReviewWorkflow` 的阶段，单独暴露会让主 Agent 跳过审查闸门或乱序执行。调研文档走 `researchWriteReview`，单篇精读走 `deepReadPaper`，主 Agent 只调用这两个工作流入口。
 - **PlanTool 计划模式（工具门控）**：复杂任务先进入只读计划阶段。`PlanModeToolInterceptor` 按三级策略动态裁剪模型可见的工具集：
   1. `planEnabled=false`（用户未开启开关）→ 隐藏 `enterPlanMode`/`exitPlanMode`，模型无法进入计划模式；
   2. `planEnabled=true`、`planActive=false` → 全部工具可用；
@@ -87,26 +87,45 @@
         ↓
   writer-agent 撰写（只做归纳与对比）→ document/{文档名}.md
         ↓
-  reviewer-agent 审查两份产出 → {approved, issues[].target}
+  reviewer-agent 审查两份产出 → {verdict, summary, issues[].target}（Java 派生 approved）
         ↓
     approved=true → 交付
     approved=false → 含 RESEARCHER 级问题 → 重跑 research（补检/补下载）→ 再跑 writer
                      含 ANALYST 级问题   → 先 reanalyzePaper 重做那几篇精读 → 再重写文档
                      全为 WRITER 级问题   → 只重跑 writer
         ↓
-    最多 2 轮，仍未通过则如实上报遗留问题
+    最多 2 轮内容审查、1 次内容修订，复审仍未通过则如实上报遗留问题
   ```
 
-  审查输出无法解析时**按未通过处理**并追加一条说明，绝不静默放行——放行一份未核验的文档等于让审查环节形同虚设。
+  模型只输出 `verdict` / `summary` / `issues`，字段与类型以框架根据 `ReviewResult.Payload` 生成的 schema 为权威，每条 issue 七字段；`approved` 由 Java 派生。每份产物的审查格式异常（无法解析、契约字段缺失、判定矛盾）至多即时补审一次，不消耗内容审查/修订额度，也不要求 writer 改正确产物；补审仍异常则停止并如实报告未完成事实核验，绝不静默放行。
 
   **两个不显眼但致命的实现细节**（都是实测踩出来的）：
 
   1. **子 Agent 的产出必须从 `messages` 里取，不能读 `state.value("output")`。** 框架的 `AgentLlmNode` 只在配置了 `outputKey` 时才写该键，否则只写 `messages`。主 Agent 配了 `outputKey("output")`，四个子 Agent 没有——照抄主 Agent 的读法会让每个阶段都拿到空字符串，整条流水线在空输入上空转，且不报错。
   2. **审查读的是磁盘上的文档，不是 writer 的回复。** writer 的正文是 `writeResearchDocument` 的**工具参数**，它的最终回复只是一句"已保存"。若把回复当作文档交给 reviewer，reviewer 面对的是空的审查对象，只能一律判 REVISE，闸门形同虚设。因此工作流自己按固定路径从磁盘读回正文；writer 若改了文件名，则回退到它自报的路径，报告里输出的始终是**实际被审查的那个路径**。
 
+  内容修订输入同时提供上一轮从磁盘读回的旧稿正文（ReadBack）与实际路径；writer 以旧稿为底稿局部修改，不凭上一轮最终回复或记忆重建。失败篇目的单篇重试与按审查意见重做，都通过工具可选 `requirements` 原样转传原始 brief；局部 metadata 只作缺参兜底，审查问题放在独立 `reason` 中。
+
   文档名由工作流固定（由课题方向推导）并写进 writer 的输入。实测 writer 会在修订轮次改名（一轮写 `...-survey.md`、下一轮写 `Training-free-....md`），导致 reviewer 反复审查同一份未修订的旧稿、循环永不收敛。
 
   进度通过 SSE 实时推送（见下节）。
+- **PaperDeepReadWorkflow**（`deepReadPaper`）：**单篇论文精读**的轻量闭环，作为第二个 Tool 暴露给主 Agent。用户已经知道要读哪篇论文时（URL/arXiv/DOI、本地 PDF 路径、或已下载论文短名），不必为一篇论文支付整场文献调研的成本。产出**只有** `investigation/{topic}/analysis/{短名}.md`（及 figures/），不写调研文档——单篇没有对比可做，四维精读本身就是交付物。
+
+  ```
+  acquirePaper 获取论文（本地路径 → 本课题已有 → 其他课题复制 → URL 下载，本地优先）
+        ↓
+  analyzeSingleSync 单篇精读 → analysis/{短名}.md     （analysis 已存在则跳过；forceRedo 强制重做）
+        ↓
+  reviewer-agent 只审 analysis（单篇精读模式，review-guide.md §0.1）→ {verdict, summary, issues[].target}（Java 派生 approved）
+        ↓
+    approved=true → 交付
+    含 ANALYST/WRITER → reanalyzeSync 按 issues 重做精读 → 再审查（WRITER 在单篇模式等同 ANALYST）
+    只剩 RESEARCHER   → 停止回环，材料问题如实上报（重读救不了拿不到的 PDF）
+        ↓
+    最多 2 轮内容审查、1 次内容修订，复审仍未通过则如实上报遗留问题
+  ```
+
+  设计取舍：`topic` 可选——已有论文沿用其所在课题（复用 analysis 与 figures），新落地默认以论文短名作课题方向；`classifySource`/`inferShortName` 把「本地文件 / URL / 短名」的判定和短名推断收敛在 `PaperDownloadTool` 的静态方法里，与获取顺序共用同一套口径。精读成功与否同样以**文件落盘**为准（`analyzeSingleSync`/`reanalyzeSync` 复用 `analyzeOne` 的 mtime 判定），报告如实给出来源等级、图数、审查结论与遗留问题。
 - **CreateAgentTool**：动态创建子 Agent 执行独立任务。
 
 > **注意**：早期的独立计划子系统（`PlanController` / `PlanService` / `PlanStepHook` / `plan_task` / `plan_step` 相关实体与 Mapper）及其前端页面（`PlanView.vue`、`/plans` 路由、`/api/plans/*` 调用）已全部移除。现在"计划"完全通过对话完成：Agent 在计划模式下与用户商量并写出计划，用户审核后由 `exitPlanMode` 退出并拆分为 Todo 任务；前端通过 Todo 接口展示任务进展。
@@ -267,13 +286,13 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | **TerminalTool** | `executeCommand`（纳入 HITL 审批）。工作目录强制限定在 workspace 内（绝对路径/`..` 逃逸被拒）；输出泵在独立线程、30s 超时可靠生效；计划模式的"只读命令"判定拒绝一切 shell 操作符（管道/重定向/命令替换）与 `find -delete`、`git config <key> <value>` 等变相写入 |
 | **CreateAgentTool** | 动态创建子 Agent 执行独立任务 |
 | **SkillResourceTool** | `readSkillResource`，只读读取 skill 的参考文件（路径限定在 skills 目录内），供子 Agent 加载参考指南 |
-| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用** |
+| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用**。另有工作流面的 `acquirePaper`（非 @Tool）：按「本地文件 → 本课题已有 → 其他课题复制 → URL 下载」的顺序把论文弄进 `papers/`，返回结构化 `AcquireResult`（含来源枚举，供报告如实说明是否复用了本地文件） |
 | **PaperTextTool** | `extractPaperText` / `listDownloadedPapers`，读取已下载 PDF 的正文（支持分页、超长截断）。**`analyst-agent` 与 `reviewer-agent` 使用** |
 | **PaperFigureTool** | `extractPaperFigures`，取出 PDF 里**原生嵌入的图片**并落盘为 PNG，**同时返回两种相对路径**（写进 analysis 文件的 `figures/…` 与写进文档的 `../analysis/figures/…`）。**仅 `analyst-agent` 使用** |
 | **DocumentWriteTool** | `writeResearchDocument`，把调研文档写入 `investigation/{课题方向}/document/`（仅限该目录、仅 Markdown） |
 | **AnalysisWriteTool** | `writePaperAnalysis`，把单篇论文的四维信息写入 `investigation/{课题方向}/analysis/`（仅限该目录、仅 Markdown），文件头由工具生成 |
 | **AnalysisReadTool** | `readPaperAnalysis`，按论文短名读回一篇精读结果。**`writer-agent` 与 `reviewer-agent` 共用** |
-| **PaperAnalysisTool** | 批量路径 `analyzePapers(topic)`：枚举该课题已下载论文、跳过已有精读结果的、**并行**调用 `analyst-agent`（路数 `agent.paper.analysis-parallelism`，默认 4），**阻塞直到整批完成**。工作流在每轮 writer 运行前经 `analyzeTopicSync` 直接驱动它（Java 等待，模型零轮询），最终索引（以「论文精读完成：」开头）随 writer 输入交付，每篇完成时推送 SSE 进度；`analyzePapers(topic, 短名)` 同步只分析一篇（失败篇目的单篇重试入口，writer 使用）；`reanalyzePaper(topic, 短名, reason)` 按审查意见强制重做一篇 |
+| **PaperAnalysisTool** | 批量路径 `analyzePapers(topic)`：枚举该课题已下载论文、跳过已有精读结果的、**并行**调用 `analyst-agent`（路数 `agent.paper.analysis-parallelism`，默认 4），**阻塞直到整批完成**。工作流在每轮 writer 运行前经 `analyzeTopicSync` 直接驱动它（Java 等待，模型零轮询），最终索引（以「论文精读完成：」开头）随 writer 输入交付，每篇完成时推送 SSE 进度；`analyzePapers(topic, 短名)` 同步只分析一篇（失败篇目的单篇重试入口，writer 使用）；`reanalyzePaper(topic, 短名, reason)` 按审查意见强制重做一篇。工作流面另有 `analyzeSingleSync` / `reanalyzeSync`：单篇精读/重做，供 `PaperDeepReadWorkflow` 驱动（返回索引/布尔成败，而非面向 writer 的重试话术） |
 | **ResearchWriteReviewWorkflow** | 研究 → 精读 → 写作 → 审查的闭环流水线（含按 target 三分路由的修订回退） |
 
 **子 Agent 工具**（`tools`）：仅 `rag-agent`。`research-agent` / `analyst-agent` / `writer-agent` / `reviewer-agent` 是 `ResearchWriteReviewWorkflow` 的阶段，不单独挂载。
@@ -316,6 +335,8 @@ skill 采用渐进式披露（progressive disclosure）拆分：
 
 **每个角色只读属于自己的一份规程，两份都是整份相关**。此前是 `writing-guide.md` 一份供两个角色共用、让 analyst"重点看 §1"——它每轮都在读一份大半是别人规程的文件，且依赖"模型会照小节号跳读"，实测并不稳。`example/` 下的 `papper*.png` 是**范例文档自己的素材**（与 `example.md` 同目录），实跑文档**不得**引用；实跑引用的图必须来自 `extractPaperFigures` 截取的 `analysis/figures/`，两者不共享任何路径。
 
+**本轮统一的 skill 契约**：每篇图数 0-4 张、上限 4 张，只能用本篇的方法框架图/关键机制图；`ABSTRACT_ONLY` / `SNIPPET` 禁图，没有合格图或取不到图诚实降级，未核实图号/页码不得编造。汇总表以统一口径忠实比较，允许真实同值（包括 Training-free 二值），不为差异改事实。作者引文须保持原语言并逐字可核实，中文释义用普通段落；blockquote 元数据、图注与路径不冒充作者引文，不适用逐字 F6，但仍核验来源与对应关系。四个 ML 分析维度与不适用时注明原因的口径不变。
+
 四个子 Agent 通过 `SkillResourceTool`（只读、路径限定在 skills 目录内）读取上述参考文件，无需授予通用文件工具，避免绕过主 Agent 的 HITL 审批。
 
 **四个子 Agent 刻意不挂 `SkillsAgentHook`。** 该 Hook 会额外注册一个框架自带的 `read_skill` 工具，它按 skill 的 frontmatter 名（`research-writing`，注意与目录名 `research_writing_skill` 不同）查找，且只返回 `SKILL.md`，够不到 `references/*.md`——正是子 Agent 真正需要的文件。两个命名口径不同、能力重叠的"读 skill"工具并列时，模型会开始猜：实测日志里出现了 `Skill not found: reviewer` / `reviewer_skill` / `reviewer-agent` 三次失败调用。现在每个子 Agent 的指令里直接写死唯一正确的调用
@@ -341,7 +362,7 @@ done          终止标记，随后服务端关流
 - `ChatStreamingService` 保证**同一 threadId 同时只有一个运行**（第二个请求立即得到 error+done）；运行在**有界线程池**（上限 16 个并发运行）上执行，超限明确拒绝而非无界堆积。用户消息只在运行被接受后才落库——被拒请求不再污染对话历史。
 - 流超时由 `agent.stream.timeout-minutes` 配置（默认 60 分钟，须覆盖最长的调研运行）。超时只断开 HTTP 流，**运行本身继续**，答案仍写入持久化历史。
 - `ProgressChannelRegistry` 按 threadId 维护监听列表，`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。
-- 阶段枚举：`RESEARCHING` / `WRITING` / `REVIEWING` / `REVISING` / `DONE` / `FAILED`，事件体为 `ProgressEvent{stage, label, round, detail, timestamp}`。
+- 阶段枚举：`RESEARCHING` / `ANALYZING` / `WRITING` / `REVIEWING` / `REVISING` / `DONE` / `FAILED`，事件体为 `ProgressEvent{stage, label, round, detail, timestamp}`。`ANALYZING`（"正在精读论文"）用于单篇精读工作流；收尾事件可用 `ProgressEvent.of(stage, round, detail, label)` 自定义显示文案（如「精读完成/精读失败」），**stage 枚举名不变**——前端以 `stage == 'FAILED'` 判定失败。
 - 推送是**尽力而为**：没有客户端监听时 `publish` 是 no-op，客户端中途断开只是摘除该 emitter——**工作流绝不因无人监听而失败**。
 - 连接关闭前会先发一个 `done` 事件。少了它，客户端会把"正常关闭"当作掉线，为一个已经结束的运行重开连接。前端另有无 `done` 兜底：流意外关闭时气泡退出 streaming 并标记「连接中断，回答可能不完整」。
 
@@ -519,6 +540,8 @@ DeepResearchAgent/
 │       │   └── WeatherTool.java           # 天气查询（未挂载）
 │       ├── workflow/              # Agent 工作流
 │       │   ├── ResearchWriteReviewWorkflow.java # 研究→精读→写作→审查闭环（含三分路由的修订）
+│       │   ├── PaperDeepReadWorkflow.java # 单篇精读闭环（获取→精读→审查→重做，只交付 analysis）
+│       │   ├── AnalysisInventory.java     # 精读/图片清单渲染（两条工作流共用）
 │       │   └── ReviewResult.java          # 审查结论解析（容错，解析失败按未通过处理）
 │       ├── progress/              # 工作流进度推送
 │       │   ├── ProgressStage.java         # 阶段枚举 + 中文 label
@@ -770,7 +793,7 @@ POST /api/chat/test-001/approve
   **本次重构把触发点推远了一个量级**：四维信息改为逐篇落盘到 `analysis/`，文档只做归纳与对比，体量从 `N × 四维全文` 降为 `N × 一句话 + 对比`（实测 2 篇论文的文档从 22,031 字符降到数千字符量级）。现实规模（4-8 篇）下不再逼近上限。
   **但没有消除这个上限**：文档仍与论文数成正比，论文数足够多时同样会截断。届时需要给 `writeResearchDocument` 增加 append / 分段语义（`appendDocumentSection`），尚未实现。
   当前行为是**安全**的：异常被工作流捕获，如实回报失败，不会落盘半篇文档、也不会声称成功。
-- **修订轮次上限 2 轮**（`ResearchWriteReviewWorkflow.MAX_ROUNDS`，与 `review-guide.md` 一致）。实测常见情况是第 2 轮已把问题收敛到少量 MINOR 项，但预算耗尽——此时工作流按未通过上报，由主 Agent 如实转告用户。
+- **最多 2 轮内容审查、1 次内容修订**（`ResearchWriteReviewWorkflow.MAX_ROUNDS` / `PaperDeepReadWorkflow.MAX_ROUNDS`，与 `review-guide.md` 一致）：初稿审查 → 必要时修订一次 → 复审，不是两次重做。复审仍不通过时如实上报，不放宽标准；每份产物的审查格式异常至多即时补审一次、不消耗内容额度，仍异常则停止。单篇精读工作流在"只剩 RESEARCHER 级材料问题"时**提前止损**（`RESIDUAL_ONLY`）：重做精读救不了拿不到的 PDF，烧掉剩余额度只会把同样的结论推迟一轮。
 - 审查期间会把整篇文档、调研材料与 `analysis/` 清单一并注入 reviewer 上下文，两篇论文量级约 2 万字符；更多论文时需关注上下文占用（精读正文由 reviewer 自己按需读取，不预先注入）。
 - **精读进度逐篇推送 SSE**：批量精读由工作流在 writer 运行前经 `analyzeTopicSync` 驱动（Java 阻塞等待、内部并行），每篇完成即发布一条 `WRITING` 阶段事件（"精读完成 {短名}（n/N）"）。此前"逐篇进度拿不到 threadId"的限制随"工作流直接驱动"一并消解——模型侧零轮询，进度对人可见。
 - **文档里的图只来自 `extractPaperFigures` 的嵌入图，取不到时降级为文字指路。** 早期版本是"产出中一律不内嵌图片"，理由是模型自己拼相对路径必错——这个观察是对的，但结论错了：解法是**禁止拼路径**而不是禁止图片。现在路径由工具给出、由 agent 逐字复制，所以断链成了可判定的错误（reviewer 拿图片清单纯字符串核对）。**范例与实跑因此彻底解耦**：`example/example.md` 引用的是**与自己同目录**的 `papper*.png`（示范图放哪、图注怎么写），实跑文档引用的是 `analysis/figures/{短名}_p{页}_{序}.png`，两者不共享任何路径，实跑**不得**引用 skill 目录下的任何文件。
