@@ -14,6 +14,8 @@
         </div>
         <div v-else class="stream-content" v-html="html" @click="handleCopyClick"></div>
         <ResearchProgress v-if="msg.progress?.runs?.length" :progress="msg.progress" />
+        <ExecutionTrace v-if="msg.trace?.length" :trace="msg.trace"
+                        :streaming="!!msg.streaming" :trace-id="msg.traceId || ''" />
       </div>
       <!-- The connection closed without the run's terminal event (no done /
            answer / interruption): the text above is only what got through,
@@ -22,7 +24,12 @@
         <AlertTriangle :size="12" />
         <span>{{ incompleteLabel }}</span>
       </div>
-      <div v-if="msg.error" class="incomplete-note" role="alert">{{ msg.error }}</div>
+      <div v-if="msg.error" class="incomplete-note" role="alert">
+        {{ msg.error }}
+        <span v-if="msg.traceId" class="trace-ref" :title="msg.traceId">
+          · trace {{ shortTraceId }}
+        </span>
+      </div>
       <fieldset v-if="msg.approvals" class="approval-gate" :disabled="approvalDisabled">
         <ApprovalPanel
           :approvals="msg.approvals"
@@ -39,6 +46,7 @@ import { computed } from 'vue'
 import { AlertTriangle, Bot, User } from 'lucide-vue-next'
 import { renderMarkdown, handleCopyClick } from '../utils/markdown'
 import ApprovalPanel from './ApprovalPanel.vue'
+import ExecutionTrace from './ExecutionTrace.vue'
 import ResearchProgress from './ResearchProgress.vue'
 
 const props = defineProps({
@@ -55,6 +63,10 @@ defineEmits(['submit-approvals'])
 // renderMarkdown(msg.content) inline in the v-for, which re-parsed every
 // historical message on every frame of a stream.
 const html = computed(() => (props.msg.role === 'assistant' ? renderMarkdown(props.msg.content) : ''))
+// Short enough for an error line; the full id is in the hover title and can be
+// grepped in logs/app.log.
+const shortTraceId = computed(() =>
+  props.msg.traceId ? props.msg.traceId.replace(/^tr-/, '').slice(0, 8) : '')
 const incompleteLabel = computed(() => {
   switch (props.msg.transportStatus) {
     case 'connection_lost': return '连接已断开，回答可能不完整；后台任务可能仍在继续'
@@ -86,6 +98,10 @@ const incompleteLabel = computed(() => {
 .incomplete-note {
   display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 0 4px;
   font-size: 11.5px; color: var(--yellow, #b45309);
+}
+.trace-ref {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  opacity: .75;
 }
 
 /* Typing indicator */

@@ -36,7 +36,7 @@ public class PlanModeToolInterceptor extends ModelInterceptor {
     /** Dangerous tools — hidden when plan mode is active. */
     private static final Set<String> DANGEROUS_TOOLS = Set.of(
             "writeFile", "deleteFile", "executeCommand",
-            "sendEmail", "sendEmailBatch"
+            "sendEmail", "sendEmailBatch", "createAgent"
     );
 
     @Override

@@ -35,7 +35,7 @@ public class SkillResourceTool {
             Read a supporting file of a skill (reference guides, templates, examples) that sits next to SKILL.md.
             Use this to load a skill's reference documents. Read-only; cannot read or write anything outside the skills directory.""")
     public String readSkillResource(
-            @ToolParam(description = "Skill name, i.e. the directory name containing SKILL.md, e.g. 'research_writing_skill'") String skillName,
+            @ToolParam(description = "Skill name, i.e. the directory name containing SKILL.md, e.g. 'research-writing'") String skillName,
             @ToolParam(description = "Path of the file relative to the skill directory, e.g. 'references/research-guide.md' or 'template/template.md'") String relativePath) {
 
         log.info("Reading skill resource: {}/{}", skillName, relativePath);
@@ -86,6 +86,11 @@ public class SkillResourceTool {
 
     private String readFromDisk(String relativePath) throws IOException {
         Path file = Path.of(relativePath);
+        if (!Files.isRegularFile(file)) {
+            // Relative to the project root, so `spring-boot:run` (cwd = app/) and an
+            // IDE run from the module directory still find the source-tree skill.
+            file = com.itajay.superassistant.workspace.WorkspacePaths.root().resolve(relativePath);
+        }
         if (!Files.isRegularFile(file)) {
             return null;
         }

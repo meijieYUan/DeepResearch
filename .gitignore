@@ -42,6 +42,12 @@ frontend/dist/
 ### Logs ###
 *.log
 startup.log
+logs/
+
+# 执行轨迹（每个 run 一份 JSONL，可重建；不入库）
+.trace/
+# classpath skill 的物化副本（启动时生成）
+.cache/
 
 # Lucene BM25 索引
 data/

@@ -151,6 +151,16 @@ public class PaperDeepReadWorkflow {
 
         String topicId = acquired.topic();
         String paperShortName = acquired.shortName();
+        TopicLocks.Handle topicLock = TopicLocks.tryLock(topicId);
+        if (topicLock == null) {
+            log.warn("PaperDeepRead rejected: topic {} is already running [paper={}]",
+                    topicId, paperShortName);
+            publish(run, Operation.STAGE, Status.FAILED, "同课题已有任务在执行");
+            publish(run.at(ProgressStage.FAILED, 0), Operation.WORKFLOW, Status.FAILED,
+                    "同课题已有任务在执行", "精读失败");
+            return "该课题已有任务在执行（" + topicId + "）：请等待其完成后重试，"
+                    + "避免同一 analysis 文件被并发覆盖。";
+        }
         run = run.forPaper(topicId, paperShortName);
         publish(run, Operation.STAGE, Status.SUCCEEDED, "论文获取完成");
         ProgressContext activity = run;
@@ -262,6 +272,8 @@ public class PaperDeepReadWorkflow {
             return "Paper deep-read workflow failed: " + e.getMessage()
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)\n"
                     + report(acquired, review, rounds, redoCount, "工作流异常终止：" + e.getMessage());
+        } finally {
+            topicLock.close();
         }
     }
 

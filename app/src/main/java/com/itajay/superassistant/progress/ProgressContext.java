@@ -3,6 +3,7 @@ package com.itajay.superassistant.progress;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.agent.tools.ToolContextHelper;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
+import com.itajay.superassistant.trace.TraceContext;
 import org.springframework.ai.chat.model.ToolContext;
 
 import java.util.Optional;
@@ -48,7 +49,25 @@ public record ProgressContext(String threadId, String runId, ProgressEvent.Workf
         if (requirements != null && !requirements.isBlank()) {
             builder.addMetadata(PaperAnalysisTool.REQUIREMENTS_METADATA_KEY, requirements);
         }
-        return builder.build();
+        // Carry the trace identity into sub-agent configs too. Metadata matters as
+        // much as context: AgentLlmNode builds ModelRequest.context from
+        // RunnableConfig.metadata, which is how the model interceptor finds the
+        // trace when the call runs on a reactor thread without the MDC.
+        TraceContext.State trace = TraceContext.current();
+        if (trace != null) {
+            builder.addMetadata(TraceContext.TRACE_ID, trace.traceId());
+            if (trace.runId() != null) {
+                builder.addMetadata(TraceContext.RUN_ID, trace.runId());
+            }
+        }
+        RunnableConfig config = builder.build();
+        if (trace != null) {
+            config.context().put(TraceContext.TRACE_ID, trace.traceId());
+            if (trace.runId() != null) {
+                config.context().put(TraceContext.RUN_ID, trace.runId());
+            }
+        }
+        return config;
     }
 
     public ProgressEvent event(ProgressEvent.Operation operation, ProgressEvent.Status status,

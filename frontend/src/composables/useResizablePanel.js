@@ -42,16 +42,23 @@ export function useResizablePanel({ storageKey, defaultWidth, min, max }) {
     document.body.style.cursor = 'col-resize'
 
     const onMove = (ev) => { width.value = clamp(startW + ev.clientX - startX) }
+    let finished = false
     const onUp = () => {
+      if (finished) return
+      finished = true
       resizing.value = false
       document.body.style.userSelect = ''
       document.body.style.cursor = ''
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('blur', onUp)
       save()
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
+    // Releasing outside the browser window never fires mouseup; the window loses
+    // focus instead. Without this, body styles and listeners leaked permanently.
+    window.addEventListener('blur', onUp)
   }
 
   return { width, collapsed, resizing, load, save, toggle, startResize }

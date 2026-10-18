@@ -21,13 +21,34 @@
       <div><strong>Uploaded:</strong> {{ result.filename }}</div>
       <div><strong>Chunks:</strong> {{ result.chunks }}</div>
     </div>
+
+    <div class="docs-section">
+      <div class="docs-header">
+        <h3>Indexed documents</h3>
+        <button class="btn-ghost btn-sm" :disabled="docsLoading" @click="loadDocuments">
+          {{ docsLoading ? 'Loading…' : 'Refresh' }}
+        </button>
+      </div>
+      <p v-if="docsError" class="upload-error"><AlertCircle :size="16" /> {{ docsError }}</p>
+      <p v-else-if="!documents.length" class="muted">No documents indexed yet.</p>
+      <ul v-else class="doc-list">
+        <li v-for="doc in documents" :key="doc.source">
+          <span class="doc-name" :title="doc.source">{{ doc.source }}</span>
+          <span class="doc-chunks">{{ doc.chunks }} chunks</span>
+          <button class="btn-ghost btn-sm" :disabled="deleting === doc.source"
+                  @click="removeDocument(doc)">
+            {{ deleting === doc.source ? 'Deleting…' : 'Delete' }}
+          </button>
+        </li>
+      </ul>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { Upload, CheckCircle, AlertCircle } from 'lucide-vue-next'
-import { uploadKnowledge } from '../api'
+import { deleteKnowledge, listKnowledge, uploadKnowledge } from '../api'
 
 // Mirrors the picker's `accept` list: a file is checked before the request so an
 // unsupported one gets a specific message instead of a round trip.
@@ -41,6 +62,10 @@ const uploading = ref(false)
 const uploadFile = ref('')
 const uploadError = ref('')
 const result = ref(null)
+const documents = ref([])
+const docsLoading = ref(false)
+const docsError = ref('')
+const deleting = ref('')
 
 function triggerFile() { fileInput.value.click() }
 
@@ -96,13 +121,52 @@ function doUpload(file) {
   // The request is `silent` (see api/index.js): this view owns the error, shown
   // inline below — a global toast as well would just duplicate it.
   uploadKnowledge(file)
-    .then(r => { result.value = r.data })
+    .then(r => {
+      // The endpoint reports extraction/indexing failures as HTTP 200 +
+      // {success:false,error}; treating that as a success showed "Uploaded:
+      // undefined" while the knowledge base stayed empty.
+      if (r.data?.success === false) {
+        uploadError.value = r.data?.error || 'Upload failed'
+        return
+      }
+      result.value = r.data
+      loadDocuments()
+    })
     .catch(err => { uploadError.value = err.response?.data?.message || err.message || 'Upload failed' })
     .finally(() => {
       uploading.value = false
       resetPicker()
     })
 }
+
+async function loadDocuments() {
+  docsLoading.value = true
+  docsError.value = ''
+  try {
+    const response = await listKnowledge()
+    documents.value = Array.isArray(response.data?.documents) ? response.data.documents : []
+  } catch (err) {
+    docsError.value = err.response?.data?.message || err.message || 'Failed to load documents'
+  } finally {
+    docsLoading.value = false
+  }
+}
+
+async function removeDocument(doc) {
+  if (!window.confirm(`Delete "${doc.source}" from the knowledge base?`)) return
+  deleting.value = doc.source
+  docsError.value = ''
+  try {
+    await deleteKnowledge(doc.source)
+    await loadDocuments()
+  } catch (err) {
+    docsError.value = err.response?.data?.message || err.message || 'Delete failed'
+  } finally {
+    deleting.value = ''
+  }
+}
+
+onMounted(loadDocuments)
 </script>
 
 <style scoped>
@@ -123,4 +187,15 @@ function doUpload(file) {
 .upload-error { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 13px; color: var(--red); }
 .upload-result { margin-top: 16px; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .result-icon { color: var(--green); margin-bottom: 4px; }
+.docs-section { margin-top: 28px; }
+.docs-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.docs-header h3 { font-size: 14px; font-weight: 650; }
+.doc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.doc-list li {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+}
+.doc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.doc-chunks { flex-shrink: 0; font-size: 12px; color: var(--text2); }
+.muted { font-size: 13px; color: var(--text2); }
 </style>

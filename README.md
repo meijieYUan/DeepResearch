@@ -64,6 +64,11 @@ investigation/智能体的上下文管理/
 | **全程流式可见** | 接口即 SSE：论文下载、逐篇精读进度与答案的逐 token 输出在同一条连接上，无黑盒等待 |
 | **四路并行精读** | Java 驱动的有界并行，精读吞吐提升约 4 倍，单篇失败自动重试、不中断整批 |
 | **上下文工程** | 四层上下文压缩 + 工具循环防护 + Plan Mode 人工审批，支撑小时级长任务 |
+| **执行轨迹可观测** | 每次运行一个 traceId：run/model/tool 事件实时显示在前端「执行轨迹」与顶栏状态条，同时落盘 `.trace/*.jsonl` 并写入带 traceId 的 `logs/app.log`；`/actuator/metrics` 提供工具/模型/运行延迟与 token 计数 |
+| **结构化学术检索** | research-agent 直接调用 arXiv Atom API 与 Semantic Scholar Graph API（标题/作者/年份/摘要/引用量/开放 PDF），Bing 仅作补充 |
+| **可取消的长任务** | 前端停止按钮调用 `POST /api/chat/{threadId}/cancel`，服务端 dispose 模型流并中断阻塞工具；断流不再等于继续烧 token |
+| **知识库生命周期** | 上传、列表、按来源删除、同名版本替换（先写新版本再删旧版本），RAG 回答带 `[来源: 文件名]` 引用 |
+| **可选部署鉴权** | 设置 `APP_API_TOKEN` 后，除健康检查外的 `/api/**` 需要 Bearer Token；本地默认保持无鉴权 |
 
 **统一的产出契约**：reviewer 模型只输出 `verdict` / `summary` / `issues`，以 `ReviewResult.Payload` 为字段权威，`approved` 由 Java 派生。每篇配图 0-4 张、上限 4 张，只用本篇方法框架图或关键机制图；摘要/片段禁图，取不到图诚实说明。对比表允许真实同值（包括 Training-free 的 `是` / `否`），不制造差异；中文释义不冒充原语言作者引文，元数据、图注与路径也不作作者引文逐字核对。内容修订基于上一轮磁盘旧稿，精读重试/重做同时保留原始需求。
 
@@ -72,11 +77,18 @@ investigation/智能体的上下文管理/
 ## 快速开始
 
 ```bash
-# 后端（需配置 LLM API Key、MySQL 与 MCP 邮件服务）
+# 后端（需配置 LLM API Key、MySQL 与 MCP 邮件服务；可选 APP_API_TOKEN 启用接口鉴权）
 ./mvnw -pl app spring-boot:run            # :8080
 
 # 前端
 cd frontend && npm install && npm run dev # :3000，代理 /api → :8080
+```
+
+运行测试（不依赖 MySQL / Milvus / MCP 服务）：
+
+```bash
+./mvnw -pl app test                  # 后端
+cd frontend && npm test              # 前端
 ```
 
 发一次调研——接口本身就是 SSE 流：

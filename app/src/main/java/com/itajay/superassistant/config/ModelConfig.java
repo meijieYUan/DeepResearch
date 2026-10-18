@@ -39,6 +39,9 @@ public class ModelConfig {
     @Value("${spring.ai.deepseek.chat.options.max-tokens:8192}")
     private Integer maxTokens;
 
+    @Value("${spring.ai.deepseek.chat.options.temperature:0.7}")
+    private double temperature;
+
     @Bean
     public DeepSeekApi deepSeekApi() {
         return DeepSeekApi.builder()
@@ -60,7 +63,7 @@ public class ModelConfig {
                 .deepSeekApi(deepSeekApi)
                 .defaultOptions(DeepSeekChatOptions.builder()
                         .model(model)
-                        .temperature(0.7)
+                        .temperature(temperature)
                         .maxTokens(maxTokens)
                         .build())
                 .toolCallingManager(toolCallingManager)

@@ -67,9 +67,7 @@ public class DocumentWriteTool {
         try {
             Files.createDirectories(documentsDir);
             boolean existed = Files.exists(target);
-            Files.writeString(target, content, StandardCharsets.UTF_8,
-                    java.nio.file.StandardOpenOption.CREATE,
-                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+            com.itajay.superassistant.workspace.AtomicFiles.writeString(target, content);
 
             log.info("Wrote research document: {} ({} chars, overwritten={})",
                     target, content.length(), existed);

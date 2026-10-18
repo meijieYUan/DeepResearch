@@ -82,6 +82,11 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <!-- Liveness/readiness with real dependency checks (/actuator/health). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
 
         <!-- 必须是 boot4 starter：boot3 版把 MybatisPlusAutoConfiguration 排到
              org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration 之后，

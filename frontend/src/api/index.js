@@ -1,7 +1,14 @@
 import axios from 'axios'
 import { toast } from '../utils/toast'
 
+// Optional deployment token. Empty (the default) keeps local usage unchanged;
+// when the backend sets APP_API_TOKEN, build the frontend with the same value.
+const API_TOKEN = import.meta.env?.VITE_API_TOKEN || ''
+
 const api = axios.create({ baseURL: '/api', timeout: 120000 })
+if (API_TOKEN) {
+  api.defaults.headers.common.Authorization = `Bearer ${API_TOKEN}`
+}
 
 api.interceptors.response.use(
   response => response,
@@ -33,9 +40,11 @@ export const getHealth = () => api.get('/health', { silent: true, timeout: 5000 
 // (network/HTTP error) or is aborted. A stream can also close without ever sending
 // `done`, so callers must not rely on onDone alone to finalize state.
 export async function streamChatEvents(threadId, path, body, handlers, signal) {
+  const headers = { 'Content-Type': 'application/json; charset=utf-8' }
+  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`
   const res = await fetch(`/api/chat/${threadId}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    headers,
     body: JSON.stringify(body),
     signal
   })
@@ -107,6 +116,11 @@ export const chatStream = (threadId, message, mode, handlers, signal) =>
 export const approveStream = (threadId, decisions, handlers, signal) =>
   streamChatEvents(threadId, '/approve', { decisions }, handlers, signal)
 
+// Ask the server to stop the run itself; aborting the fetch alone only closes the
+// stream and lets the agent keep burning tokens in the background.
+export const cancelChat = (threadId) =>
+  api.post(`/chat/${threadId}/cancel`, null, { silent: true })
+
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId }, silent: true })
 export const getPendingTodos = (threadId) => api.get('/todos/pending', { params: { threadId } })
@@ -122,3 +136,8 @@ export const uploadKnowledge = (file) => {
   // only duplicate the same message.
   return api.post('/knowledge/upload', fd, { silent: true })
 }
+
+export const listKnowledge = () => api.get('/knowledge/documents', { silent: true })
+
+export const deleteKnowledge = (source) =>
+  api.delete('/knowledge/documents', { params: { source }, silent: true })

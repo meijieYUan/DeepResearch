@@ -1,3 +1,6 @@
+-- DEPRECATED: docker-compose.yml now mounts app/src/main/resources/sql directly,
+-- so this file is no longer executed. Kept only so an existing checkout with a
+-- customized copy is not silently lost; delete it once the migration is confirmed.
 CREATE DATABASE IF NOT EXISTS superassistant
     DEFAULT CHARACTER SET utf8mb4
     COLLATE utf8mb4_unicode_ci;

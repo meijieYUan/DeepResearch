@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Focused resource contracts, not snapshots of the guides or live-model tests. */
 class SkillContractTest {
 
-    private static final String ROOT = "/skills/research_writing_skill/";
+    private static final String ROOT = "/skills/research-writing/";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test

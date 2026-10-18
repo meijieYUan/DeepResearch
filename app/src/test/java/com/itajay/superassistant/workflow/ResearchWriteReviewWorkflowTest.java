@@ -222,6 +222,53 @@ class ResearchWriteReviewWorkflowTest {
     }
 
     @Test
+    void passWithoutAFileOnDiskIsNotReportedAsDeliverable() {
+        when(analysis.analyzeTopicSync(eq(topic), isNull(), anyInt(), eq(brief), any(ProgressContext.class)))
+                .thenReturn("论文精读完成：");
+        ResearchWriteReviewWorkflow flow = new ResearchWriteReviewWorkflow(
+                (input, config) -> "materials",
+                (input, config) -> "只是回复文本，没有落盘",
+                (input, config) -> PASS,
+                analysis, new ProgressChannelRegistry());
+
+        String report = flow.researchWriteReview(brief, null);
+
+        assertThat(report).contains("通过 (PASS)", "没有可交付的文件")
+                .doesNotContain("可以直接交付用户");
+    }
+
+    @Test
+    void aStrayDraftFromThePreviousRoundDoesNotHideThisRoundsRevision() throws IOException {
+        when(analysis.analyzeTopicSync(eq(topic), isNull(), anyInt(), eq(brief), any(ProgressContext.class)))
+                .thenReturn("论文精读完成：");
+        Path stray = WorkspacePaths.documentsDir(topic).resolve(topic + "-survey.md");
+        AtomicInteger round = new AtomicInteger();
+        ResearchWriteReviewWorkflow flow = new ResearchWriteReviewWorkflow(
+                (input, config) -> "materials",
+                (input, config) -> {
+                    Files.createDirectories(document.getParent());
+                    if (round.incrementAndGet() == 1) {
+                        Files.writeString(stray, "# 第一轮旧稿\n\n旧结论。");
+                        return "file: " + WorkspacePaths.relative(stray);
+                    }
+                    Files.writeString(document, "# 第二轮修订稿\n\n已修改的结论。");
+                    return "file: " + WorkspacePaths.relative(document);
+                },
+                (input, config) -> {
+                    reviewInputs.add(input);
+                    return round.get() == 1 ? revise("WRITER") : PASS;
+                },
+                analysis, new ProgressChannelRegistry());
+
+        flow.researchWriteReview(brief, null);
+
+        assertThat(reviewInputs.get(0)).contains("旧结论。");
+        // The second review must see the canonical file written this round, not the
+        // stray file that `documentPath` still pointed at.
+        assertThat(reviewInputs.get(1)).contains("已修改的结论。").doesNotContain("旧结论。");
+    }
+
+    @Test
     void oversizedDraftIsExplicitlyLimitedRatherThanClaimedComplete() {
         when(analysis.analyzeTopicSync(eq(topic), isNull(), anyInt(), eq(brief), any(ProgressContext.class))).thenReturn("论文精读完成：");
         List<String> writes = new ArrayList<>();

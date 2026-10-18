@@ -1,5 +1,6 @@
 package com.itajay.superassistant.rag;
 
+import com.itajay.superassistant.workspace.WorkspacePaths;
 import jakarta.annotation.PreDestroy;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
@@ -9,12 +10,15 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TermQuery;
@@ -31,6 +35,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -54,12 +59,20 @@ public class Bm25Index {
     public static final String CONTENT_FIELD = "content";
     private static final String ID_FIELD = "id";
     private static final String SOURCE_FIELD = "source";
+    private static final String SOURCE_VERSION_FIELD = "source_version";
 
     /**
      * Metadata key carrying the source file name on each Spring AI Document.
      * Set by {@code RagService} at read time; survives the token splitter.
      */
     public static final String SOURCE_METADATA_KEY = "source_filename";
+
+    /** Version of one ingestion; lets a replacement delete only the superseded chunks. */
+    public static final String SOURCE_VERSION_METADATA_KEY = "source_version";
+
+    /** One source file and its current chunk count, for the knowledge-base API. */
+    public record SourceStat(String source, int chunks) {
+    }
 
     private final Analyzer analyzer;
     private final FSDirectory directory;
@@ -69,6 +82,11 @@ public class Bm25Index {
     public Bm25Index(@Value("${rag.retrieval.bm25.index-path:./data/bm25-index}") String indexPath) throws IOException {
         this.analyzer = new SmartChineseAnalyzer();
         Path path = Path.of(indexPath);
+        if (!path.isAbsolute()) {
+            // Anchor to the repository root, not the process working directory:
+            // starting from `app/` used to create a second, empty index there.
+            path = WorkspacePaths.root().resolve(path).normalize();
+        }
         this.directory = FSDirectory.open(path);
         IndexWriterConfig config = new IndexWriterConfig(analyzer);
         config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
@@ -104,6 +122,11 @@ public class Bm25Index {
             if (source != null) {
                 doc.add(new StringField(SOURCE_FIELD, String.valueOf(source), Field.Store.YES));
             }
+            Object version = chunk.getMetadata() == null ? null
+                    : chunk.getMetadata().get(SOURCE_VERSION_METADATA_KEY);
+            if (version != null) {
+                doc.add(new StringField(SOURCE_VERSION_FIELD, String.valueOf(version), Field.Store.YES));
+            }
             luceneDocs.add(doc);
         }
         if (luceneDocs.isEmpty()) {
@@ -131,6 +154,62 @@ public class Bm25Index {
             log.info("BM25 removed {} stale chunk(s) of source '{}'", deleted, sourceId);
         }
         return deleted;
+    }
+
+    /**
+     * Deletes the previous versions of a source, keeping the chunks written by the
+     * given version. Called after the new version has been indexed, so a failed
+     * ingestion leaves the old one intact.
+     */
+    public synchronized long deleteBySourceExcept(String sourceId, String keepVersion) throws IOException {
+        if (sourceId == null || sourceId.isBlank()) {
+            return 0;
+        }
+        BooleanQuery.Builder query = new BooleanQuery.Builder()
+                .add(new TermQuery(new Term(SOURCE_FIELD, sourceId)), BooleanClause.Occur.MUST);
+        if (keepVersion != null && !keepVersion.isBlank()) {
+            query.add(new TermQuery(new Term(SOURCE_VERSION_FIELD, keepVersion)),
+                    BooleanClause.Occur.MUST_NOT);
+        }
+        long deleted = writer.deleteDocuments(query.build());
+        writer.commit();
+        searcherManager.maybeRefresh();
+        if (deleted > 0) {
+            log.info("BM25 removed {} superseded chunk(s) of source '{}'", deleted, sourceId);
+        }
+        return deleted;
+    }
+
+    /** Current chunk count per source, for the knowledge-base listing API. */
+    public List<SourceStat> sourceStats() {
+        IndexSearcher searcher = null;
+        try {
+            searcher = searcherManager.acquire();
+            IndexReader reader = searcher.getIndexReader();
+            StoredFields storedFields = searcher.storedFields();
+            TopDocs all = searcher.search(new MatchAllDocsQuery(), Math.max(1, reader.maxDoc()));
+            Map<String, Integer> counts = new java.util.TreeMap<>();
+            for (ScoreDoc hit : all.scoreDocs) {
+                String source = storedFields.document(hit.doc).get(SOURCE_FIELD);
+                if (source != null && !source.isBlank()) {
+                    counts.merge(source, 1, Integer::sum);
+                }
+            }
+            List<SourceStat> stats = new ArrayList<>(counts.size());
+            counts.forEach((source, chunks) -> stats.add(new SourceStat(source, chunks)));
+            return stats;
+        } catch (IOException e) {
+            log.warn("Could not list BM25 sources: {}", e.getMessage());
+            return List.of();
+        } finally {
+            if (searcher != null) {
+                try {
+                    searcherManager.release(searcher);
+                } catch (IOException e) {
+                    log.debug("Could not release BM25 searcher: {}", e.getMessage());
+                }
+            }
+        }
     }
 
     /**

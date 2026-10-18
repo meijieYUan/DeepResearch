@@ -47,6 +47,29 @@ test('save/load sanitize progress, retain final snapshots, convert running trans
   assert.equal(messages[3].progress, undefined)
 })
 
+test('trace survives persistence bounded and sanitized', t => {
+  const data = storage(t), store = useThreads()
+  const trace = Array.from({ length: 120 }, (_, i) => ({
+    seq: i, timestamp: i, category: 'TOOL', name: 'readFile', status: 'STARTED',
+    detail: 'd'.repeat(600), secret: 'discard'
+  }))
+  store.threads.value = { A: { id: 'A', title: '', lastActive: 1, messages: [
+    { id: 'm', role: 'assistant', content: '', traceId: 'tr-12345678', trace }
+  ] } }
+
+  store.saveThreads()
+  const saved = JSON.parse(data.get(THREADS_STORAGE_KEY)).A.messages[0]
+  assert.equal(saved.trace.length, 100)
+  assert.equal(saved.trace[0].secret, undefined)
+  assert.equal(saved.trace[0].detail.length, 500)
+  assert.equal(saved.traceId, 'tr-12345678')
+
+  store.loadThreads()
+  const restored = store.threads.value.A.messages[0]
+  assert.equal(restored.trace.length, 100)
+  assert.equal(restored.trace[0].detail.length, 500)
+})
+
 test('new/switch/delete call stop before changing active thread; history progress is not cleared', t => {
   storage(t)
   const store = useThreads(), calls = []

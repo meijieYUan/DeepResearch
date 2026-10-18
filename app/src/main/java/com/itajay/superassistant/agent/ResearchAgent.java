@@ -1,10 +1,14 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.alibaba.cloud.ai.graph.agent.hook.modelcalllimit.ModelCallLimitHook;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
+import com.itajay.superassistant.tool.AcademicSearchTool;
 import com.itajay.superassistant.tool.PaperDownloadTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
 import com.itajay.superassistant.tool.WebSearchTool;
+import com.itajay.superassistant.trace.TraceModelInterceptor;
+import com.itajay.superassistant.trace.TraceToolInterceptor;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.stereotype.Component;
 
@@ -28,20 +32,24 @@ public class ResearchAgent {
     public final ReactAgent reactAgent;
 
     public ResearchAgent(WebSearchTool webSearchTool,
+                         AcademicSearchTool academicSearchTool,
                          SkillResourceTool skillResourceTool,
                          PaperDownloadTool paperDownloadTool,
                          ChatModel chatModel,
-                         ModelCallGuardInterceptor subAgentModelCallGuard) {
+                         ModelCallGuardInterceptor subAgentModelCallGuard,
+                         ModelCallLimitHook researchCallLimitHook,
+                         TraceToolInterceptor traceToolInterceptor,
+                         TraceModelInterceptor traceModelInterceptor) {
         this.reactAgent = ReactAgent.builder()
                 .name("research-agent")
-                .description("科研论文检索与下载 agent：使用 research-writing skill 的检索网站与筛选标准，建立候选池、判定相关性并下载相关论文。")
+                .description("科研论文检索与下载 agent：使用 research-writing 的检索网站与筛选标准，建立候选池、判定相关性并下载相关论文。")
                 .model(chatModel)
                 .instruction("""
                         你是 ResearchAgent，负责为后续写作收集并下载高质量论文。
                         输入：{input}
 
                         第一步：先读取你的完整操作规程，它是本任务的权威依据。用 readSkillResource 工具，两个参数都写死：
-                        readSkillResource(skillName="research_writing_skill", relativePath="references/research-guide.md")
+                        readSkillResource(skillName="research-writing", relativePath="references/research-guide.md")
                         若无法读取该文件，明确说明并停止，不要凭猜测执行。
 
                         然后严格按 research-guide.md 执行：
@@ -80,8 +88,9 @@ public class ResearchAgent {
                         输出格式：按 research-guide.md 的"输出契约"节输出 Markdown 材料，
                         包含候选池、相关性判定表（含摘要证据摘录）、下载清单与参考文献列表。
                         """)
-                .methodTools(webSearchTool, skillResourceTool, paperDownloadTool)
-                .interceptors(subAgentModelCallGuard)
+                .methodTools(webSearchTool, academicSearchTool, skillResourceTool, paperDownloadTool)
+                .hooks(researchCallLimitHook)
+                .interceptors(subAgentModelCallGuard, traceToolInterceptor, traceModelInterceptor)
                 .build();
     }
 }

@@ -14,7 +14,10 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+      # Single source of truth for the schema: the same files the README tells
+      # operators to apply manually. The init scripts run with MYSQL_DATABASE
+      # selected by the official entrypoint.
+      - ./app/src/main/resources/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-123456}"]
       interval: 10s

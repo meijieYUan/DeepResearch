@@ -1,5 +1,6 @@
 package com.itajay.superassistant.progress;
 
+import com.itajay.superassistant.trace.TraceEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,6 +13,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Fans progress events out to every connection listening for a conversation thread.
@@ -40,7 +42,12 @@ public class ProgressChannelRegistry {
     @Value("${agent.stream.timeout-minutes:60}")
     private long timeoutMinutes = 60;
 
+    /** Bounds the number of SseEmitters (each holds a servlet async request). */
+    private static final int MAX_LISTENERS_PER_THREAD = 4;
+    private static final int MAX_TOTAL_LISTENERS = 200;
+
     private final Map<String, CopyOnWriteArrayList<SseEmitter>> channels = new ConcurrentHashMap<>();
+    private final AtomicInteger totalListeners = new AtomicInteger();
 
     /**
      * Opens a progress-only connection for a thread (the debug endpoint).
@@ -51,7 +58,13 @@ public class ProgressChannelRegistry {
      */
     public SseEmitter register(String threadId) {
         SseEmitter emitter = newEmitter();
-        attach(threadId, emitter);
+        if (!attach(threadId, emitter)) {
+            try {
+                emitter.complete();
+            } catch (Exception ignored) {
+                // already closed
+            }
+        }
         log.debug("Progress stream opened [thread={}]", threadId);
         return emitter;
     }
@@ -62,9 +75,16 @@ public class ProgressChannelRegistry {
      * lifecycle, so a completed connection stops receiving events without anyone
      * having to remember to detach it.
      */
-    public void attach(String threadId, SseEmitter emitter) {
+    public boolean attach(String threadId, SseEmitter emitter) {
         if (threadId == null || threadId.isBlank()) {
             throw new IllegalArgumentException("threadId is required");
+        }
+        CopyOnWriteArrayList<SseEmitter> existing = channels.get(threadId);
+        if ((existing != null && existing.size() >= MAX_LISTENERS_PER_THREAD)
+                || totalListeners.get() >= MAX_TOTAL_LISTENERS) {
+            log.warn("SSE listener limit reached [thread={}, perThread={}, total={}]",
+                    threadId, existing == null ? 0 : existing.size(), totalListeners.get());
+            return false;
         }
         AtomicBoolean detached = new AtomicBoolean();
         Runnable remove = () -> {
@@ -83,6 +103,7 @@ public class ProgressChannelRegistry {
         // Wire callbacks before exposing the emitter to publishers. A callback can
         // run during registration or addition; remember it and remove again after
         // addition so a finished connection is never left behind in the fan-out.
+        AtomicBoolean added = new AtomicBoolean();
         channels.compute(threadId, (key, list) -> {
             if (detached.get()) {
                 return list;
@@ -91,11 +112,16 @@ public class ProgressChannelRegistry {
                 list = new CopyOnWriteArrayList<>();
             }
             list.add(emitter);
+            added.set(true);
             return list;
         });
+        if (added.get()) {
+            totalListeners.incrementAndGet();
+        }
         if (detached.get()) {
             removeEmitter(threadId, emitter);
         }
+        return true;
     }
 
     /**
@@ -103,7 +129,20 @@ public class ProgressChannelRegistry {
      * is listening, which is the common case for API-only callers.
      */
     public void publish(String threadId, ProgressEvent event) {
-        if (threadId == null || threadId.isBlank() || event == null) {
+        sendAll(threadId, "progress", event);
+    }
+
+    /**
+     * Pushes one execution-trace event to the thread's listeners. Same transport as
+     * progress, different frame name; the frontend renders it as the live timeline
+     * and the trace is also persisted by {@code TraceService}.
+     */
+    public void publishTrace(String threadId, TraceEvent event) {
+        sendAll(threadId, "trace", event);
+    }
+
+    private void sendAll(String threadId, String frame, Object payload) {
+        if (threadId == null || threadId.isBlank() || payload == null) {
             return;
         }
         CopyOnWriteArrayList<SseEmitter> list = channels.get(threadId);
@@ -112,7 +151,7 @@ public class ProgressChannelRegistry {
         }
         for (SseEmitter emitter : list) {
             try {
-                emitter.send(SseEmitter.event().name("progress").data(event));
+                emitter.send(SseEmitter.event().name(frame).data(payload));
             } catch (IOException | IllegalStateException e) {
                 // Client disconnected mid-send. Drop this listener; the run and the
                 // other listeners carry on.
@@ -142,15 +181,21 @@ public class ProgressChannelRegistry {
     }
 
     private SseEmitter newEmitter() {
-        return new SseEmitter(timeoutMinutes * 60_000L);
+        return new AsyncSseEmitter(timeoutMinutes * 60_000L);
     }
 
     private void removeEmitter(String threadId, SseEmitter emitter) {
+        AtomicBoolean removed = new AtomicBoolean();
         channels.computeIfPresent(threadId, (key, list) -> {
-            list.remove(emitter);
+            if (list.remove(emitter)) {
+                removed.set(true);
+            }
             // Keep the mapping while other subscribers remain. This runs atomically
             // with attach so a concurrent subscriber cannot join an orphaned list.
             return list.isEmpty() ? null : list;
         });
+        if (removed.get()) {
+            totalListeners.decrementAndGet();
+        }
     }
 }

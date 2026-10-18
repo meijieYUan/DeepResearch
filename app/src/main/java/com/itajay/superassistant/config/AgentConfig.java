@@ -13,12 +13,16 @@ import com.itajay.superassistant.compact.CompactHook;
 import com.itajay.superassistant.interceptor.LoopGuardToolInterceptor;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.CreateAgentTool;
+import com.itajay.superassistant.tool.DateTimeTool;
+import com.itajay.superassistant.tool.WeatherTool;
 import com.itajay.superassistant.workflow.PaperDeepReadWorkflow;
 import com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow;
 import com.itajay.superassistant.interceptor.PlanModeToolInterceptor;
 import com.itajay.superassistant.prompt.PromptSubmitHook;
 import com.itajay.superassistant.rag.RagAgent;
 import com.itajay.superassistant.rag.ModelMessagePersistenceHook;
+import com.itajay.superassistant.trace.TraceModelInterceptor;
+import com.itajay.superassistant.trace.TraceToolInterceptor;
 import com.itajay.superassistant.tool.FileOperationTool;
 import com.itajay.superassistant.tool.MemoryTool;
 import com.itajay.superassistant.tool.PlanTool;
@@ -104,6 +108,8 @@ public class AgentConfig {
     public ReactAgent mainAgent(ChatModel chatModel,
                                  TodoTool todoTool,
                                  WebSearchTool webSearchTool,
+                                 DateTimeTool dateTimeTool,
+                                 WeatherTool weatherTool,
                                  FileOperationTool fileOperationTool,
                                  MemoryTool memoryTool,
                                  CompactHook compactHook,
@@ -123,6 +129,8 @@ public class AgentConfig {
                                  LoopGuardToolInterceptor loopGuardToolInterceptor,
                                  ToolRetryInterceptor toolRetryInterceptor,
                                  ToolErrorInterceptor toolErrorInterceptor,
+                                 TraceToolInterceptor traceToolInterceptor,
+                                 TraceModelInterceptor traceModelInterceptor,
                                  @Nullable ToolCallbackProvider mcpToolCallbackProvider) {
 
         HumanInTheLoopHook humanInTheLoopHook = HumanInTheLoopHook.builder()
@@ -153,7 +161,8 @@ public class AgentConfig {
                 .description("Main agent: handles user interaction, planning, tool orchestration, and workflow delegation.")
                 .model(chatModel)
                 .instruction(MAIN_AGENT_INSTRUCTION)
-                .methodTools(todoTool, webSearchTool, fileOperationTool, memoryTool,
+                .methodTools(todoTool, webSearchTool, dateTimeTool, weatherTool,
+                             fileOperationTool, memoryTool,
                              planTool, terminalTool, createAgentTool, researchWriteReviewWorkflow,
                              paperDeepReadWorkflow)
                 .tools(ragTool)
@@ -161,7 +170,8 @@ public class AgentConfig {
                        modelCallLimitHook, modelMessagePersistenceHook)
                 .interceptors(promptSubmitHook,
                               planModeToolInterceptor, modelCallGuardInterceptor,
-                              loopGuardToolInterceptor, toolRetryInterceptor, toolErrorInterceptor)
+                              loopGuardToolInterceptor, toolRetryInterceptor, toolErrorInterceptor,
+                              traceToolInterceptor, traceModelInterceptor)
                 .saver(mysqlSaver)
                 .outputKey("output");
 

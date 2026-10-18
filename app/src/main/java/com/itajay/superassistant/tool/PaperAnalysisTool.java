@@ -314,7 +314,8 @@ public class PaperAnalysisTool {
         try {
             AtomicInteger started = new AtomicInteger();
             for (PendingJob job : pending) {
-                Future<Outcome> future = completions.submit(() -> {
+                Future<Outcome> future = completions.submit(
+                        com.itajay.superassistant.trace.TraceContext.wrapCallable(() -> {
                     // Announced from inside the lane, so the event fires when the paper
                     // is actually picked up — the frontend sees motion from the first
                     // second instead of a silent multi-minute wait.
@@ -331,7 +332,7 @@ public class PaperAnalysisTool {
                     } finally {
                         activity.exited(topic, job.shortName());
                     }
-                });
+                }));
                 jobs.put(future, job);
             }
             while (done < pending.size()) {

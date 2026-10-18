@@ -22,4 +22,9 @@ spring:
     properties:
       mail.smtp.auth: true
       mail.smtp.ssl.enable: true
+      # Without these, a hung SMTP server can block a tool call forever (the
+      # JavaMail defaults are infinite).
+      mail.smtp.connectiontimeout: 10000
+      mail.smtp.timeout: 10000
+      mail.smtp.writetimeout: 10000
     default-encoding: UTF-8

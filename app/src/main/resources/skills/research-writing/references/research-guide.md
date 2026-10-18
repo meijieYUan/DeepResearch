@@ -17,7 +17,9 @@
 
 | 工具 | 实际行为 | 关键限制 |
 |------|---------|---------|
-| `webSearch` | Bing 检索（cn.bing.com），返回**最多 8 条**结果的标题 + 摘要片段 + URL | 只返回 8 条，因此**必须靠多组检索式扩大候选池**，不能指望一次搜索拿到全部候选 |
+| `searchArxiv` | arXiv Atom API，返回标题、作者、发表日期、摘要、abs/PDF 链接 | 适合 CS/物理/数学；**优先使用**，一次最多 25 条 |
+| `searchSemanticScholar` | Semantic Scholar Graph API，返回标题、作者、年份、会议、引用量、摘要、开放 PDF | 公共 API 有限流；适合跨学科补充与按引用量排序 |
+| `webSearch` | Bing 检索（cn.bing.com），返回**最多 8 条**结果的标题 + 摘要片段 + URL | 只返回 8 条，作为**补充**用于非论文来源、中文站点、CNKI 与漏检；不能指望一次搜索拿到全部候选 |
 | `webCrawl` | 抓取 URL 并抽取正文纯文本 | **只处理 HTML**，返回内容**超过 8000 字符会被截断**；**无法解析 PDF 二进制** |
 | `downloadPaper` | 下载论文 PDF 到 `investigation/{课题方向}/papers/`，自动重试、校验、去重 | 接受 PDF 链接 / arXiv abs 页 / DOI / 出版社 landing page；**仅用于已判定相关的论文** |
 | `listDownloadedPapers` | 列出某课题下已下载的论文（大小、页数） | 下载前先查，避免重复下载 |
@@ -27,7 +29,7 @@
 由此推出三条硬性结论：
 
 1. **候选池靠"多检索式 × 多站点"堆出来**，而不是靠单次搜索。
-2. **摘要必须从论文的 HTML 摘要页读取**（arXiv `/abs/` 页、Semantic Scholar 论文页、PubMed 页、出版社 landing page 等），**不要试图用 `webCrawl` 打开 `.pdf` 链接**——那只会拿到乱码或空内容。
+2. **摘要优先使用 `searchArxiv` / `searchSemanticScholar` 返回体中的原文摘要**（结构化、无需再抓页面）；缺失时再读 arXiv `/abs/` 页、Semantic Scholar 论文页、PubMed 页、出版社 landing page 等。**不要试图用 `webCrawl` 打开 `.pdf` 链接**——那只会拿到乱码或空内容。
 3. **`downloadPaper` 是唯一的副作用操作**，且只对通过 §5 判定的论文调用；其余一律只读。
 
 **降级链（所有抓取动作都适用）**：

@@ -140,6 +140,13 @@ public class ResearchWriteReviewWorkflow {
         // blockers, blaming the writer for a mismatch the workflow had created.
         String brief = topic;
         String topicId = topicIdentifier(brief);
+        TopicLocks.Handle topicLock = TopicLocks.tryLock(topicId);
+        if (topicLock == null) {
+            log.warn("ResearchWriteReview rejected: topic {} is already running [thread={}]",
+                    topicId, threadId);
+            return "该课题已有调研任务在执行（" + topicId + "）：请等待其完成后重试，或改用其他课题方向。"
+                    + "（同一课题的并发运行会重复精读并互相覆盖 analysis/document。）";
+        }
         ProgressContext run = new ProgressContext(threadId, UUID.randomUUID().toString(),
                 ProgressEvent.Workflow.RESEARCH_WRITE_REVIEW, ProgressStage.RESEARCHING, 0, topicId, null);
         ProgressContext activity = run;
@@ -194,7 +201,10 @@ public class ResearchWriteReviewWorkflow {
                 AtomicInteger reviewAttempt = new AtomicInteger(1);
                 publish(activity, Operation.STAGE, Status.RUNNING, "开始质量审查");
                 publishReview(reviewContext, Status.RUNNING, "开始质量审查", 1);
-                reviewed = readBack(documentPath, documentOutput);
+                // Always start from the canonical path this round. `documentPath`
+                // may still point at a stray file from the previous round, and
+                // reading it again would review the unrevised draft forever.
+                reviewed = readBack(documentPathFor(topicId), documentOutput);
                 documentPath = reviewed.path();
                 review = null; // An exception must not retain the previous artifact's verdict.
                 review = ReviewRunner.run(reviewerRun,
@@ -252,6 +262,8 @@ public class ResearchWriteReviewWorkflow {
             return "Research-write-review workflow failed: " + e.getMessage()
                     + (documentOutput == null ? "" : "\n(An earlier draft may still have been written.)")
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)";
+        } finally {
+            topicLock.close();
         }
     }
 
@@ -447,8 +459,13 @@ public class ResearchWriteReviewWorkflow {
             sb.append("\n审查总体意见:\n").append(review.summary()).append('\n');
         }
 
-        if (approved) {
+        if (approved && reviewed != null && reviewed.onDisk()) {
             sb.append("\n文档已通过质量审查，可以直接交付用户。\n");
+        } else if (approved) {
+            // The reviewer may pass the writer's raw reply, but no artifact was
+            // written. Reporting a file path here would be a false delivery claim.
+            sb.append("\n⚠️ 审查结论为 PASS，但文档未能从磁盘读回：没有可交付的文件。")
+                    .append("请重跑写作阶段并确认 writeResearchDocument 落盘成功。\n");
         } else if (review != null && review.executionFailed()) {
             sb.append("\n⚠️ 审查输出在补审后仍不可用，文档质量未经验证；已保留产物，不据此触发内容返工。\n");
         } else if (review != null) {
@@ -544,28 +561,42 @@ public class ResearchWriteReviewWorkflow {
      * document — either way the reviewer sees whatever the writer actually said.</p>
      */
     private ReadBack readBack(String documentPath, String writerOutput) {
-        String content = readIfPresent(documentPath);
-        if (content != null) {
-            log.info("Read back the written document for review [{} chars, {}]", content.length(), documentPath);
-            return new ReadBack(documentPath, content, true);
-        }
+        String canonical = readIfPresent(documentPath);
+        String reported = extractDocumentPath(writerOutput);
 
         // The writer saved somewhere other than the fixed path. Review what it did
-        // write rather than giving up — the review is still worth running. The path
-        // that was actually read wins, so the report never names a file that does
-        // not exist.
-        String reported = extractDocumentPath(writerOutput);
+        // write rather than giving up — but only when that file is newer than the
+        // canonical one, otherwise this is a stale draft from an earlier round.
         if (reported != null && !reported.equals(documentPath)) {
-            content = readIfPresent(reported);
-            if (content != null) {
+            String reportedContent = readIfPresent(reported);
+            if (reportedContent != null
+                    && (canonical == null || isNewer(reported, documentPath))) {
                 log.warn("writer-agent saved to {} instead of the expected {}; reviewing that file",
                         reported, documentPath);
-                return new ReadBack(reported, content, true);
+                return new ReadBack(reported, reportedContent, true);
             }
+        }
+
+        if (canonical != null) {
+            log.info("Read back the written document for review [{} chars, {}]",
+                    canonical.length(), documentPath);
+            return new ReadBack(documentPath, canonical, true);
         }
 
         log.warn("No document found at {}; reviewing the writer's raw output instead", documentPath);
         return new ReadBack(documentPath, writerOutput, false);
+    }
+
+    /** True when {@code candidate} is newer than {@code reference}; unreadable mtimes lose. */
+    private static boolean isNewer(String candidate, String reference) {
+        try {
+            Path candidatePath = WorkspacePaths.resolveInsideInvestigation(candidate);
+            Path referencePath = WorkspacePaths.resolveInsideInvestigation(reference);
+            return Files.getLastModifiedTime(candidatePath)
+                    .compareTo(Files.getLastModifiedTime(referencePath)) > 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**

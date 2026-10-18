@@ -53,6 +53,42 @@ public class AgentGuardConfig {
     }
 
     /**
+     * Per-stage model-call ceilings for the remaining sub-agents. They run once per
+     * workflow round, but each run is still a ReAct loop: a malformed PDF or a
+     * reviewer that keeps re-reading pages can otherwise call the model indefinitely.
+     */
+    @Bean
+    public ModelCallLimitHook researchCallLimitHook(
+            @Value("${agent.guard.loop.max-model-calls-per-research:20}") int limit) {
+        return stageLimit(limit);
+    }
+
+    @Bean
+    public ModelCallLimitHook writerCallLimitHook(
+            @Value("${agent.guard.loop.max-model-calls-per-writer:12}") int limit) {
+        return stageLimit(limit);
+    }
+
+    @Bean
+    public ModelCallLimitHook reviewerCallLimitHook(
+            @Value("${agent.guard.loop.max-model-calls-per-reviewer:8}") int limit) {
+        return stageLimit(limit);
+    }
+
+    @Bean
+    public ModelCallLimitHook ragCallLimitHook(
+            @Value("${agent.guard.loop.max-model-calls-per-rag:6}") int limit) {
+        return stageLimit(limit);
+    }
+
+    private static ModelCallLimitHook stageLimit(int limit) {
+        return ModelCallLimitHook.builder()
+                .runLimit(limit)
+                .exitBehavior(ModelCallLimitHook.ExitBehavior.END)
+                .build();
+    }
+
+    /**
      * 子 Agent 的模型兜底：只重试，重试耗尽后把异常如实抛出（不返回兜底回答）。
      *
      * <p>为什么与主 Agent 不同：四个调研子 Agent 的产出会被落盘复用——analyst 的精读结果写进

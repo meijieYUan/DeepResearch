@@ -48,6 +48,20 @@ spring:
               url: ${MCP_EMAIL_URL:http://localhost:8081}
               sse-endpoint: /sse
 
+  # 心跳、审批清扫、checkpoint 清理共用调度器；单个线程被慢 SSE 写阻塞时
+  # 其余定时任务不应一起停摆。
+  task:
+    scheduling:
+      pool:
+        size: 4
+
+  # 知识库上传：前端限制 10MB，Spring Boot 默认 max-file-size 只有 1MB，
+  # 不显式放宽会让 1MB 以上的 PDF 直接失败（且错误发生在进入 Controller 之前）。
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 12MB
+
   # 数据源由 Spring Boot 自动配置装配（SaverConfig 不再手写 DataSource Bean）。
   # 凭据一律走环境变量，冒号后为本地开发默认值；生产部署必须显式设置 DB_PASSWORD。
   datasource:
@@ -63,10 +77,28 @@ mybatis-plus:
     db-config:
       id-type: auto
 
+app:
+  # 可选共享密钥；为空时保持本地无鉴权模式。设置后 /api/**（健康检查除外）
+  # 需要 Authorization: Bearer <token> 或 X-API-Token。
+  api-token: ${APP_API_TOKEN:}
+
 server:
   port: 8080
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      # No details without authentication; the aggregate status is enough.
+      show-details: never
+
 rag:
+  milvus:
+    host: ${MILVUS_HOST:localhost}
+    port: ${MILVUS_PORT:9090}
   retrieval:
     vector:
       top-k: 5
@@ -107,6 +139,13 @@ agent:
     # 对话/进度 SSE 流的生命周期上限（分钟）。超时只断开 HTTP 流，运行本身继续，
     # 答案仍会写入持久化历史。调研工作流可长达数十分钟，默认给到 60。
     timeout-minutes: 60
+  trace:
+    # 执行轨迹：run/model/tool 事件同时走 SSE（前端时间线）并落盘到 .trace/
+    enabled: true
+    # 每线程内存中保留的最近事件数（磁盘 JSONL 不受此限制）
+    max-events: 500
+    # 每线程保留的最近 run 文件数
+    retain-runs: 20
   progress:
     # 调研工作流的 SSE 进度推送（GET /api/chat/{threadId}/stream）
     # 心跳间隔：调研运行会在单次子 Agent 调用里停留数分钟，没有心跳时
@@ -175,3 +214,8 @@ agent:
       # analyst-agent 单篇精读的模型调用上限（paperAnalysisCallLimitHook 读取）。
       # 它在一个 Java 循环里被逐篇调用，某篇结构混乱的 PDF 会让它反复翻页不收敛。
       max-model-calls-per-paper: 8
+      # 其余子 Agent 的单次运行上限：它们每轮只跑一次，但单次运行仍是 ReAct 循环。
+      max-model-calls-per-research: 20
+      max-model-calls-per-writer: 12
+      max-model-calls-per-reviewer: 8
+      max-model-calls-per-rag: 6

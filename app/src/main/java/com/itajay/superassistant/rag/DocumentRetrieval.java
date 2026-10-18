@@ -1,5 +1,7 @@
 package com.itajay.superassistant.rag;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
 import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
@@ -9,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * 多路检索：向量检索（Milvus）+ BM25 关键字检索（Lucene），
@@ -16,6 +19,8 @@ import java.util.List;
  */
 @Component
 public class DocumentRetrieval {
+
+    private static final Logger log = LoggerFactory.getLogger(DocumentRetrieval.class);
 
     private final DocumentRetriever vectorRetriever;
     private final Bm25DocumentRetriever bm25Retriever;
@@ -45,8 +50,25 @@ public class DocumentRetrieval {
      * @return 融合后的候选文档列表
      */
     public List<Document> doRetrieve(Query query) {
-        List<Document> vectorDocs = vectorRetriever.retrieve(query);
-        List<Document> bm25Docs = bm25Retriever.retrieve(query);
+        // Each route degrades on its own. Calling them in sequence without a guard
+        // meant a Milvus outage also threw away BM25's results, even though keyword
+        // recall needs no external service.
+        List<Document> vectorDocs = retrieveSafely("vector", () -> vectorRetriever.retrieve(query));
+        List<Document> bm25Docs = retrieveSafely("bm25", () -> bm25Retriever.retrieve(query));
+        if (vectorDocs.isEmpty() && bm25Docs.isEmpty()) {
+            return List.of();
+        }
         return DocumentFusion.reciprocalRankFusion(List.of(vectorDocs, bm25Docs), fusionTopK, rrfK);
+    }
+
+    private static List<Document> retrieveSafely(String route, Supplier<List<Document>> call) {
+        try {
+            List<Document> documents = call.get();
+            return documents == null ? List.of() : documents;
+        } catch (Exception e) {
+            log.warn("{} retrieval failed; continuing with the remaining route(s): {}",
+                    route, e.getMessage());
+            return List.of();
+        }
     }
 }

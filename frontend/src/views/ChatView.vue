@@ -33,6 +33,16 @@
         </label>
       </div>
 
+      <div v-if="currentActivity" class="activity-bar">
+        <span :class="['activity-dot', { running: currentActivity.running }]"></span>
+        <span class="activity-label">
+          正在执行：{{ currentActivity.label }}
+          <span v-if="currentActivity.status" class="activity-status">· {{ currentActivity.status }}</span>
+        </span>
+        <span v-if="currentActivity.traceId" class="activity-trace"
+              :title="currentActivity.traceId">{{ shortTraceId(currentActivity.traceId) }}</span>
+      </div>
+
       <div class="chat-messages scrollbar" ref="msgContainer" @scroll="onScroll">
         <div v-if="messages.length === 0" class="empty-state">
           <div class="empty-icon"><MessageSquare :size="28" /></div>
@@ -70,11 +80,17 @@
             ref="inputRef"
             v-model="input"
             @keydown="onKeydown"
-            placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
-            :disabled="loading || !activeThreadId"
+            :placeholder="hasPendingApproval
+              ? '请先处理上方的高危操作审批'
+              : 'Type a message... (Enter to send, Shift+Enter for new line)'"
+            :disabled="loading || !activeThreadId || hasPendingApproval"
             rows="1"
           ></textarea>
-          <button class="btn-primary send-btn" @click="onSend" :disabled="!input.trim() || loading || !activeThreadId">
+          <button v-if="loading" class="btn-ghost stop-btn" @click="cancel" title="停止运行">
+            <Square :size="13" fill="currentColor" />
+          </button>
+          <button v-else class="btn-primary send-btn" @click="onSend"
+                  :disabled="!input.trim() || !activeThreadId || hasPendingApproval">
             <Send :size="16" />
           </button>
         </div>
@@ -84,8 +100,8 @@
 </template>
 
 <script setup>
-import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ArrowDown, MessageSquare, PanelLeftClose, PanelLeftOpen, Send } from 'lucide-vue-next'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ArrowDown, MessageSquare, PanelLeftClose, PanelLeftOpen, Send, Square } from 'lucide-vue-next'
 import MessageItem from '../components/MessageItem.vue'
 import TaskPanel from '../components/TaskPanel.vue'
 import ThreadSidebar from '../components/ThreadSidebar.vue'
@@ -93,6 +109,7 @@ import { useChatStream } from '../composables/useChatStream'
 import { useResizablePanel } from '../composables/useResizablePanel'
 import { useTasks } from '../composables/useTasks'
 import { useThreads } from '../composables/useThreads'
+import { traceCategoryLabel, traceNameLabel, traceStatusLabel } from '../utils/trace'
 
 // --- thread store: conversations, persistence, CRUD --------------------------
 const threadStore = useThreads()
@@ -100,6 +117,42 @@ const {
   threads, activeThreadId, activeThread, messages, threadList,
   saveThreads, newThread, switchThread, deleteThread
 } = threadStore
+
+// A pending approval owns the thread's run state server-side; a new message would
+// be rejected. Block composing here so the optimistic user turn is never written.
+const hasPendingApproval = computed(() =>
+  messages.value.some(m => Array.isArray(m.approvals)
+    && m.approvals.length > 0 && !m.approvalsSubmitted))
+
+// What is running right now, from the newest trace event of the streaming
+// bubble; falls back to the workflow's progress label before the first event.
+const currentActivity = computed(() => {
+  if (!loading.value) return null
+  const streaming = [...messages.value].reverse().find(m => m.streaming)
+  if (!streaming) return null
+  const trace = streaming.trace
+  if (Array.isArray(trace) && trace.length) {
+    const last = trace[trace.length - 1]
+    return {
+      label: `${traceCategoryLabel(last.category)} · ${traceNameLabel(last.name)}`,
+      status: traceStatusLabel(last.status),
+      running: last.status === 'STARTED',
+      traceId: streaming.traceId || last.traceId || ''
+    }
+  }
+  const activeRun = streaming.progress?.runs
+    ?.find(run => run.runId === streaming.progress.activeRunId)
+  return {
+    label: activeRun?.label || '等待模型响应',
+    status: activeRun ? '进行中' : '',
+    running: true,
+    traceId: streaming.traceId || ''
+  }
+})
+
+function shortTraceId(id) {
+  return id ? id.replace(/^tr-/, '').slice(0, 8) : ''
+}
 
 // --- task panel -------------------------------------------------------------
 const { taskList, refreshTasks } = useTasks({ activeThreadId })
@@ -124,7 +177,7 @@ const stream = useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown
 })
-const { loading, stopStream, send, submitApprovals } = stream
+const { loading, stopStream, cancel, send, submitApprovals } = stream
 
 // --- composer ---------------------------------------------------------------
 const input = ref('')
@@ -133,6 +186,9 @@ const inputRef = ref(null)
 function clearInput() { input.value = '' }
 
 function onKeydown(e) {
+  // Enter is also how an IME confirms a candidate (pinyin/kana/etc.). Sending on
+  // that keydown shipped half-composed text; keyCode 229 is the legacy signal.
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     onSend()
@@ -150,7 +206,7 @@ watch(input, adjustTextarea)
 
 function onSend() {
   const text = input.value.trim()
-  if (!text || loading.value || !activeThreadId.value) return
+  if (!text || loading.value || !activeThreadId.value || hasPendingApproval.value) return
   // Sending is an explicit "I'm following this" signal: re-pin to the bottom
   // even if the user had scrolled up to read earlier in the conversation.
   stickToBottom.value = true
@@ -251,6 +307,29 @@ onUnmounted(() => stopStream())
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* Live "what is running" strip, driven by trace events on the streaming bubble. */
+.activity-bar {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 7px 24px; font-size: 12px; color: var(--text2);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg2));
+  border-bottom: 1px solid var(--border);
+}
+.activity-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text2);
+}
+.activity-dot.running {
+  background: var(--accent);
+  animation: activityPulse 1.2s ease-in-out infinite;
+}
+@keyframes activityPulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+.activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-status { color: var(--text2); }
+.activity-trace {
+  margin-left: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; opacity: .7; flex-shrink: 0;
+}
+
 .chat-messages { flex: 1; overflow-y: auto; padding: 30px 24px 6px; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 10px; color: var(--text2); }
 .empty-icon {
@@ -293,6 +372,7 @@ onUnmounted(() => stopStream())
   line-height: 1.55; font-family: inherit; min-height: 38px; max-height: 200px;
 }
 .send-btn { padding: 9px; border-radius: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.stop-btn { padding: 9px; border-radius: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; color: var(--red); }
 
 .plan-toggle {
   display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12px;

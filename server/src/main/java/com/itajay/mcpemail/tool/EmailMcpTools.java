@@ -35,6 +35,9 @@ public class EmailMcpTools {
     /** 对外统一的失败话术：不回传底层异常细节，细节只写服务端日志。 */
     private static final String GENERIC_FAILURE = "Error: failed to send email. Please check the server logs for details.";
 
+    /** One approval must not turn into an unbounded mail blast. */
+    private static final int MAX_RECIPIENTS = 50;
+
     private final JavaMailSender mailSender;
     private final String senderAddress;
 
@@ -57,6 +60,9 @@ public class EmailMcpTools {
             recipients = parseAddresses(to);
             if (recipients.isEmpty()) {
                 return "Error: no valid recipient address provided.";
+            }
+            if (recipients.size() > MAX_RECIPIENTS) {
+                return "Error: too many recipients (max " + MAX_RECIPIENTS + ").";
             }
             ccList = parseAddresses(cc);
         } catch (IllegalArgumentException e) {
@@ -112,6 +118,9 @@ public class EmailMcpTools {
         }
         if (addresses.isEmpty()) {
             return "Error: no valid recipient address provided.";
+        }
+        if (addresses.size() > MAX_RECIPIENTS) {
+            return "Error: too many recipients (max " + MAX_RECIPIENTS + ").";
         }
 
         int ok = 0;

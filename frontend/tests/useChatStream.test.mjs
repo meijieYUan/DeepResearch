@@ -14,7 +14,7 @@ function setup(t) {
   t.after(() => scope.stop())
   const threads = ref({ A: { id: 'A', title: '', messages: [] }, B: { id: 'B', title: '', messages: [] } })
   const activeThreadId = ref('A'), planMode = ref(false), planActive = ref(false)
-  const requests = [], calls = { save: 0, refresh: 0, scroll: 0 }, frames = new Map()
+  const requests = [], cancels = [], calls = { save: 0, refresh: 0, scroll: 0 }, frames = new Map()
   let frame = 0
   const originalRAF = globalThis.requestAnimationFrame, originalCancel = globalThis.cancelAnimationFrame
   globalThis.requestAnimationFrame = callback => { const id = ++frame; frames.set(id, callback); return id }
@@ -24,10 +24,11 @@ function setup(t) {
   const stream = scope.run(() => useChatStream({ threads, activeThreadId, planMode, planActive,
     saveThreads: () => calls.save++, refreshTasks: () => calls.refresh++, scrollDown: () => calls.scroll++,
     requestChat: (id, text, mode, handlers, signal) => request('chat', id, { text, mode }, handlers, signal),
-    requestApproval: (id, decisions, handlers, signal) => request('approval', id, decisions, handlers, signal)
+    requestApproval: (id, decisions, handlers, signal) => request('approval', id, decisions, handlers, signal),
+    requestCancel: id => { cancels.push(id); return Promise.resolve() }
   }))
   const flush = () => { const pending = [...frames.values()]; frames.clear(); for (const fn of pending) fn() }
-  return { ...stream, threads, activeThreadId, planMode, planActive, requests, calls, frames, flush, scope }
+  return { ...stream, threads, activeThreadId, planMode, planActive, requests, cancels, calls, frames, flush, scope }
 }
 const bubble = (state, id = state.activeThreadId.value) => state.threads.value[id].messages.at(-1)
 
@@ -166,6 +167,65 @@ test('approval preserves the bubble snapshot and enforces loading + single-fligh
   s.requests[1].handlers.onDone(); s.requests[1].resolve(); await tick()
   assert.equal(s.submitApprovals(approval), false, 'cannot replay a submitted group')
   assert.equal(approval.progress.activeRunId, 'a')
+})
+
+test('a failed approval submission becomes retryable instead of locking the panel', async t => {
+  const s = setup(t)
+  s.send('hello', 'Default')
+  await tick()
+  const first = s.requests[0]
+  first.handlers.onInterruption({ message: 'approve', pendingApprovals: [{ toolId: 'tool', arguments: '{}' }] })
+  const approval = bubble(s)
+  approval.approvals[0].decision = 'APPROVED'
+  first.handlers.onDone(); first.resolve(); await tick()
+
+  assert.equal(s.submitApprovals(approval), true)
+  await tick()
+  // The approval connection fails before any frame: the server still holds the
+  // pending interruption, so the panel must be usable again.
+  s.requests[1].reject(new Error('network down'))
+  await tick()
+  assert.equal(approval.approvalsSubmitted, false)
+  assert.equal(s.submitApprovals(approval), true)
+  await tick()
+  assert.equal(s.requests.length, 3)
+  assert.equal(s.requests[2].kind, 'approval')
+})
+
+test('trace frames accumulate live and are bounded', async t => {
+  const s = setup(t)
+  s.send('hello', 'Default')
+  await tick()
+  const request = s.requests[0]
+  for (let i = 0; i < 205; i++) {
+    request.handlers.onTrace({
+      seq: i, timestamp: i, category: 'TOOL', name: 'readFile', status: 'STARTED',
+      detail: 'd'.repeat(600), traceId: 'tr-12345678'
+    })
+  }
+  await tick()
+  const live = bubble(s)
+  assert.equal(live.trace.length, 200)
+  assert.equal(live.trace[0].seq, 5)
+  assert.equal(live.trace[0].detail.length, 500)
+  assert.equal(live.traceId, 'tr-12345678')
+  assert.equal(live.trace[0].secret, undefined)
+})
+
+test('cancel asks the server to stop and settles the local stream', async t => {
+  const s = setup(t)
+  s.send('hello', 'Default')
+  await tick()
+  const request = s.requests[0], current = bubble(s)
+  request.handlers.onDelta({ text: 'partial' })
+
+  assert.equal(s.cancel(), true)
+  assert.deepEqual(s.cancels, ['A'])
+  assert.equal(request.signal.aborted, true)
+  assert.equal(s.loading.value, false)
+  assert.equal(current.transportStatus, 'stopped')
+  assert.equal(current.streaming, false)
+  assert.equal(s.cancel(), false)
 })
 
 test('stop/unmount clears pending RAF, flushes partial once and rejects all later handlers', async t => {

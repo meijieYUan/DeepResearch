@@ -1,10 +1,13 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.alibaba.cloud.ai.graph.agent.hook.modelcalllimit.ModelCallLimitHook;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.AnalysisReadTool;
 import com.itajay.superassistant.tool.PaperTextTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
+import com.itajay.superassistant.trace.TraceModelInterceptor;
+import com.itajay.superassistant.trace.TraceToolInterceptor;
 import com.itajay.superassistant.workflow.ReviewResult;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.stereotype.Component;
@@ -48,7 +51,10 @@ public class ReviewerAgent {
                          SkillResourceTool skillResourceTool,
                          PaperTextTool paperTextTool,
                          AnalysisReadTool analysisReadTool,
-                         ModelCallGuardInterceptor subAgentModelCallGuard) {
+                         ModelCallGuardInterceptor subAgentModelCallGuard,
+                         ModelCallLimitHook reviewerCallLimitHook,
+                         TraceToolInterceptor traceToolInterceptor,
+                         TraceModelInterceptor traceModelInterceptor) {
         this.reactAgent = ReactAgent.builder()
                 .name("reviewer-agent")
                 .description("调研文档质量审查 agent：按验收标准检查产出，输出结构化审批结论与修改意见。")
@@ -64,9 +70,9 @@ public class ReviewerAgent {
                         不要用你自己的领域知识去"纠正"文档——发现疑点时标记"需人工核对"，而不是直接判定文档错误。
 
                         第一步：先读取 skill 文件，它们是你的权威依据。用 readSkillResource 工具，两个参数都写死：
-                        - readSkillResource(skillName="research_writing_skill", relativePath="references/review-guide.md")
+                        - readSkillResource(skillName="research-writing", relativePath="references/review-guide.md")
                           —— 你的完整审查规程；
-                        - readSkillResource(skillName="research_writing_skill", relativePath="template/template.md")
+                        - readSkillResource(skillName="research-writing", relativePath="template/template.md")
                           —— 结构基准。
                         若无法读取，明确说明并停止，不要凭猜测审查。
 
@@ -139,7 +145,8 @@ public class ReviewerAgent {
                 // derives from the verdict anyway, so a reviewer that answered both inconsistently
                 // produced a self-contradicting verdict that the parse then silently overrode.
                 .outputType(ReviewResult.Payload.class)
-                .interceptors(subAgentModelCallGuard)
+                .hooks(reviewerCallLimitHook)
+                .interceptors(subAgentModelCallGuard, traceToolInterceptor, traceModelInterceptor)
                 .build();
     }
 }

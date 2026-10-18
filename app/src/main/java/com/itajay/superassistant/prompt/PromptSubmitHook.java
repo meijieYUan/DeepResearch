@@ -34,8 +34,14 @@ public class PromptSubmitHook extends ModelInterceptor {
 
     private static final Logger log = LoggerFactory.getLogger(PromptSubmitHook.class);
 
-    /** User memory file, maintained by {@code MemoryTool}. */
-    private static final Path MEMORY_FILE = Path.of(".memory", "MEMORY.md");
+    /**
+     * User memory file, maintained by {@code MemoryTool}. Anchored to the project
+     * root: a relative path would split memory into {@code app/.memory} or
+     * {@code .memory} depending on where the process was started.
+     */
+    private static final Path MEMORY_FILE =
+            com.itajay.superassistant.workspace.WorkspacePaths.root()
+                    .resolve(".memory").resolve("MEMORY.md");
 
     /** Request-context key carrying the thread id (set by the chat controller). */
     private static final String THREAD_ID_KEY = "threadId";

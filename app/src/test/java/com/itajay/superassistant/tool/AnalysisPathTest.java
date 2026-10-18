@@ -112,7 +112,7 @@ class AnalysisPathTest {
         for (String hostile : new String[]{
                 "../../etc/passwd",
                 "investigation/../../x",
-                "app/src/main/resources/skills/research_writing_skill/SKILL.md",
+                "app/src/main/resources/skills/research-writing/SKILL.md",
                 "..",
                 "   ",
                 null}) {

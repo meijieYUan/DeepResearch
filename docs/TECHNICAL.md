@@ -102,7 +102,7 @@
   **两个不显眼但致命的实现细节**（都是实测踩出来的）：
 
   1. **子 Agent 的产出必须从 `messages` 里取，不能读 `state.value("output")`。** 框架的 `AgentLlmNode` 只在配置了 `outputKey` 时才写该键，否则只写 `messages`。主 Agent 配了 `outputKey("output")`，四个子 Agent 没有——照抄主 Agent 的读法会让每个阶段都拿到空字符串，整条流水线在空输入上空转，且不报错。
-  2. **审查读的是磁盘上的文档，不是 writer 的回复。** writer 的正文是 `writeResearchDocument` 的**工具参数**，它的最终回复只是一句"已保存"。若把回复当作文档交给 reviewer，reviewer 面对的是空的审查对象，只能一律判 REVISE，闸门形同虚设。因此工作流自己按固定路径从磁盘读回正文；writer 若改了文件名，则回退到它自报的路径，报告里输出的始终是**实际被审查的那个路径**。
+  2. **审查读的是磁盘上的文档，不是 writer 的回复。** writer 的正文是 `writeResearchDocument` 的**工具参数**，它的最终回复只是一句"已保存"。若把回复当作文档交给 reviewer，reviewer 面对的是空的审查对象，只能一律判 REVISE，闸门形同虚设。因此**每一轮都先读规范路径**（上一轮自报的 stray 路径不会带到下一轮），读不到时才回退到 writer 自报的路径，且仅当它比规范文件更新；报告里输出的始终是**实际被审查的那个路径**。若最终审查 PASS 但没有任何文件落盘，报告会明确写"没有可交付的文件"，不再输出交付话术。
 
   内容修订输入同时提供上一轮从磁盘读回的旧稿正文（ReadBack）与实际路径；writer 以旧稿为底稿局部修改，不凭上一轮最终回复或记忆重建。失败篇目的单篇重试与按审查意见重做，都通过工具可选 `requirements` 原样转传原始 brief；局部 metadata 只作缺参兜底，审查问题放在独立 `reason` 中。
 
@@ -126,7 +126,7 @@
   ```
 
   设计取舍：`topic` 可选——已有论文沿用其所在课题（复用 analysis 与 figures），新落地默认以论文短名作课题方向；`classifySource`/`inferShortName` 把「本地文件 / URL / 短名」的判定和短名推断收敛在 `PaperDownloadTool` 的静态方法里，与获取顺序共用同一套口径。精读成功与否同样以**文件落盘**为准（`analyzeSingleSync`/`reanalyzeSync` 复用 `analyzeOne` 的 mtime 判定），报告如实给出来源等级、图数、审查结论与遗留问题。
-- **CreateAgentTool**：动态创建子 Agent 执行独立任务。
+- **CreateAgentTool**：动态创建子 Agent 执行独立任务；子 Agent 继承 thread/trace 上下文、挂 trace 拦截器与 6 次模型调用上限，结果从 `AssistantMessage` 读取（不依赖未配置的 `outputKey`），且不授予任何工具。
 
 > **注意**：早期的独立计划子系统（`PlanController` / `PlanService` / `PlanStepHook` / `plan_task` / `plan_step` 相关实体与 Mapper）及其前端页面（`PlanView.vue`、`/plans` 路由、`/api/plans/*` 调用）已全部移除。现在"计划"完全通过对话完成：Agent 在计划模式下与用户商量并写出计划，用户审核后由 `exitPlanMode` 退出并拆分为 Todo 任务；前端通过 Todo 接口展示任务进展。
 
@@ -173,7 +173,7 @@ L4 ContextCompactor      LLM 摘要（分块并行 + 总超时降级）+ 上下�
 | L1 | `ToolResultTruncator` | 单条结果 > 10K tokens：全文落盘 `.compact/tool_results/{threadId}/`，上下文内替换为 500 tokens 预览 + 文件指针 | 目录总量 > 512MB 时按最旧文件修剪 |
 | L2 | `ContextSnip` | ≥ 60 条消息才激活；移除连续重复 user 消息、瞬时错误（429 / timeout / 502-504 …）、低价值填充语 | 工具调用与工具结果**绝对保护**；最近 20 条消息保护 |
 | L3 | `MicroCompact` | 保留最近 5 个工具事务，更早事务仅替换**结果 payload**（保留 assistant 调用与 call id） | `ToolCallIntegrity` 保证不切断事务 |
-| L4 | `ContextCompactor` | 前缀交 LLM 总结（> 30K 字符自动分块，分块摘要 **4 路并行**后合并；总超时 5 分钟，超时/失败降级保留 L1–L3 结果），保留安全后缀 | 边界回退到工具事务起点，绝不切断调用/结果配对 |
+| L4 | `ContextCompactor` | 前缀交 LLM 总结（> 30K 字符自动分块，分块摘要 **4 路并行**后合并；分块与 merge 共享 5 分钟总 deadline，超时/失败降级保留 L1–L3 结果），保留安全后缀 | 每次压缩使用独立线程池并在 finally `shutdownNow`，挂起的模型调用不会占死后续压缩；边界回退到工具事务起点，绝不切断调用/结果配对 |
 
 **L4 产物**（写回图状态 → 随 checkpoint 持久化 → 供后续请求复用）：
 
@@ -216,7 +216,8 @@ Token 估算由 `TokenEstimator` 抽象，默认 `BpeTokenEstimator`（jtokkit O
 阶段 2: POST /api/chat/{threadId}/approve
   → 提交 decisions: [{toolId, result, editedArguments?}]
   → 请求先过前置校验（decisions 非空、每条含 toolId/result、EDITED 必带合法 JSON 的
-    editedArguments）——校验失败返回明确错误且**不丢弃待审批状态**，可修正后重试
+    editedArguments、toolId 必须属于本次待审批集合且不重复、每个待审批工具都必须有决策）
+    ——校验失败返回明确错误且**不丢弃待审批状态**，可修正后重试
   → 后端 HITLHelper.approveOneByOne() 逐条应用决策
   → RunnableConfig.addHumanFeedback() 注入 → Agent 恢复执行（在同一响应流上继续输出）
   → 链式中断自动处理（多个高危操作可连续触发审批）
@@ -239,10 +240,11 @@ Token 估算由 `TokenEstimator` 抽象，默认 `BpeTokenEstimator`（jtokkit O
 
 - 支持 PDF / Markdown / TXT / Java / Python / XML / JSON 等多格式文档导入
 - TokenTextSplitter：chunkSize=800，maxChunks=500
-- API：`POST /knowledge/upload`（multipart file）
+- API：`POST /api/knowledge/upload`（multipart file，上限 10MB；`spring.servlet.multipart.max-file-size`）、`GET /api/knowledge/documents`（来源 + chunk 数）、`DELETE /api/knowledge/documents?source=...`（同时删除 Milvus 与 BM25 中的该来源）
 - `RagHook` 通过 `ReplaceAllWith` 覆盖 `rag-agent` 的状态消息；历史上下文由 main-agent 持有，`rag-agent` 无独立 checkpoint
-- BM25 倒排索引持久化于 `rag.retrieval.bm25.index-path`（默认 `./data/bm25-index`）。读取走 Lucene `SearcherManager`（NRT，检索不再每次重开索引、读写不互斥）；每个 chunk 记录来源文件名，**同名文件重复导入先删旧 chunk 再写新**；索引写入失败会显式告警（向量库有、关键字库缺是双写不一致，不再静默）
-- 检索链路逐级降级：查询扩展失败退回原查询、单路召回失败只损失该路、精排失败退回融合候选——外部依赖故障不再拖垮整个 RAG 回答
+- BM25 倒排索引持久化于 `rag.retrieval.bm25.index-path`（默认 `./data/bm25-index`，相对路径锚定到项目根目录，不随启动目录漂移）。读取走 Lucene `SearcherManager`（NRT，检索不再每次重开索引、读写不互斥）；每个 chunk 记录来源文件名 **与 ingestion version**。同名文件重复导入时**先写新版本，成功后再删除旧版本**（Milvus 用 `source == X AND version != V` 过滤，BM25 用 `deleteBySourceExcept`），失败不会先毁掉旧文档；上传接口直接以字节读入并显式传入原始文件名。索引写入失败会显式告警并由上传接口返回失败
+- RAG 上下文按 chunk 标注 `[来源: 文件名]`，system prompt 要求回答时引用这些来源；来源文件名来自 chunk 的 `source_filename` 元数据，不是模型猜测
+- 检索链路逐级降级：查询扩展失败退回原查询、向量/BM25 两路各自 try/catch（单路故障只损失该路）、精排失败退回全部融合候选——外部依赖故障不再拖垮整个 RAG 回答
 
 ### 5. 持久记忆体系
 
@@ -254,7 +256,8 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | `recall` | 按关键词搜索记忆，按重要性排序返回 |
 | `listMemories` | 按类型分组列出全部记忆及容量使用情况 |
 | `deleteFact` | 按 ID 删除指定记忆 |
-| `consolidateMemories` | 清理低重要性（<4）记忆并重新编号，保持 ≤ 50 条预算 |
+| `consolidateMemories` | 清理低重要性（<4）记忆并修剪到 ≤ 50 条预算；**ID 保持稳定、不重新编号**（重新编号曾让 preference/project 共享的 `p` 前缀互相覆盖） |
+| 存储位置 | `.memory/` 锚定在项目根目录（`WorkspacePaths.root()`），从 `app/` 启动也不会分裂出第二份记忆 |
 
 记忆档案由 `PromptSubmitHook` 在**每次模型调用前**注入 system message（非 messages 列表，上限 3000 字符），因此记忆更新下一轮即生效，且不会写入 checkpoint 或前端历史。
 
@@ -279,14 +282,15 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | 工具 | 能力 |
 |---|---|
 | **TodoTool** | `todoWrite(objective)` LLM 拆解并持久化；`createTask` / `startTask` / `completeTask` / `updateTodo` / `deleteTodo` / `getReadyTasks` / `queryTodos`。所有操作绑定当前会话 `threadId`（`createTask`、`queryTodos` 从 `ToolContext` 解析，不由模型传入） |
-| **WebSearchTool** | DuckDuckGo HTML 搜索（无需 API Key），解析 top 8 结果；`webCrawl(url)` Jsoup 抓取全文，> 8K 字符自动截断 |
+| **WebSearchTool** | Bing HTML 搜索（`cn.bing.com`，无需 API Key），解析 top 8 结果；`webCrawl(url)` 抓取全文，> 8K 字符自动截断。URL 经 `UrlSafety` 校验（仅 http/https，拒绝环回/私网/链路本地/ULA/云元数据地址），重定向逐跳复验，响应体上限 5MB |
+| **AcademicSearchTool** | `searchArxiv(query, maxResults)` 调 arXiv Atom API；`searchSemanticScholar(query, maxResults)` 调 Semantic Scholar Graph API。返回标题、作者、年份/会议、引用量、摘要与 abs/PDF 链接；固定主机、只对 query 做 URL 编码，`maxResults` 夹取 1-25。**仅 `research-agent` 使用** |
 | **FileOperationTool** | `readFile` / `writeFile` / `createFile` / `deleteFile` / `listFiles`，路径限制在 workspace 内 |
 | **MemoryTool** | `remember` / `recall` / `listMemories` / `deleteFact` / `consolidateMemories` |
 | **PlanTool** | `enterPlanMode` / `exitPlanMode` |
 | **TerminalTool** | `executeCommand`（纳入 HITL 审批）。工作目录强制限定在 workspace 内（绝对路径/`..` 逃逸被拒）；输出泵在独立线程、30s 超时可靠生效；计划模式的"只读命令"判定拒绝一切 shell 操作符（管道/重定向/命令替换）与 `find -delete`、`git config <key> <value>` 等变相写入 |
-| **CreateAgentTool** | 动态创建子 Agent 执行独立任务 |
+| **CreateAgentTool** | 动态创建子 Agent 执行独立任务；继承 trace/thread、6 次模型调用上限、无工具（计划模式下隐藏）。结果读 `AssistantMessage` 文本 |
 | **SkillResourceTool** | `readSkillResource`，只读读取 skill 的参考文件（路径限定在 skills 目录内），供子 Agent 加载参考指南 |
-| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用**。另有工作流面的 `acquirePaper`（非 @Tool）：按「本地文件 → 本课题已有 → 其他课题复制 → URL 下载」的顺序把论文弄进 `papers/`，返回结构化 `AcquireResult`（含来源枚举，供报告如实说明是否复用了本地文件） |
+| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，重定向手动跟随且**逐跳**做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播/ULA/云元数据地址时拒绝；响应体流式读取并受 `max-pdf-bytes` 限制，不会先整包缓冲）。**仅 `research-agent` 使用**。另有工作流面的 `acquirePaper`（非 @Tool）：按「本地文件 → 本课题已有 → 其他课题复制 → URL 下载」的顺序把论文弄进 `papers/`，返回结构化 `AcquireResult`（含来源枚举，供报告如实说明是否复用了本地文件） |
 | **PaperTextTool** | `extractPaperText` / `listDownloadedPapers`，读取已下载 PDF 的正文（支持分页、超长截断）。**`analyst-agent` 与 `reviewer-agent` 使用** |
 | **PaperFigureTool** | `extractPaperFigures`，取出 PDF 里**原生嵌入的图片**并落盘为 PNG，**同时返回两种相对路径**（写进 analysis 文件的 `figures/…` 与写进文档的 `../analysis/figures/…`）。**仅 `analyst-agent` 使用** |
 | **DocumentWriteTool** | `writeResearchDocument`，把调研文档写入 `investigation/{课题方向}/document/`（仅限该目录、仅 Markdown） |
@@ -314,13 +318,13 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 
 **MCP 工具**（独立 Email Server :8081）：`sendEmail` / `sendEmailBatch`（纳入 HITL 审批）
 
-**已实现但未挂载**：`DateTimeTool`（`getCurrentDateTime` / `dateDifference` / `dateAdd`）、`WeatherTool`（`getWeather`）。两者均为 `@Component`，如需启用在 `AgentConfig` 的 `methodTools(...)` 中追加即可。
+`DateTimeTool`（`getCurrentDateTime` / `dateDifference` / `dateAdd`）与 `WeatherTool`（`getWeather`，wttr.in）已挂载到 main-agent；两者无副作用、不需要 HITL。
 
 ### 8. Agent Skills
 
 [SkillConfig](../app/src/main/java/com/itajay/superassistant/skill/SkillConfig.java) 通过 ClasspathSkillRegistry 加载 skills：
 
-- `research_writing_skill`：科研论文调研与文献综述撰写。自动检索 arXiv / Semantic Scholar / Google Scholar，下载 4-8 篇相关论文，逐篇精读提取方法框架/创新点/训练目标并落盘，按模板生成**对比型**调研文档并经质量审查。
+- `research-writing`：科研论文调研与文献综述撰写。自动检索 arXiv / Semantic Scholar / Google Scholar，下载 4-8 篇相关论文，逐篇精读提取方法框架/创新点/训练目标并落盘，按模板生成**对比型**调研文档并经质量审查。
 
 skill 采用渐进式披露（progressive disclosure）拆分：
 
@@ -339,8 +343,10 @@ skill 采用渐进式披露（progressive disclosure）拆分：
 
 四个子 Agent 通过 `SkillResourceTool`（只读、路径限定在 skills 目录内）读取上述参考文件，无需授予通用文件工具，避免绕过主 Agent 的 HITL 审批。
 
-**四个子 Agent 刻意不挂 `SkillsAgentHook`。** 该 Hook 会额外注册一个框架自带的 `read_skill` 工具，它按 skill 的 frontmatter 名（`research-writing`，注意与目录名 `research_writing_skill` 不同）查找，且只返回 `SKILL.md`，够不到 `references/*.md`——正是子 Agent 真正需要的文件。两个命名口径不同、能力重叠的"读 skill"工具并列时，模型会开始猜：实测日志里出现了 `Skill not found: reviewer` / `reviewer_skill` / `reviewer-agent` 三次失败调用。现在每个子 Agent 的指令里直接写死唯一正确的调用
-`readSkillResource(skillName="research_writing_skill", relativePath="references/xxx.md")`。主 Agent 仍保留该 Hook，用于技能发现。
+**skill 从 classpath 加载，不依赖启动目录。** `SkillConfig` 使用 `ClasspathSkillRegistry` 扫描 `classpath:skills`；此前用的 `FileSystemSkillRegistry` 写死相对路径 `app/src/main/resources/skills`，而 `mvn -pl app spring-boot:run` 的工作目录是 `app/`，实际找的是 `app/app/src/main/resources/skills`，启动日志会显示 `Skills reloaded: 0 total skills`，主 Agent 因此声称"没有 skill"。`SKILL.md` 的 frontmatter `name` 与目录名现已统一为 `research-writing`（Agent Skills 规范要求小写字母+单个连字符且与目录名一致），启动日志应显示 `Loaded 1 skills from classpath: skills`；框架会把技能文件物化到 `.cache/skills/` 供读取。
+
+**四个子 Agent 刻意不挂 `SkillsAgentHook`。** 该 Hook 会额外注册一个框架自带的 `read_skill` 工具，它按 skill 的 frontmatter 名（`research-writing`，现与目录名一致）查找，且只返回 `SKILL.md`，够不到 `references/*.md`——正是子 Agent 真正需要的文件。两个能力重叠的"读 skill"工具并列时，模型会开始猜：实测日志里出现过 `Skill not found: reviewer` / `reviewer_skill` / `reviewer-agent` 等失败调用。现在每个子 Agent 的指令里直接写死唯一正确的调用
+`readSkillResource(skillName="research-writing", relativePath="references/xxx.md")`。主 Agent 仍保留该 Hook，用于技能发现。
 
 ### 9. 运行流式输出与调研进度推送（SSE）
 
@@ -350,10 +356,11 @@ skill 采用渐进式披露（progressive disclosure）拆分：
 
 ```
 progress      工作流阶段进度（由工具经 ProgressChannelRegistry 扇入）
+trace         执行轨迹事件（run/model/tool，见 §11）
 delta         模型增量文本（逐 token）
-answer        运行完成的最终回答 { threadId, text, planEnabled, planActive }
-interruption  高危操作待审批 { pendingApprovals: [...] }（见 §3）
-error         运行失败 { message }
+answer        运行完成的最终回答 { threadId, text, planEnabled, planActive, traceId }
+interruption  高危操作待审批 { pendingApprovals: [...], traceId }（见 §3）
+error         运行失败 { message, traceId }
 done          终止标记，随后服务端关流
 ```
 
@@ -361,7 +368,9 @@ done          终止标记，随后服务端关流
 
 - `ChatStreamingService` 保证**同一 threadId 同时只有一个运行**（第二个请求立即得到 error+done）；运行在**有界线程池**（上限 16 个并发运行）上执行，超限明确拒绝而非无界堆积。用户消息只在运行被接受后才落库——被拒请求不再污染对话历史。
 - 流超时由 `agent.stream.timeout-minutes` 配置（默认 60 分钟，须覆盖最长的调研运行）。超时只断开 HTTP 流，**运行本身继续**，答案仍写入持久化历史。
-- `ProgressChannelRegistry` 按 threadId 维护监听列表，`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。
+- `ProgressChannelRegistry` 按 threadId 维护监听列表，`@Scheduled` 每 15s 发注释心跳保活，避免代理或浏览器掐掉空闲连接。**连接数有界**（每 thread 4 个、全局 200 个），超限的监听器被拒绝；调度线程池已从默认 1 调为 4，避免一个慢心跳拖住审批清扫与 checkpoint 清理。
+- **SSE 写入异步化**：`AsyncSseEmitter` 为每个连接维护 256 条有界队列 + 一条虚拟发送线程。慢客户端只会把队列填满（随后该 listener 被丢弃），不会再阻塞 agent 运行线程或心跳线程；`done` 也走队列，保证在关闭前写出。
+- **运行可取消**：`POST /api/chat/{threadId}/cancel` 会 dispose 模型流、完成等待中的 Future，并中断运行线程（阻塞工具如终端命令会响应中断）。取消发生在图状态中间时会留下不完整的 checkpoint，下一次运行会收到 DeepSeek 400，因此取消后会删除该 thread 的 graph checkpoint（`ThreadStateResetService`，按 `thread_name` 找到 saver UUID，同时清理内存缓存与 DB 行）；可见聊天记录在 `custom_chat_memory`/前端，不受影响，但 agent 的隐藏续接上下文会重置。前端运行期间显示停止按钮，点击后调用该接口并本地结算气泡；线程切换/离开页面仍只断开客户端流，不取消后台调研。
 - 阶段枚举：`RESEARCHING` / `ANALYZING` / `WRITING` / `REVIEWING` / `REVISING` / `DONE` / `FAILED`，事件体为 `ProgressEvent{stage, label, round, detail, timestamp}`。`ANALYZING`（"正在精读论文"）用于单篇精读工作流；收尾事件可用 `ProgressEvent.of(stage, round, detail, label)` 自定义显示文案（如「精读完成/精读失败」），**stage 枚举名不变**——前端以 `stage == 'FAILED'` 判定失败。
 - 推送是**尽力而为**：没有客户端监听时 `publish` 是 no-op，客户端中途断开只是摘除该 emitter——**工作流绝不因无人监听而失败**。
 - 连接关闭前会先发一个 `done` 事件。少了它，客户端会把"正常关闭"当作掉线，为一个已经结束的运行重开连接。前端另有无 `done` 兜底：流意外关闭时气泡退出 streaming 并标记「连接中断，回答可能不完整」。
@@ -405,7 +414,67 @@ done          终止标记，随后服务端关流
 
 `MAIN_AGENT_INSTRUCTION` 中同时内置"安全规则"（禁止破坏性命令、提权、数据外泄等）与"健壮性/终止规则"（避免重复调用、及时停止、错误优雅处理）以配合上述防护。
 
-**上表中的 hook/interceptor 只注册在 `mainAgent` 上，`analyst-agent` 是唯一例外。** 其余三个子 Agent 每轮只跑一次，无上限不构成风险；但批量精读会在 Java 里（默认 4 路并行）调用 analyst N 次，每次都是一次**无上限**的运行——一篇结构混乱的 PDF 足以让某一篇反复翻页不收敛，而外层还会继续处理其余论文。因此 `AgentGuardConfig` 额外提供 `paperAnalysisCallLimitHook`（`agent.guard.loop.max-model-calls-per-paper`，默认 8，`.exitBehavior(END)` 终止该篇而非整批），并且批量精读对单篇失败做隔离——**一篇失败不中断整批**，如实记入最终索引的失败列；writer 可用 `analyzePapers(topic, 短名)` 对失败篇目单篇重试。
+**LoopGuard 按 run 计数并在运行结束时清理**：`totalCalls` / `identicalCalls` 的 key 优先取 `RunnableConfig` 里的 `runId`（没有才退回 threadId），`TraceService` 在运行结束发布 `RunFinishedEvent`，拦截器据此删除该 run 的全部计数。这样长期对话不会在累计 60 次工具调用后被永久短路，fingerprint map 也有 20k 条上限兜底。
+
+**子 Agent 也都有模型调用上限**：除了 `analyst` 的单篇 8 次，research / writer / reviewer / rag 分别默认 20 / 12 / 8 / 6 次（`agent.guard.loop.max-model-calls-per-*`）；`CreateAgentTool` 动态子 Agent 固定 6 次。
+
+**上表中的 hook/interceptor 只注册在 `mainAgent` 上；子 Agent 的循环防护是独立的一套。** 每个子 Agent 都有模型调用上限（analyst 单篇 8 次；research 20、writer 12、reviewer 8、rag 6），以 `.exitBehavior(END)` 结束该次运行而不是抛错拖垮整条流水线。批量精读还会对单篇失败做隔离——**一篇失败不中断整批**，如实记入最终索引的失败列；writer 可用 `analyzePapers(topic, 短名)` 对失败篇目单篇重试。
+
+### 11. 执行轨迹与结构化日志
+
+一次运行的所有日志与事件共享一个 **traceId**，定位问题时只需拿一个 id 去 grep：模型调用、工具调用、异步精读 lane、工作流阶段和最终错误都会带上它。
+
+**标识传播**
+
+- `TraceFilter` 为每个 HTTP 请求确定 traceId：优先使用调用方传入的 `X-Trace-Id`（仅接受 8–64 位安全字符），否则生成 `tr-<16 hex>`；同时写入响应头和 SLF4J `MDC`。
+- 聊天运行在独立线程池执行，`ChatStreamingService` 为每次运行生成 `runId` 并打开 `TraceContext` 作用域（traceId/threadId/runId 同时进入 MDC）；traceId 与 runId 也写入 `RunnableConfig.context()`，供工具/模型拦截器在丢失 ThreadLocal 时回退读取。
+- 审批恢复会沿用中断前 `RunnableConfig` 里的 traceId，因此「初稿 → 审批 → 恢复执行」仍是同一条链路。
+- 并行精读（`PaperAnalysisTool`）与压缩分块（`ContextCompactor`）的线程池任务用 `TraceContext.wrapCallable/wrapSupplier` 包装，MDC 不会断。
+
+**轨迹事件**
+
+| Category | 产生位置 | 记录内容 |
+|---|---|---|
+| `RUN` | `ChatStreamingService` | 运行开始/结束、耗时、结果（answer / interruption / error） |
+| `MODEL` | `TraceModelInterceptor` | 每次模型调用的消息数、工具数、耗时、成功/失败；不记录提示词与回答正文 |
+| `TOOL` | `TraceToolInterceptor` | 工具名、脱敏截断后的参数与结果、耗时、成功/失败 |
+
+`TraceEvent{traceId, threadId, runId, seq, timestamp, category, name, status, durationMs, detail, attributes}`。参数/结果最多 300 字符，`password/token/secret/authorization/api_key` 等字段会被替换为 `***`；`writeFile` 这类大参数不会被完整写入轨迹。
+
+**三种消费方式**
+
+1. **SSE**：每次事件作为 `trace` 帧推送到当前聊天流，前端在气泡内渲染「执行轨迹」时间线，并在顶部显示「正在执行：工具 · readFile / 模型 · 模型生成」的实时状态条。
+2. **API**：`GET /api/chat/{threadId}/trace` 返回最近一次运行的 `TraceSnapshot`；内存环形缓冲（默认 500 条）没有数据时（进程重启后）自动读取最新的 JSONL 文件。
+3. **磁盘**：`.trace/{threadId}/{runId}.jsonl`，一行一个事件；每线程保留最近 `retain-runs` 份。`.trace/` 与 `logs/` 均已加入 `.gitignore`。
+
+**日志**
+
+`logback-spring.xml` 同时输出控制台和 `logs/app.log`（50MB 滚动、保留 7 天、总量 500MB），格式为：
+
+```
+2026-10-18 01:00:00.123 INFO  [trace=tr-0123456789abcdef] [thread=abc] [run=...] [chat-stream] c.i...ChatStreamingService - ...
+```
+
+排查某个会话时，先在前端轨迹面板复制 trace id，再 `grep 'tr-0123456789abcdef' logs/app.log`；若要 JSON 化投递到采集系统，可直接读取 `.trace/` 下的 JSONL。
+
+**Micrometer 指标**（`/actuator/metrics` 可查）：
+
+| 指标 | 标签 | 含义 |
+|---|---|---|
+| `agent.runs` | `status` | 运行次数（按 SUCCEEDED/FAILED/INFO） |
+| `agent.run.duration` | — | 运行耗时 |
+| `agent.tool.calls` / `agent.tool.duration` | `name`、`status` | 工具调用次数/耗时 |
+| `agent.model.calls` / `agent.model.duration` | `status` | 模型调用次数/耗时 |
+| `agent.model.tokens` | `kind=prompt/completion` | 模型 token 计数（来自 provider usage） |
+
+**配置**
+
+```yaml
+agent.trace:
+  enabled: true        # 关闭后不记录、不推送、不落盘
+  max-events: 500      # 每线程内存环形缓冲
+  retain-runs: 20      # 每线程保留的 JSONL 份数
+```
 
 ## 技术栈
 
@@ -443,8 +512,9 @@ DeepResearchAgent/
 │       ├── composables/           # useThreads（会话+持久化）· useChatStream（SSE 生命周期）
 │       │                          # useTasks（任务面板）· useResizablePanel（拖拽，两视图共用）
 │       ├── components/            # ThreadSidebar · MessageItem（markdown 渲染缓存）
+│       │                          # ExecutionTrace（执行轨迹时间线）· ResearchProgress
 │       │                          # ApprovalPanel（HITL 审批）· TaskPanel · ToastHost
-│       ├── utils/{markdown.js,toast.js,id.js}   # hljs 按需注册 · toast 去重 · 稳定 id
+│       ├── utils/{markdown.js,toast.js,id.js,trace.js}  # 渲染/提示/ID · 轨迹清洗与标签
 │       └── views/
 │           ├── ChatView.vue       # 对话界面（组合 composables 与子组件）
 │           └── KnowledgeView.vue  # 知识库上传管理（前端校验 + input 重置）
@@ -456,7 +526,7 @@ DeepResearchAgent/
 │       │   ├── SuperAssistant.java       # 核心 API：对话 + HITL 审批（请求校验，响应即 SSE 流）
 │       │   ├── ChatStreamingService.java # 单次运行的流式执行（有界线程池，同 thread 串行）
 │       │   ├── TodoController.java       # Todo REST API
-│       │   ├── RagController.java        # 知识库文件上传 (/knowledge/upload)
+│       │   ├── RagController.java        # 知识库上传/列表/删除 (/api/knowledge/*)
 │       │   └── HealthController.java     # 健康检查 (/api/health)
 │       ├── config/                # Spring 配置
 │       │   ├── AgentConfig.java          # main-agent 组装 + Hooks/Interceptors 注册 + 系统提示词
@@ -483,8 +553,11 @@ DeepResearchAgent/
 │       │   ├── BpeTokenEstimator.java    # jtokkit O200K BPE 实现
 │       │   ├── HeuristicTokenEstimator.java  # 启发式回退
 │       │   └── TokenBudgets.java         # token 预算内二分截断
+│       ├── health/                # Actuator 健康指示器
+│       │   └── MilvusHealthIndicator.java  # /actuator/health 中的向量库探针
 │       ├── checkpoint/            # checkpoint 生命周期管理
-│       │   └── CheckpointRetentionService.java  # 定时清理过期 checkpoint
+│       │   ├── CheckpointRetentionService.java  # 定时清理过期 checkpoint
+│       │   └── ThreadStateResetService.java     # 取消运行后重置该 thread 的图状态
 │       ├── agent/                 # 专业子 Agent
 │       │   ├── ResearchAgent.java        # 研究 Agent：搜索 + 相关性判定 + PDF 下载（不精读）
 │       │   ├── AnalystAgent.java         # 精读 Agent：逐篇读正文 + 四维提取 + 落盘（一次一篇）
@@ -514,13 +587,15 @@ DeepResearchAgent/
 │       │   ├── CustomJdbcChatMemoryRepository.java  # 自研对话记忆仓库
 │       │   └── ModelMessagePersistenceHook.java     # AFTER_MODEL 回答持久化
 │       ├── security/              # HITL 人工审批
+│       │   ├── UrlSafety.java             # SSRF 防护（下载/抓取共用的出站地址校验）
+│       │   ├── ApiTokenFilter.java        # 可选共享密钥（APP_API_TOKEN）
 │       │   ├── HITLHelper.java            # 审批决策工具（逐一/全部/编辑参数）
 │       │   ├── ApprovalDecision.java      # 审批决策 DTO
 │       │   ├── PendingApproval.java       # 待审批项 DTO（前端渲染）
 │       │   └── PendingInterruptionStore.java  # 中断状态暂存
 │       ├── tool/                  # Agent 工具
 │       │   ├── TodoTool.java              # 待办 CRUD
-│       │   ├── WebSearchTool.java         # DuckDuckGo + Jsoup
+│       │   ├── WebSearchTool.java         # Bing + Jsoup（URL 经 UrlSafety）
 │       │   ├── FileOperationTool.java     # 文件读写/创建/删除/列表
 │       │   ├── MemoryTool.java            # 持久记忆
 │       │   ├── PlanTool.java              # 计划模式入口/出口
@@ -536,14 +611,25 @@ DeepResearchAgent/
 │       │   ├── AnalysisStore.java         # 精读文件的路径解析、清单与文件头解析
 │       │   ├── PaperAnalysisTool.java     # analyzePapers / reanalyzePaper（writer-agent 用）
 │       │   ├── DocumentWriteTool.java     # 调研文档落盘（writer-agent 用）
-│       │   ├── DateTimeTool.java          # 日期时间（未挂载）
-│       │   └── WeatherTool.java           # 天气查询（未挂载）
+│       │   ├── DateTimeTool.java          # 日期时间
+│       │   ├── WeatherTool.java           # 天气查询
+│       │   └── AcademicSearchTool.java    # arXiv / Semantic Scholar 结构化检索
 │       ├── workflow/              # Agent 工作流
+│       │   ├── TopicLocks.java            # 同课题并发互斥
 │       │   ├── ResearchWriteReviewWorkflow.java # 研究→精读→写作→审查闭环（含三分路由的修订）
 │       │   ├── PaperDeepReadWorkflow.java # 单篇精读闭环（获取→精读→审查→重做，只交付 analysis）
 │       │   ├── AnalysisInventory.java     # 精读/图片清单渲染（两条工作流共用）
 │       │   └── ReviewResult.java          # 审查结论解析（容错，解析失败按未通过处理）
+│       ├── trace/                 # 执行轨迹与日志关联
+│       │   ├── TraceContext.java         # MDC/ThreadLocal 的 traceId/threadId/runId
+│       │   ├── TraceFilter.java          # X-Trace-Id 透传/生成 + 响应头
+│       │   ├── RunFinishedEvent.java     # 运行结束事件（清理 run 级状态）
+│       │   ├── TraceService.java         # 事件采集、SSE 推送、JSONL 落盘与读取
+│       │   ├── TraceToolInterceptor.java # 工具调用轨迹（参数脱敏/截断）
+│       │   ├── TraceModelInterceptor.java# 模型调用轨迹（不含正文）
+│       │   └── TraceSanitizer.java       # 密钥脱敏与摘要
 │       ├── progress/              # 工作流进度推送
+│       │   ├── AsyncSseEmitter.java       # 有界队列 + 虚拟线程异步发送
 │       │   ├── ProgressStage.java         # 阶段枚举 + 中文 label
 │       │   ├── ProgressEvent.java         # SSE 事件体
 │       │   └── ProgressChannelRegistry.java # 按 threadId 维护 SseEmitter + 心跳
@@ -561,11 +647,12 @@ DeepResearchAgent/
 │       │   └── SkillConfig.java           # ClasspathSkillRegistry
 │       └── resources/
 │           ├── application.yml
+│           ├── logback-spring.xml         # 控制台 + logs/app.log，含 trace/thread/run
 │           ├── sql/
 │           │   ├── todo_task.sql          # todo_task 表
 │           │   └── custom_chat_memory.sql # custom_chat_memory 表
 │           └── skills/
-│               └── research_writing_skill/
+│               └── research-writing/
 │                   ├── SKILL.md                       # 主流程（自动加载）
 │                   ├── references/                    # 子 Agent 参考指南（按需读取）
 │                   │   ├── research-guide.md          # 检索/相关性判定/下载/输出契约
@@ -585,7 +672,7 @@ DeepResearchAgent/
             └── EmailMcpTools.java        # sendEmail / sendEmailBatch
 ```
 
-测试位于 `app/src/test/`：覆盖压缩阈值/估算器/截断器/Snip/MicroCompact/文件状态、`PromptSubmitHook`、checkpoint 保留策略、调研产出的路径规则（`WorkspacePathsTest` / `AnalysisPathTest`）、审查结论的解析与三分路由（`ReviewResultTest`）等。`PaperFigureToolTest` 与 `PaperTextToolTest` 用 PDFBox **构造真 PDF** 作 fixture（真嵌入图、真解码），验证落盘位置、两种相对路径形态、小图过滤、同调用内去重、页码夹取、越界与敌意输入被拒、重跑幂等。其余子 Agent 的"是否真的落盘/读回"需要活的模型，由端到端验证覆盖，不做单测。
+测试位于 `app/src/test/`：覆盖压缩阈值/估算器/截断器/Snip/MicroCompact/文件状态、`PromptSubmitHook`、checkpoint 保留策略、调研产出的路径规则（`WorkspacePathsTest` / `AnalysisPathTest`）、审查结论的解析与三分路由（`ReviewResultTest`）、知识库上传路由与原始文件名（`RagControllerTest`）、记忆 ID/预算（`MemoryToolTest`）、出站 URL 安全（`UrlSafetyTest`）、跨轮次旧稿回退（`ResearchWriteReviewWorkflowTest`）、trace 上下文/落盘/工具事件脱敏（`TraceContextTest` / `TraceServiceTest` / `TraceToolInterceptorTest`）、run 级循环防护（`LoopGuardToolInterceptorTest`）、同课题互斥（`TopicLocksTest`）、取消（`ChatStreamingServiceTest`）、arXiv/Semantic Scholar 解析（`AcademicSearchToolTest`）、知识库版本替换/引用（`Bm25IndexSourceTest` / `RagHookContextTest`）、可选 Token（`ApiTokenFilterTest`）等。`PaperFigureToolTest` 与 `PaperTextToolTest` 用 PDFBox **构造真 PDF** 作 fixture（真嵌入图、真解码），验证落盘位置、两种相对路径形态、小图过滤、同调用内去重、页码夹取、越界与敌意输入被拒、重跑幂等。其余子 Agent 的"是否真的落盘/读回"需要活的模型，由端到端验证覆盖，不做单测。
 
 ## API 参考
 
@@ -597,7 +684,9 @@ DeepResearchAgent/
 |--------|------|---------|----------|
 | POST | `/api/chat/{threadId}` | `{"message":"...", "mode":"Default|PlanMode"}` | `text/event-stream`：`progress` / `delta` / 终止事件（`answer` \| `interruption` \| `error`）/ `done` |
 | POST | `/api/chat/{threadId}/approve` | `{"decisions":[{"toolId","result","description?","editedArguments?"}]}` | 同 chat 流格式（恢复的运行继续在本流上输出） |
-| GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，调试用进度旁路监听（`progress` / `done`） |
+| POST | `/api/chat/{threadId}/cancel` | — | `{"cancelled":true/false}`；dispose 模型流、中断运行线程并释放 thread 槽 |
+| GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，调试用进度旁路监听（`progress` / `trace` / `done`） |
+| GET | `/api/chat/{threadId}/trace` | — | 最近一次运行的 `TraceSnapshot{traceId,runId,startedAt,endedAt,events[]}` |
 
 `answer` / `interruption` 事件体中包含 `planEnabled` / `planActive` 字段反映计划模式状态。无法开始的请求（会话占用中、消息为空/过长、审批悬置时发新消息、decisions 校验失败、并发已达上限）同样以 `error` + `done` 事件流返回，HTTP 状态保持 200——状态行无法承载逐运行的语义。
 
@@ -605,7 +694,9 @@ DeepResearchAgent/
 
 | Method | Path | Request | Response |
 |--------|------|---------|----------|
-| POST | `/knowledge/upload` | multipart `file` | `{success:true, chunks:12, filename:"..."}` |
+| POST | `/api/knowledge/upload` | multipart `file`（≤10MB） | `{success:true, chunks:12, filename:"..."}`；失败为 HTTP 200 + `{success:false, error:"..."}` |
+| GET | `/api/knowledge/documents` | — | `{documents:[{source,chunks}]}` |
+| DELETE | `/api/knowledge/documents?source=...` | query `source` | `{success:true, source, deletedChunks}`；同时删除 Milvus 与 BM25 内容 |
 
 ### Todo
 
@@ -624,7 +715,8 @@ DeepResearchAgent/
 
 | Method | Path | Response |
 |--------|------|----------|
-| GET | `/api/health` | 健康状态 |
+| GET | `/api/health` | 进程存活探针（静态 `UP`，供前端状态灯使用） |
+| GET | `/actuator/health` | 聚合健康状态：数据库（JDBC）+ `milvus` 指示器；`show-details=never` |
 
 ### MCP Email Server
 
@@ -652,6 +744,20 @@ SMTP_PASSWORD=xxxxxxxx          # 邮箱 SMTP 密码（MCP Email Server）
 spring.ai.deepseek.api-key: ${DEEPSEEK_API_KEY}
 spring.ai.dashscope.api-key: ${EMBEDDING_KEY}
 spring.ai.mcp.client.sse.connections.email-server.url: ${MCP_EMAIL_URL:http://localhost:8081}
+
+# 知识库上传上限（Spring Boot 默认 max-file-size 仅 1MB）
+spring.servlet.multipart.max-file-size: 10MB
+spring.servlet.multipart.max-request-size: 12MB
+
+# 可选共享密钥：为空=本地无鉴权；设置后除健康检查外的 /api/** 需要 Bearer
+app.api-token: ${APP_API_TOKEN:}
+
+# 心跳/审批清扫/checkpoint 清理共用调度器，避免单线程互相拖累
+spring.task.scheduling.pool.size: 4
+
+# 依赖健康检查（数据库 + Milvus）与指标；/api/health 仍是静态存活探针
+management.endpoints.web.exposure.include: health,metrics
+management.endpoint.health.show-details: never
 # 数据源由 Spring Boot 自动配置装配（SaverConfig 只负责把 MysqlSaver 接到该 DataSource 上）
 spring.datasource.url: ${DB_URL:jdbc:mysql://localhost:3306/superassistant}
 spring.datasource.username: ${DB_USERNAME:root}
@@ -659,6 +765,9 @@ spring.datasource.password: ${DB_PASSWORD:123456}
 
 # RAG 检索与精排
 rag:
+  milvus:
+    host: ${MILVUS_HOST:localhost}
+    port: ${MILVUS_PORT:9090}
   retrieval:
     vector: { top-k: 5, similarity-threshold: 0.7 }
     bm25:   { top-k: 10, index-path: ./data/bm25-index }
@@ -670,6 +779,12 @@ rag:
 # 对话/进度 SSE 流的生命周期上限（分钟）；超时只断流，运行继续、答案仍落库
 agent.stream:
   timeout-minutes: 60
+
+# 执行轨迹（SSE trace 帧 + .trace/*.jsonl + API）
+agent.trace:
+  enabled: true
+  max-events: 500
+  retain-runs: 20
 
 # 上下文压缩：动态阈值 =（模型窗口 − 输出预留 − 系统/工具预留）× 比例
 agent.compact:
@@ -687,7 +802,11 @@ agent.guard:
   tool-retry:   { max-retries: 2,  initial-delay-ms: 300, max-delay-ms: 3000, backoff-factor: 2.0 }
   loop:         { max-model-calls-per-run: 15, max-model-calls-per-thread: 60,
                   max-total-tool-calls: 60, max-identical-calls: 3,
-                  max-model-calls-per-paper: 8 }   # analyst-agent 单篇精读的调用上限
+                  max-model-calls-per-paper: 8,
+                  max-model-calls-per-research: 20,
+                  max-model-calls-per-writer: 12,
+                  max-model-calls-per-reviewer: 8,
+                  max-model-calls-per-rag: 6 }
 
 # checkpoint 保留策略（定时清理）
 agent.checkpoint-retention:
@@ -814,6 +933,9 @@ POST /api/chat/test-001/approve
 - `CompactHook` 必须在 `BEFORE_AGENT` hook 中最后执行（`getOrder() = 10000`），以保证 token 估算覆盖最终消息列表。
 - `PlanModeToolInterceptor` 在计划模式激活时隐藏 `writeFile`、`deleteFile`、`executeCommand`、`sendEmail`、`sendEmailBatch`；未启用计划模式时隐藏 `enterPlanMode` / `exitPlanMode`。
 - `compaction` 的 LRU 缓存（文件访问状态、线程调用计数）上限为 `CompactConfig.FILE_STATE_CACHE_MAX_ENTRIES`（100）。
-- 本地运行测试若使用 JDK 25，Mockito 会因 MockMaker 与新版 JDK 不兼容而报错（`CheckpointRetentionServiceTest`、`ChatStreamingServiceTest` 等使用 mock）；建议以 JDK 21 运行测试。
+- 测试命令：后端 `./mvnw -pl app test`（当前 402 个用例，4 个跳过；在 JDK 21 与 JDK 25 上均通过），前端 `cd frontend && npm test`（39 个用例）。CI 配置见 `.github/workflows/ci.yml`。
+
+- **部署鉴权是可选的共享密钥**：设置 `APP_API_TOKEN` 后，除健康检查外的 `/api/**` 需要 `Authorization: Bearer <token>`（前端用相同的 `VITE_API_TOKEN`）；未设置时保持本地无鉴权。它是共享密钥，不是用户/租户隔离。
+- **仍未实现的边界**：扫描版 PDF/矢量图 OCR、视觉核图、后台/定时任务、PDF/DOCX 导出、模型供应商降级、多副本 HITL 落库。终端工具仍是宿主机 shell（仅靠 HITL 审批约束），不是沙箱。
 
 维护者：[itajay](mailto:author@itajay.com)

@@ -7,6 +7,8 @@ import com.itajay.superassistant.tool.AnalysisWriteTool;
 import com.itajay.superassistant.tool.PaperFigureTool;
 import com.itajay.superassistant.tool.PaperTextTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
+import com.itajay.superassistant.trace.TraceModelInterceptor;
+import com.itajay.superassistant.trace.TraceToolInterceptor;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.stereotype.Component;
 
@@ -49,7 +51,9 @@ public class AnalystAgent {
                         AnalysisWriteTool analysisWriteTool,
                         PaperFigureTool paperFigureTool,
                         ModelCallLimitHook paperAnalysisCallLimitHook,
-                        ModelCallGuardInterceptor subAgentModelCallGuard) {
+                        ModelCallGuardInterceptor subAgentModelCallGuard,
+                        TraceToolInterceptor traceToolInterceptor,
+                        TraceModelInterceptor traceModelInterceptor) {
         this.reactAgent = ReactAgent.builder()
                 .name("analyst-agent")
                 .description("单篇论文精读 agent：读取一篇已下载论文的正文，提取四维信息并落盘到 analysis/ 目录。")
@@ -58,7 +62,7 @@ public class AnalystAgent {
                         你是 AnalystAgent，负责**精读一篇论文**并把结果落盘。输入中会指定课题方向与一篇论文的短名。
 
                         第一步：先读取你的完整操作规程，它是本任务的权威依据。用 readSkillResource 工具，两个参数都写死：
-                        readSkillResource(skillName="research_writing_skill", relativePath="references/analysis-guide.md")
+                        readSkillResource(skillName="research-writing", relativePath="references/analysis-guide.md")
                         若无法读取该文件，明确说明并停止，不要凭猜测执行。
 
                         第二步：精读这一篇论文的正文。
@@ -121,7 +125,7 @@ public class AnalystAgent {
                         """)
                 .methodTools(skillResourceTool, paperTextTool, analysisWriteTool, paperFigureTool)
                 .hooks(paperAnalysisCallLimitHook)
-                .interceptors(subAgentModelCallGuard)
+                .interceptors(subAgentModelCallGuard, traceToolInterceptor, traceModelInterceptor)
                 .build();
     }
 }

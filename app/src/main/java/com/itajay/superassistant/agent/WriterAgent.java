@@ -1,11 +1,14 @@
 package com.itajay.superassistant.agent;
 
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.alibaba.cloud.ai.graph.agent.hook.modelcalllimit.ModelCallLimitHook;
 import com.itajay.superassistant.interceptor.ModelCallGuardInterceptor;
 import com.itajay.superassistant.tool.AnalysisReadTool;
 import com.itajay.superassistant.tool.DocumentWriteTool;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
 import com.itajay.superassistant.tool.SkillResourceTool;
+import com.itajay.superassistant.trace.TraceModelInterceptor;
+import com.itajay.superassistant.trace.TraceToolInterceptor;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.stereotype.Component;
 
@@ -38,7 +41,10 @@ public class WriterAgent {
                        PaperAnalysisTool paperAnalysisTool,
                        AnalysisReadTool analysisReadTool,
                        DocumentWriteTool documentWriteTool,
-                       ModelCallGuardInterceptor subAgentModelCallGuard) {
+                       ModelCallGuardInterceptor subAgentModelCallGuard,
+                       ModelCallLimitHook writerCallLimitHook,
+                       TraceToolInterceptor traceToolInterceptor,
+                       TraceModelInterceptor traceModelInterceptor) {
         this.reactAgent = ReactAgent.builder()
                 .name("writer-agent")
                 .description("调研文档撰写 agent：基于已落盘的单篇论文分析，归纳并撰写对比型 Markdown 调研文档。")
@@ -48,7 +54,7 @@ public class WriterAgent {
                         输入：{input}
 
                         第一步：先读取以下三个文件，它们是撰写阶段的权威依据。
-                        用 readSkillResource 工具，skillName 一律填 "research_writing_skill"，relativePath 分别为：
+                        用 readSkillResource 工具，skillName 一律填 "research-writing"，relativePath 分别为：
                         1. references/writing-guide.md —— 你的完整撰写规程（输入契约、对比写法、逐篇定位、红线）
                         2. template/template.md —— 文档结构的唯一权威
                         3. example/example.md —— 写作风格与详略程度的范例
@@ -116,7 +122,8 @@ public class WriterAgent {
                         除 writeResearchDocument 落盘外，不要执行其他写入、删除、发送邮件等副作用操作。
                         """)
                 .methodTools(skillResourceTool, paperAnalysisTool, analysisReadTool, documentWriteTool)
-                .interceptors(subAgentModelCallGuard)
+                .hooks(writerCallLimitHook)
+                .interceptors(subAgentModelCallGuard, traceToolInterceptor, traceModelInterceptor)
                 .build();
     }
 }

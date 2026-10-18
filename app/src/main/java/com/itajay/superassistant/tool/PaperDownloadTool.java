@@ -6,6 +6,7 @@ import com.itajay.superassistant.config.PaperDownloadProperties;
 import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.progress.ProgressEvent;
 import com.itajay.superassistant.progress.ProgressStage;
+import com.itajay.superassistant.security.UrlSafety;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -16,7 +17,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -65,6 +68,9 @@ public class PaperDownloadTool {
     /** Every valid PDF starts with this. Used to tell a real file from an error page. */
     private static final byte[] PDF_MAGIC = {'%', 'P', 'D', 'F', '-'};
 
+    /** Upper bound on HTTP redirects within one fetch (each hop is re-validated). */
+    private static final int MAX_REDIRECTS = 5;
+
     private static final Pattern PDF_HREF = Pattern.compile(
             "href\\s*=\\s*[\"']([^\"']*\\.pdf(?:\\?[^\"']*)?)[\"']", Pattern.CASE_INSENSITIVE);
 
@@ -84,7 +90,10 @@ public class PaperDownloadTool {
         this.progress = progress;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
-                .followRedirects(HttpClient.Redirect.NORMAL)
+                // Redirects are followed manually in fetchOnce: the JDK's automatic
+                // follower never re-checks the target, so a public URL could hand us
+                // a Location pointing at loopback or a private network.
+                .followRedirects(HttpClient.Redirect.NEVER)
                 .build();
     }
 
@@ -290,66 +299,101 @@ public class PaperDownloadTool {
             failures.add(url + ": invalid URL");
             return null;
         }
-        String scheme = uri.getScheme();
-        if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
-            failures.add(url + ": unsupported scheme (only http/https allowed)");
-            return null;
-        }
-        if (!isPublicHost(url, uri, failures)) {
+        String rejection = UrlSafety.rejectionReason(uri);
+        if (rejection != null) {
+            failures.add(url + ": " + rejection);
             return null;
         }
 
         int attempts = Math.max(1, props.getMaxRetries());
         long backoff = props.getInitialBackoffMs();
         String lastError = null;
+        int redirects = 0;
 
         for (int attempt = 1; attempt <= attempts; attempt++) {
             try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(uri)
-                        .header("User-Agent", props.getUserAgent())
-                        .header("Accept", "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8")
-                        .header("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8")
-                        .timeout(Duration.ofMillis(props.getRequestTimeoutMs()))
-                        .GET()
-                        .build();
+                while (true) {
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(uri)
+                            .header("User-Agent", props.getUserAgent())
+                            .header("Accept", "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8")
+                            .header("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8")
+                            .timeout(Duration.ofMillis(props.getRequestTimeoutMs()))
+                            .GET()
+                            .build();
 
-                HttpResponse<byte[]> response = httpClient.send(
-                        request, HttpResponse.BodyHandlers.ofByteArray());
-                int status = response.statusCode();
-                byte[] body = response.body();
+                    HttpResponse<InputStream> response = httpClient.send(
+                            request, HttpResponse.BodyHandlers.ofInputStream());
+                    int status = response.statusCode();
 
-                if (status >= 200 && status < 300) {
-                    if (isPdf(body)) {
-                        if (body.length > props.getMaxPdfBytes()) {
-                            failures.add(url + ": file too large (" + (body.length / 1024 / 1024) + " MB)");
+                    if (isRedirect(status)) {
+                        String location = response.headers().firstValue("location").orElse(null);
+                        closeQuietly(response.body());
+                        if (location == null || location.isBlank()) {
+                            failures.add(url + ": redirect without a Location header");
                             return null;
                         }
-                        if (body.length < props.getMinPdfBytes()) {
-                            failures.add(url + ": response too small to be a paper (" + body.length + " bytes)");
+                        if (++redirects > MAX_REDIRECTS) {
+                            failures.add(url + ": too many redirects");
                             return null;
                         }
-                        return new FetchOutcome(url, body, null, status);
+                        URI next;
+                        try {
+                            next = uri.resolve(location.trim());
+                        } catch (IllegalArgumentException e) {
+                            failures.add(url + ": invalid redirect target " + location);
+                            return null;
+                        }
+                        // Re-validate every hop: this is exactly the check the JDK's
+                        // automatic redirect follower skipped.
+                        String hopRejection = UrlSafety.rejectionReason(next);
+                        if (hopRejection != null) {
+                            failures.add(next + ": " + hopRejection);
+                            return null;
+                        }
+                        log.debug("Redirect {} -> {}", uri, next);
+                        uri = next;
+                        continue;
                     }
-                    // Not a PDF — treat as a landing page and let the caller look for links.
-                    String html = new String(body, java.nio.charset.StandardCharsets.UTF_8);
-                    return new FetchOutcome(url, null, html, status);
-                }
 
-                if (isRetryable(status) && attempt < attempts) {
-                    long wait = retryAfterMs(response).orElse(backoff);
-                    log.debug("HTTP {} from {} — retrying in {} ms (attempt {}/{})",
-                            status, url, wait, attempt, attempts);
-                    sleep(wait);
-                    backoff = nextBackoff(backoff);
-                    lastError = "HTTP " + status;
-                    continue;
-                }
+                    if (isRetryable(status) && attempt < attempts) {
+                        long wait = retryAfterMs(response).orElse(backoff);
+                        closeQuietly(response.body());
+                        log.debug("HTTP {} from {} — retrying in {} ms (attempt {}/{})",
+                                status, url, wait, attempt, attempts);
+                        sleep(wait);
+                        backoff = nextBackoff(backoff);
+                        lastError = "HTTP " + status;
+                        break; // next attempt
+                    }
 
-                failures.add(url + ": HTTP " + status + (status == 403
-                        ? " (likely bot protection — try a mirror or the arXiv/OpenReview copy)"
-                        : ""));
-                return null;
+                    byte[] body;
+                    try (InputStream in = response.body()) {
+                        body = readLimited(in, props.getMaxPdfBytes(), uri.toString(), failures);
+                    }
+                    if (body == null) {
+                        return null;
+                    }
+
+                    if (status >= 200 && status < 300) {
+                        if (isPdf(body)) {
+                            if (body.length < props.getMinPdfBytes()) {
+                                failures.add(url + ": response too small to be a paper ("
+                                        + body.length + " bytes)");
+                                return null;
+                            }
+                            return new FetchOutcome(uri.toString(), body, null, status);
+                        }
+                        // Not a PDF — treat as a landing page and let the caller look for links.
+                        String html = new String(body, java.nio.charset.StandardCharsets.UTF_8);
+                        return new FetchOutcome(uri.toString(), null, html, status);
+                    }
+
+                    failures.add(url + ": HTTP " + status + (status == 403
+                            ? " (likely bot protection — try a mirror or the arXiv/OpenReview copy)"
+                            : ""));
+                    return null;
+                }
 
             } catch (java.net.http.HttpTimeoutException e) {
                 lastError = "timed out after " + props.getRequestTimeoutMs() + " ms";
@@ -371,48 +415,35 @@ public class PaperDownloadTool {
         return null;
     }
 
-    /**
-     * SSRF guard: refuse hosts that resolve to non-public addresses.
-     *
-     * <p>Download URLs come from the model (and landing pages come from the network),
-     * so a prompt-injected or malicious page could point the tool at loopback, an
-     * internal service, or the cloud metadata address (169.254.169.254). Every hop of
-     * the redirect chain re-enters {@code fetchOnce}, so the whole chain is checked.</p>
-     *
-     * <p>This validates at name-resolution time; a DNS record that changes between the
-     * check and the connection (rebinding) is out of scope for a paper downloader.</p>
-     */
-    private boolean isPublicHost(String url, URI uri, List<String> failures) {
-        String host = uri.getHost();
-        if (host == null || host.isBlank()) {
-            failures.add(url + ": missing host");
-            return false;
-        }
-        java.net.InetAddress[] addresses;
-        try {
-            addresses = java.net.InetAddress.getAllByName(host);
-        } catch (java.net.UnknownHostException e) {
-            failures.add(url + ": unknown host");
-            return false;
-        }
-        for (java.net.InetAddress address : addresses) {
-            if (address.isLoopbackAddress() || address.isAnyLocalAddress()
-                    || address.isLinkLocalAddress() || address.isSiteLocalAddress()
-                    || address.isMulticastAddress() || isCarrierGradeNat(address)) {
-                log.warn("Blocked download from non-public address {} ({})", address.getHostAddress(), host);
-                failures.add(url + ": host resolves to a non-public address (blocked)");
-                return false;
-            }
-        }
-        return true;
+    private static boolean isRedirect(int status) {
+        return status == 301 || status == 302 || status == 303
+                || status == 307 || status == 308;
     }
 
-    /** 100.64.0.0/10 (RFC 6598 shared space) — not reachable as a public paper host. */
-    private static boolean isCarrierGradeNat(java.net.InetAddress address) {
-        byte[] bytes = address.getAddress();
-        return bytes.length == 4
-                && (bytes[0] & 0xFF) == 100
-                && (bytes[1] & 0xC0) == 64;
+    /** Reads at most {@code limit} bytes; returns null and records a failure when exceeded. */
+    private static byte[] readLimited(InputStream in, long limit, String url,
+                                      List<String> failures) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        long total = 0;
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            total += read;
+            if (total > limit) {
+                failures.add(url + ": response too large (over " + limit + " bytes)");
+                return null;
+            }
+            out.write(buffer, 0, read);
+        }
+        return out.toByteArray();
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // the redirect body is irrelevant
+        }
     }
 
     /** Writes the downloaded bytes to a temp file, validates it, then moves it into place. */

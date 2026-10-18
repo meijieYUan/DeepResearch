@@ -97,9 +97,7 @@ public class AnalysisWriteTool {
         try {
             Files.createDirectories(analysisDir);
             boolean existed = Files.exists(target);
-            Files.writeString(target, file.toString(), StandardCharsets.UTF_8,
-                    java.nio.file.StandardOpenOption.CREATE,
-                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+            com.itajay.superassistant.workspace.AtomicFiles.writeString(target, file.toString());
 
             log.info("Wrote paper analysis: {} ({} chars, level={}, overwritten={})",
                     target, content.length(), level, existed);

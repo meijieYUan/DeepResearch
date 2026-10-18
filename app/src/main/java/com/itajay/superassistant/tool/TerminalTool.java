@@ -68,6 +68,7 @@ public class TerminalTool {
             return "Error: directory not found: " + dir;
         }
 
+        Process process = null;
         try {
             ProcessBuilder pb;
             String os = System.getProperty("os.name").toLowerCase();
@@ -79,14 +80,15 @@ public class TerminalTool {
             pb.directory(dirFile);
             pb.redirectErrorStream(true);
 
-            Process process = pb.start();
+            process = pb.start();
 
             // Pump the output on a daemon thread. Reading on the calling thread until
             // EOF first (the old order) deadlocked whenever the command kept running
             // without producing output: waitFor(30s) was never reached and the chat
             // stream thread hung forever.
             StringBuilder output = new StringBuilder();
-            Thread pump = new Thread(() -> drain(process, output), "terminal-output-pump");
+            final Process running = process;
+            Thread pump = new Thread(() -> drain(running, output), "terminal-output-pump");
             pump.setDaemon(true);
             pump.start();
 
@@ -121,6 +123,16 @@ public class TerminalTool {
             return header + body.toString().trim();
 
         } catch (InterruptedException e) {
+            // The run was cancelled/timed out. Without this the command and its
+            // children kept running after the tool returned, leaking ports and files.
+            if (process != null) {
+                process.destroyForcibly();
+                try {
+                    process.waitFor(DESTROY_GRACE_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {
+                    // the interrupt flag is restored below
+                }
+            }
             Thread.currentThread().interrupt();
             log.warn("Command interrupted: {}", command);
             return "Error: command interrupted";
@@ -132,7 +144,7 @@ public class TerminalTool {
 
     private void drain(Process process, StringBuilder output) {
         try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream(), Charset.defaultCharset()))) {
+                new InputStreamReader(process.getInputStream(), processCharset()))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 synchronized (output) {
@@ -144,6 +156,32 @@ public class TerminalTool {
         } catch (Exception e) {
             // The process was destroyed or the stream broke; whatever was captured stands.
             log.debug("Output pump stopped: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Decodes child-process output. Java's default is UTF-8, but on Windows a
+     * command run through a pipe speaks the system OEM code page (GBK on a Chinese
+     * install), so `dir`/`type` output arrived as mojibake. {@code native.encoding}
+     * is JEP 400's name for that code page.
+     */
+    static Charset processCharset() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("win")) {
+            return java.nio.charset.StandardCharsets.UTF_8;
+        }
+        String nativeEncoding = System.getProperty("native.encoding");
+        if (nativeEncoding != null && !nativeEncoding.isBlank()) {
+            try {
+                return Charset.forName(nativeEncoding);
+            } catch (Exception ignored) {
+                // fall through to the Chinese-Windows default
+            }
+        }
+        try {
+            return Charset.forName("GBK");
+        } catch (Exception e) {
+            return Charset.defaultCharset();
         }
     }
 

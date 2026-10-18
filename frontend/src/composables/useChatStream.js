@@ -1,7 +1,8 @@
 import { getCurrentScope, onScopeDispose, ref, watch } from 'vue'
-import { chatStream, approveStream } from '../api'
+import { chatStream, approveStream, cancelChat } from '../api'
 import { newId } from '../utils/id'
 import { reduceResearchProgress, setProgressTransport } from '../utils/researchProgress'
+import { TRACE_LIMIT, sanitizeTraceEvent } from '../utils/trace'
 
 const TITLE_MAX = 40
 
@@ -18,7 +19,7 @@ const TITLE_MAX = 40
 export function useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown,
-  requestChat = chatStream, requestApproval = approveStream
+  requestChat = chatStream, requestApproval = approveStream, requestCancel = cancelChat
 }) {
   // A run is in flight: the composer stays disabled until the stream settles.
   const loading = ref(false)
@@ -40,10 +41,24 @@ export function useChatStream({
     }
   }
 
+  /**
+   * User-initiated stop. Unlike a mere client abort, this asks the server to
+   * cancel the run (model stream, blocking tool, thread) and then settles the
+   * local bubble. Thread switches/unmounts deliberately keep using stopStream so
+   * a long research run survives navigation.
+   */
+  function cancel() {
+    const slot = liveStream
+    if (!slot) return false
+    requestCancel(slot.threadId).catch(() => { /* best effort */ })
+    stopStream()
+    return true
+  }
+
   watch(activeThreadId, () => stopStream(), { flush: 'sync' })
   if (getCurrentScope()) onScopeDispose(() => stopStream())
 
-  function runStream(threadId, messageId, launch) {
+  function runStream(threadId, messageId, launch, onFailure) {
     const slot = {
       threadId, messageId, generation: ++generation,
       controller: new AbortController(), finalized: false, receivedAnswer: false,
@@ -65,10 +80,12 @@ export function useChatStream({
       if (b && slot.pendingDelta) b.content += slot.pendingDelta
       slot.pendingDelta = ''
     }
-    const persist = () => {
+    // Progress frames are frequent; coalesce them into a trailing save. Terminal
+    // frames (finalize/answer/interruption) save immediately.
+    const persist = (immediate = false) => {
       const t = liveThread()
       if (t) t.lastActive = Date.now()
-      saveThreads()
+      saveThreads(immediate)
       scrollDown()
     }
     const setTransport = (b, status) => {
@@ -86,7 +103,11 @@ export function useChatStream({
       b.incomplete = incomplete
       if (error) b.error = String(error).slice(0, 1024)
       setTransport(b, status)
-      persist()
+      persist(true)
+      // A stream that failed (network/connection/stop) before producing an
+      // approval/answer did not take: let the caller undo a single-flight flag so
+      // the user can retry. A clean `done` still counts as a completed submission.
+      if (!slot.receivedAnswer && status !== 'done' && onFailure) onFailure()
     }
     const reconcilePlan = p => {
       if (p.planEnabled !== undefined) planMode.value = p.planEnabled
@@ -98,6 +119,18 @@ export function useChatStream({
         const b = liveBubble()
         b.progress = reduceResearchProgress(b.progress, p)
         b.progress = setProgressTransport(b.progress, b.transportStatus)
+        persist()
+      },
+      onTrace(raw) {
+        if (!accepts()) return
+        const b = liveBubble()
+        const event = sanitizeTraceEvent(raw)
+        if (!b || !event) return
+        if (!Array.isArray(b.trace)) b.trace = []
+        b.trace.push(event)
+        if (b.trace.length > TRACE_LIMIT) b.trace.splice(0, b.trace.length - TRACE_LIMIT)
+        if (event.traceId) b.traceId = event.traceId
+        // Progress frames are frequent; the debounced save coalesces them.
         persist()
       },
       onDelta(d) {
@@ -118,12 +151,13 @@ export function useChatStream({
         reconcilePlan(p)
         cancelFrame()
         const b = liveBubble()
+        if (typeof p.traceId === 'string' && p.traceId) b.traceId = p.traceId
         if (typeof p.text === 'string' && p.text) { slot.pendingDelta = ''; b.content = p.text }
         else flushDeltas()
         b.streaming = false
         b.incomplete = false
         slot.receivedAnswer = true
-        persist()
+        persist(true)
         refreshTasks()
       },
       onInterruption(p) {
@@ -133,6 +167,7 @@ export function useChatStream({
         flushDeltas()
         // Reuse the bubble, keeping its id, partial text and progress snapshot.
         const b = liveBubble()
+        if (typeof p.traceId === 'string' && p.traceId) b.traceId = p.traceId
         if (typeof p.message === 'string' && p.message) b.content += (b.content ? '\n\n' : '') + p.message
         b.approvals = (Array.isArray(p.pendingApprovals) ? p.pendingApprovals : []).map(a => ({
           ...a, id: newId('app'), decision: null, editing: false, editedArgs: a.arguments
@@ -140,11 +175,13 @@ export function useChatStream({
         b.streaming = false
         b.incomplete = false
         slot.receivedAnswer = true
-        persist()
+        persist(true)
         refreshTasks()
       },
       onError(p) {
         if (!accepts()) return
+        const b = liveBubble()
+        if (b && typeof p?.traceId === 'string' && p.traceId) b.traceId = p.traceId
         slot.finalize('error', true, p?.message || 'Unknown error')
       },
       onDone() {
@@ -213,13 +250,23 @@ export function useChatStream({
     })
     // An approval group is single-flight and cannot be replayed after completion.
     source.approvalsSubmitted = true
+    const sourceId = source.id
     const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
     t.messages.push(bubble)
     saveThreads()
     runStream(threadId, bubble.id, (signal, handlers) =>
-      requestApproval(threadId, decisions, handlers, signal))
+      requestApproval(threadId, decisions, handlers, signal), () => {
+      // The stream failed before any approval/answer frame (network error, dead
+      // backend). The pending interruption is still server-side, so make the
+      // approval panel editable again instead of leaving it permanently submitted.
+      const live = threads.value[threadId]?.messages?.find(m => m.id === sourceId)
+      if (live?.approvalsSubmitted) {
+        live.approvalsSubmitted = false
+        saveThreads()
+      }
+    })
     return true
   }
 
-  return { loading, stopStream, send, submitApprovals }
+  return { loading, stopStream, cancel, send, submitApprovals }
 }

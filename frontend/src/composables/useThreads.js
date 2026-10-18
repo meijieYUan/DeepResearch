@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { toast } from '../utils/toast'
 import { newId } from '../utils/id'
 import { sanitizeResearchProgress } from '../utils/researchProgress'
+import { TRACE_PERSIST_LIMIT, sanitizeTraceEvent } from '../utils/trace'
 
 // The two localStorage keys this store owns, defined once so no component has
 // to know the strings.
@@ -54,6 +55,12 @@ function sanitizeMessage(raw) {
   if (raw.approvalsSubmitted === true) msg.approvalsSubmitted = true
   if (Array.isArray(raw.approvals)) {
     msg.approvals = raw.approvals.map(sanitizeApproval).filter(Boolean)
+  }
+  if (typeof raw.traceId === 'string' && raw.traceId) msg.traceId = raw.traceId.slice(0, 64)
+  if (Array.isArray(raw.trace)) {
+    const trace = raw.trace.map(sanitizeTraceEvent).filter(Boolean)
+      .slice(-TRACE_PERSIST_LIMIT)
+    if (trace.length) msg.trace = trace
   }
   return msg
 }
@@ -120,7 +127,34 @@ export function useThreads() {
     threads.value = clean
   }
 
-  function saveThreads() {
+  let saveTimer = null
+  let pagehideRegistered = false
+
+  /**
+   * Bumps the trailing-save window for streaming progress frames. Without this,
+   * every progress/delta frame serialized the entire transcript synchronously;
+   * with a long research run that is both a main-thread stall and a quota risk.
+   *
+   * `immediate` (the default) preserves the old synchronous behaviour for
+   * structural changes (new/delete/switch) and for terminal frames.
+   */
+  function saveThreads(immediate = true) {
+    if (immediate) {
+      if (saveTimer !== null) {
+        clearTimeout(saveTimer)
+        saveTimer = null
+      }
+      saveThreadsNow()
+      return
+    }
+    if (saveTimer !== null) return
+    saveTimer = setTimeout(() => {
+      saveTimer = null
+      saveThreadsNow()
+    }, 300)
+  }
+
+  function saveThreadsNow() {
     // Strip non-serializable reactive flags (streaming, editing, …) before saving
     const clean = {}
     for (const [id, t] of Object.entries(threads.value)) {
@@ -136,6 +170,11 @@ export function useThreads() {
           const progress = sanitizeResearchProgress(m.progress)
           if (progress) c.progress = progress
           if (m.approvalsSubmitted) c.approvalsSubmitted = true
+          if (m.traceId) c.traceId = m.traceId
+          if (Array.isArray(m.trace) && m.trace.length) {
+            c.trace = m.trace.slice(-TRACE_PERSIST_LIMIT)
+              .map(sanitizeTraceEvent).filter(Boolean)
+          }
           if (m.approvals) {
             c.approvals = m.approvals.map(a => ({
               toolId: a.toolId, toolName: a.toolName,
@@ -202,6 +241,14 @@ export function useThreads() {
   // Restores the persisted session on boot: the saved active thread when it
   // still exists, else the most recent one.
   function init() {
+    // A debounced save may still be pending when the tab goes away; flush it so
+    // the last few progress frames are not lost.
+    if (!pagehideRegistered && typeof globalThis.addEventListener === 'function') {
+      pagehideRegistered = true
+      globalThis.addEventListener('pagehide', () => {
+        if (saveTimer !== null) saveThreads(true)
+      })
+    }
     loadThreads()
     if (threadList.value.length === 0) return
     const saved = localStorage.getItem(ACTIVE_THREAD_KEY)

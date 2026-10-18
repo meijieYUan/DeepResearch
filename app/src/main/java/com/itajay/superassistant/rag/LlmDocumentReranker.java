@@ -23,7 +23,8 @@ public class LlmDocumentReranker implements DocumentReranker {
     private static final Logger log = LoggerFactory.getLogger(LlmDocumentReranker.class);
 
     private static final int DEFAULT_MAX_DOC_CHARS = 500;
-    private static final int DEFAULT_MAX_CANDIDATES = 20;
+    /** Keep each LLM call's prompt bounded; larger candidate sets are scored in batches. */
+    private static final int RERANK_BATCH_SIZE = 20;
 
     private final ChatClient chatClient;
     private final boolean enabled;
@@ -42,29 +43,38 @@ public class LlmDocumentReranker implements DocumentReranker {
         if (documents == null || documents.isEmpty()) {
             return List.of();
         }
-        if (!enabled || documents.size() == 1) {
+        if (!enabled) {
+            return documents.stream().limit(Math.max(1, topK)).toList();
+        }
+        if (documents.size() == 1) {
             return documents;
         }
         String queryText = query == null ? "" : query.text();
-        List<Document> candidates = documents.size() > DEFAULT_MAX_CANDIDATES
-                ? documents.subList(0, DEFAULT_MAX_CANDIDATES)
-                : documents;
 
-        List<Double> scores = scoreDocuments(queryText, candidates);
-        if (scores == null) {
-            log.warn("LLM rerank failed, keeping fusion order");
-            return new ArrayList<>(candidates);
+        // Score every candidate, in prompt-sized batches. Truncating to the first
+        // batch silently dropped everything recalled by the second/third expanded
+        // query and made query expansion pointless.
+        List<Double> scores = new ArrayList<>(documents.size());
+        for (int from = 0; from < documents.size(); from += RERANK_BATCH_SIZE) {
+            int to = Math.min(documents.size(), from + RERANK_BATCH_SIZE);
+            List<Double> batchScores = scoreDocuments(queryText, documents.subList(from, to));
+            if (batchScores == null || batchScores.size() != to - from) {
+                log.warn("LLM rerank failed, keeping all {} fusion candidates in order",
+                        documents.size());
+                return new ArrayList<>(documents);
+            }
+            scores.addAll(batchScores);
         }
 
-        List<IndexedScore> indexed = new ArrayList<>(candidates.size());
-        for (int i = 0; i < candidates.size(); i++) {
-            indexed.add(new IndexedScore(i, candidates.get(i), scores.get(i)));
+        List<IndexedScore> indexed = new ArrayList<>(documents.size());
+        for (int i = 0; i < documents.size(); i++) {
+            indexed.add(new IndexedScore(i, documents.get(i), scores.get(i)));
         }
         indexed.sort((a, b) -> {
             int cmp = Double.compare(b.score, a.score);
             return cmp != 0 ? cmp : Integer.compare(a.index, b.index);
         });
-        return indexed.stream().limit(topK).map(s -> s.doc).toList();
+        return indexed.stream().limit(Math.max(1, topK)).map(s -> s.doc).toList();
     }
 
     private List<Double> scoreDocuments(String queryText, List<Document> candidates) {

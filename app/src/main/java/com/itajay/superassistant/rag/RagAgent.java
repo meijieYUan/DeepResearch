@@ -15,14 +15,26 @@ public class RagAgent {
 
 
     public RagAgent(RagHook raghook,
-                    ChatModel chatModel) {
+                    ChatModel chatModel,
+                    com.alibaba.cloud.ai.graph.agent.hook.modelcalllimit.ModelCallLimitHook ragCallLimitHook,
+                    com.itajay.superassistant.trace.TraceToolInterceptor traceToolInterceptor,
+                    com.itajay.superassistant.trace.TraceModelInterceptor traceModelInterceptor) {
         this.reactAgent = ReactAgent.builder()
                 .name("rag-agent")
                 .model(chatModel)
-                .instruction("{input}") //用户的输入 在 OverAllState 的 {input} 键中
+                // Do not use "{input}" here: AgentTool passes the tool argument as a
+                // UserMessage under the `messages` state key, so a template variable
+                // named `input` is never present and PromptTemplate.render fails with
+                // "Missing variable names are: [input]". RagHook injects the retrieved
+                // context into the system prompt; this is just the role instruction.
+                .instruction("""
+                        你是知识库检索助手。优先依据系统提示中注入的知识库上下文回答用户问题；
+                        上下文没有覆盖的内容，如实说明未在知识库中找到，不要编造。
+                        """)
                 .includeContents(false) //让rag agent专注于用户问题进行回答
                 .description(AGENT_DESCRIPTION)
-                .hooks(raghook)
+                .hooks(raghook, ragCallLimitHook)
+                .interceptors(traceToolInterceptor, traceModelInterceptor)
                 .build();
     }
 

@@ -123,6 +123,10 @@ class ChatStreamingServiceTest {
 
     @Test
     void anEmptyRunIsAnErrorNotASilentClose() throws Exception {
+        // A previous approval must not survive an empty run: the thread would stay
+        // locked for the store's TTL and could be resumed twice.
+        store.put(THREAD, RunnableConfig.builder().build(),
+                InterruptionMetadata.builder("n", new OverAllState()).toolFeedbacks(List.of()).build(), "hi");
         ChatStreamingService service = serviceReturning(Flux.empty());
 
         service.start(THREAD, "hi", RunnableConfig.builder().build(), false);
@@ -130,6 +134,84 @@ class ChatStreamingServiceTest {
 
         assertThat(eventNames()).containsExactly("error", "done");
         assertThat(payload("error").get("message")).isEqualTo("Agent returned empty result");
+        assertThat(store.get(THREAD)).isNull();
+    }
+
+    @Test
+    void onAcceptedRunsOnceInsideTheAcceptedRun() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger accepted = new java.util.concurrent.atomic.AtomicInteger();
+        ChatStreamingService service = serviceReturning(Flux.just(output("ok")));
+
+        service.start(THREAD, "hi", RunnableConfig.builder().build(), false, accepted::incrementAndGet);
+        awaitTerminal("done");
+
+        assertThat(accepted).hasValue(1);
+    }
+
+    @Test
+    void aRejectedRunDoesNotInvokeItsOnAcceptedCallback() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        ChatStreamingService service = serviceReturning(Flux.defer(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return Flux.just(output("late answer"));
+        }));
+
+        service.start(THREAD, "hi", RunnableConfig.builder().build(), false);
+        Thread.sleep(100); // let the first run take the slot
+
+        java.util.concurrent.atomic.AtomicInteger rejectedAccepted =
+                new java.util.concurrent.atomic.AtomicInteger();
+        service.start(THREAD, "again", RunnableConfig.builder().build(), false,
+                rejectedAccepted::incrementAndGet);
+
+        assertThat(rejectedAccepted).hasValue(0);
+
+        release.countDown();
+        awaitTerminal("answer");
+    }
+
+    @Test
+    void cancelStopsTheRunReleasesTheSlotAndStreamsAnError() throws Exception {
+        CountDownLatch subscribed = new CountDownLatch(1);
+        ChatStreamingService service = serviceReturning(
+                Flux.<NodeOutput>never().doOnSubscribe(ignored -> subscribed.countDown()));
+
+        service.start(THREAD, "hi", RunnableConfig.builder().build(), false);
+        assertThat(subscribed.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(service.cancel(THREAD)).isTrue();
+        awaitTerminal("done");
+
+        assertThat(eventNames()).contains("error", "done");
+        assertThat((String) payload("error").get("message")).contains("运行已取消");
+        assertThat(service.cancel(THREAD)).isFalse();
+
+        // The slot must be free again: a normal run can start on the same thread.
+        events.clear();
+        ChatStreamingService next = serviceReturning(Flux.just(output("after cancel")));
+        next.start(THREAD, "again", RunnableConfig.builder().build(), false);
+        awaitTerminal("answer");
+        assertThat(payload("answer").get("text")).isEqualTo("after cancel");
+    }
+
+    @Test
+    void aBlankThreadIdIsRejectedWithoutLeakingARunSlot() throws Exception {
+        ChatStreamingService service = serviceReturning(Flux.just(output("should not run")));
+
+        service.start("  ", "hi", RunnableConfig.builder().build(), false);
+        awaitTerminal("done");
+        assertThat(eventNames()).containsExactly("error", "done");
+        assertThat((String) payload("error").get("message")).contains("threadId");
+
+        // The same (invalid) id must still be usable for a proper rejection later,
+        // not stuck behind a leaked "already running" slot.
+        events.clear();
+        service.start("  ", "again", RunnableConfig.builder().build(), false);
+        awaitTerminal("done");
+        assertThat((String) payload("error").get("message")).contains("threadId");
     }
 
     @Test

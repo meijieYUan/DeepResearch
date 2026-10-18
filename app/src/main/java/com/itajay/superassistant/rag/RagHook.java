@@ -63,13 +63,9 @@ public class RagHook extends AgentHook {
     /** 对用户的提问进行检索增强：扩展 → 多路召回 → 去重精排 → 注入 system prompt。 */
     @Override
     public CompletableFuture<Map<String, Object>> beforeAgent(OverAllState state, RunnableConfig config) {
-        Optional<Object> inputOpt = state.value("input");
-        if (inputOpt.isEmpty()) {    //输入不存在
-            return CompletableFuture.completedFuture(Map.of());
-        }
-        if (!(inputOpt.get() instanceof String text) || text.isBlank()) {
-            log.warn("RAG input is not usable text ({}); skipping retrieval",
-                    inputOpt.get() == null ? "null" : inputOpt.get().getClass().getSimpleName());
+        String text = resolveQueryText(state);
+        if (text == null || text.isBlank()) {
+            log.warn("RAG input is not usable text; skipping retrieval");
             return CompletableFuture.completedFuture(Map.of());
         }
 
@@ -107,8 +103,7 @@ public class RagHook extends AgentHook {
             documents = candidates;
         }
 
-        String context = documents.stream().map(Document::getText).collect
-                (Collectors.joining("\n"));
+        String context = buildContext(documents);
         String systemPrompt = String.format(RAG_TEMPLATE, context);
         List<Message> enhancedMessages = List.of(new SystemMessage(systemPrompt), new UserMessage(text));
         // 使用检索的文档上下文进行回答（默认覆盖历史消息）。
@@ -116,9 +111,47 @@ public class RagHook extends AgentHook {
         return CompletableFuture.completedFuture(Map.of("messages", ReplaceAllWith.of(enhancedMessages)));
     }
 
+    /**
+     * The agent is exposed to the main agent through {@code AgentTool}, which invokes
+     * the graph with only a {@code messages} state: the tool argument arrives as the
+     * last {@link UserMessage} and there is no {@code input} key. Direct invocation
+     * (tests, deep links) still uses {@code input}. Read both, preferring {@code input}.
+     */
+    private static String resolveQueryText(OverAllState state) {
+        Optional<Object> inputOpt = state.value("input");
+        if (inputOpt.isPresent() && inputOpt.get() instanceof String text && !text.isBlank()) {
+            return text;
+        }
+        Optional<List> messagesOpt = state.value("messages", List.class);
+        List<?> messages = messagesOpt.orElse(List.of());
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i) instanceof UserMessage user
+                    && user.getText() != null && !user.getText().isBlank()) {
+                return user.getText();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Labels every chunk with its source file. Without this the model sees one
+     * undifferentiated blob and cannot cite where a claim came from, even though
+     * {@code source_filename} is stored on every chunk.
+     */
+    static String buildContext(List<Document> documents) {
+        return documents.stream().map(document -> {
+            Object source = document.getMetadata() == null ? null
+                    : document.getMetadata().get(Bm25Index.SOURCE_METADATA_KEY);
+            String label = source == null || String.valueOf(source).isBlank()
+                    ? "未知来源" : String.valueOf(source);
+            return "[来源: " + label + "]\n" + document.getText();
+        }).collect(Collectors.joining("\n\n"));
+    }
+
     private static final String RAG_TEMPLATE = """
     你是用户的知识百科助手。基于以下上下文回答问题。
-    如果上下文中没有相关信息，请直接说明你不知道。
+    如果上下文中没有相关信息，请直接说明你不知道，不要编造。
+    回答时请在相应内容后用 [来源: 文件名] 标注依据；只引用上下文里出现过的来源。
     -------------------------------------------
     上下文：
         %s
