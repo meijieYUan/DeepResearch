@@ -48,6 +48,7 @@
           :msg="msg"
           :approval-disabled="loading || msg.approvalsSubmitted"
           @submit-approvals="onSubmitApprovals"
+          @resume-research="onResumeResearch"
         />
 
         <!-- Shown only once the user has scrolled away from the bottom, which is
@@ -124,7 +125,7 @@ const stream = useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown
 })
-const { loading, stopStream, send, submitApprovals } = stream
+const { loading, stopStream, send, submitApprovals, resumeResearch } = stream
 
 // --- composer ---------------------------------------------------------------
 const input = ref('')
@@ -163,6 +164,13 @@ function onSend() {
 function onSubmitApprovals(msg) {
   if (loading.value || msg.approvalsSubmitted) return
   if (submitApprovals(msg)) { stickToBottom.value = true; scrollDown(true) }
+}
+
+// Continue a run that paused on missing papers; the user has dropped them into
+// the library by now (or wants to retry the same failing set).
+function onResumeResearch(msg) {
+  if (loading.value || msg.waitingResumed) return
+  if (resumeResearch(msg)) { stickToBottom.value = true; scrollDown(true) }
 }
 
 // --- scroll -----------------------------------------------------------------

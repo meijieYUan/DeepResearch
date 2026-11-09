@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -77,11 +78,18 @@ public class PaperDownloadTool {
 
     private final PaperDownloadProperties props;
     private final ProgressChannelRegistry progress;
+    private final PaperLibrary library;
+    private final DownloadFailureRegistry downloadFailures;
     private final HttpClient httpClient;
 
-    public PaperDownloadTool(PaperDownloadProperties props, ProgressChannelRegistry progress) {
+    public PaperDownloadTool(PaperDownloadProperties props,
+                             ProgressChannelRegistry progress,
+                             PaperLibrary library,
+                             DownloadFailureRegistry downloadFailures) {
         this.props = props;
         this.progress = progress;
+        this.library = library;
+        this.downloadFailures = downloadFailures;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
                 .followRedirects(HttpClient.Redirect.NORMAL)
@@ -152,6 +160,20 @@ public class PaperDownloadTool {
         }
         publishDownload(threadId, "开始下载论文：" + shortName);
 
+        // The shared library comes before the network: a paper any earlier conversation
+        // already fetched is copied in, costing nothing. The copy — not a move — keeps
+        // the library intact for the next topic.
+        Optional<Path> fromLibrary = library == null ? Optional.empty()
+                : library.importInto(safeName, topic);
+        if (fromLibrary.isPresent()) {
+            Path copied = fromLibrary.get();
+            Integer pages = PaperStore.pageCount(copied);
+            if (pages != null) {
+                publishDownload(threadId, "本地论文库命中，已复制：" + shortName);
+                return ok(copied, pages, PaperStore.sha256(copied), "copied from local paper library");
+            }
+        }
+
         List<String> candidates = buildCandidates(normalizedUrl);
         List<String> failures = new ArrayList<>();
         String lastHtml = null;
@@ -163,7 +185,7 @@ public class PaperDownloadTool {
                 continue;
             }
             if (outcome.bytes() != null) {
-                return finish(outcome, target, failures, threadId, shortName);
+                return finish(outcome, target, failures, threadId, topic, shortName, normalizedUrl);
             }
             if (outcome.html() != null) {
                 lastHtml = outcome.html();
@@ -178,7 +200,7 @@ public class PaperDownloadTool {
             for (String link : discovered) {
                 FetchOutcome outcome = fetch(link, failures);
                 if (outcome != null && outcome.bytes() != null) {
-                    return finish(outcome, target, failures, threadId, shortName);
+                    return finish(outcome, target, failures, threadId, topic, shortName, normalizedUrl);
                 }
             }
             if (!discovered.isEmpty()) {
@@ -189,10 +211,26 @@ public class PaperDownloadTool {
         }
 
         publishDownload(threadId, "下载失败：" + shortName + "（将尝试其他来源或降级为仅摘要）");
+        recordFailure(threadId, topic, shortName, normalizedUrl, failures);
         return "DOWNLOAD_FAILED: " + normalizedUrl + "\n"
                 + "Attempts:\n" + formatFailures(failures) + "\n"
                 + "Next: try an alternative source (arXiv mirror, OpenReview, author homepage), "
                 + "or fall back to the abstract page and mark this paper SOURCE_LEVEL=ABSTRACT_ONLY.";
+    }
+
+    /**
+     * Remembers that this paper is still missing, so the workflow can offer a manual
+     * download instead of silently degrading the document. Best-effort: a run without a
+     * thread id (direct invocation in tests) simply has nothing to report to.
+     */
+    private void recordFailure(String threadId, String topic, String shortName, String url,
+                               List<String> failures) {
+        if (downloadFailures == null || threadId == null || topic == null) {
+            return;
+        }
+        // The first line is the most specific reason; the full list goes to the tool reply.
+        String reason = failures.isEmpty() ? "unknown" : failures.get(0);
+        downloadFailures.record(threadId, topic, shortName, url, reason);
     }
 
     /**
@@ -208,6 +246,21 @@ public class PaperDownloadTool {
         return PaperStore.listPdfs(topic);
     }
 
+    /**
+     * The shared corpus, across every topic and conversation.
+     *
+     * <p>Worth exposing on its own: the model can see that a paper is already available
+     * before spending a search on finding a source for it, and can pick the exact short
+     * name a library copy is stored under.</p>
+     */
+    @Tool(description = """
+            List the shared local paper library — PDFs every topic and conversation can reuse.
+            downloadPaper checks this library first and copies a hit into the topic without any
+            network access, so check here before hunting for a source.""")
+    public String listLibraryPapers() {
+        return library == null ? "（本地论文库未启用）" : library.describe();
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // Progress
     // ──────────────────────────────────────────────────────────────────────
@@ -219,11 +272,20 @@ public class PaperDownloadTool {
      * tell progress from a hang.
      */
     private String finish(FetchOutcome outcome, Path target, List<String> failures,
-                          String threadId, String shortName) {
+                          String threadId, String topic, String shortName, String reference) {
         String result = saveAndReport(outcome, target, failures);
         if (result.startsWith("DOWNLOAD_FAILED")) {
             publishDownload(threadId, "下载失败：" + shortName + "（该来源不可用，换源或降级为仅摘要）");
         } else {
+            // Everything downloaded is shared forward: the library is what keeps the next
+            // topic from paying for this fetch again. Silent failure — the topic copy is
+            // what this run needs, the library only helps future ones.
+            if (library != null) {
+                library.store(outcome.bytes(), shortName, reference);
+            }
+            if (downloadFailures != null) {
+                downloadFailures.resolved(threadId, topic, shortName);
+            }
             publishDownload(threadId, "已下载论文：" + shortName);
         }
         return result;
@@ -665,7 +727,7 @@ public class PaperDownloadTool {
      * user, who needs to know whether a run re-downloaded something they already had.
      */
     public enum Origin {
-        LOCAL_COPY, REUSED_IN_TOPIC, COPIED_FROM_OTHER_TOPIC, DOWNLOAD, NOT_FOUND
+        LOCAL_COPY, REUSED_IN_TOPIC, COPIED_FROM_OTHER_TOPIC, COPIED_FROM_LIBRARY, DOWNLOAD, NOT_FOUND
     }
 
     /**
@@ -806,7 +868,26 @@ public class PaperDownloadTool {
                     "本地 PDF 不存在或不可读：" + paper);
         }
 
-        // 3. The same short name under another topic: copy it (never move — the other
+        // 3. The shared library: the whole point of it is that this step usually hits.
+        //    Tried before other topics because the library is the canonical corpus, and
+        //    matched on identifiers as well as name — the same paper may have been saved
+        //    under a different short name by an earlier conversation.
+        if (library != null) {
+            Optional<Path> fromLibrary = library.find(safeName, paper);
+            if (fromLibrary.isPresent()) {
+                try {
+                    PaperStore.importPdf(fromLibrary.get(), effectiveTopic, safeName, props.getMaxPdfBytes());
+                    publishDownload(threadId, "本地论文库命中，已复制：" + safeName);
+                    return new AcquireResult(true, effectiveTopic, safeName, relative,
+                            Origin.COPIED_FROM_LIBRARY,
+                            "复用自本地论文库：" + WorkspacePaths.relative(fromLibrary.get()));
+                } catch (IllegalArgumentException | IOException e) {
+                    log.warn("从论文库复制失败 [{}]: {}", safeName, e.getMessage());
+                }
+            }
+        }
+
+        // 4. The same short name under another topic: copy it (never move — the other
         //    topic's analyses reference it).
         Path found = elsewhere != null ? elsewhere
                 : PaperStore.findPdfAcrossTopics(safeName).orElse(null);
@@ -823,7 +904,7 @@ public class PaperDownloadTool {
             }
         }
 
-        // 4. Nothing on disk. Only a URL can be fetched; a bare short name with no
+        // 5. Nothing on disk. Only a URL can be fetched; a bare short name with no
         //    existing paper is a lookup miss, and inventing a download target is worse
         //    than saying so.
         if (kind == SourceKind.URL) {

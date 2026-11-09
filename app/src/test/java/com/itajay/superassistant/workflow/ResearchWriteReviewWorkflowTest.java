@@ -7,7 +7,9 @@ import com.itajay.superassistant.progress.ProgressEvent;
 import org.springframework.ai.chat.model.ToolContext;
 
 import java.util.Map;
+import com.itajay.superassistant.tool.DownloadFailureRegistry;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
+import com.itajay.superassistant.tool.PaperLibrary;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -246,5 +248,98 @@ class ResearchWriteReviewWorkflowTest {
         assertThat(writerInputs.get(1)).contains("reanalyzePaper(topic, 论文短名, reason, requirements)",
                 "requirements 原样", brief, "结论不符");
         assertThat(researchInputs).hasSize(1);
+    }
+
+    /**
+     * The core of the manual-download pause: a paper the research stage could not get
+     * must stop the run before the expensive close reading, and the pause must be
+     * registered so {@code POST /resume} can continue it.
+     */
+    @Test
+    void missingPapersPauseTheRunBeforeCloseReading() {
+        DownloadFailureRegistry failures = new DownloadFailureRegistry();
+        ResearchResumeStore resumeStore = new ResearchResumeStore();
+        AtomicInteger analysisCalls = new AtomicInteger();
+
+        var flow = new ResearchWriteReviewWorkflow((input, config) -> {
+            // The research stage could not fetch one paper; the downloader records that
+            // against the same thread + topic the workflow reads back.
+            failures.record("pause-thread", topic, "Missing-Paper",
+                    "https://example.com/x.pdf", "HTTP 403");
+            return "本轮材料：Alpha";
+        }, (input, config) -> {
+            throw new AssertionError("writer must not run while the run is waiting for papers");
+        }, (input, config) -> {
+            throw new AssertionError("reviewer must not run while the run is waiting for papers");
+        }, analysis, new ProgressChannelRegistry(), null, failures, resumeStore);
+
+        when(analysis.analyzeTopicSync(any(), any(), anyInt(), any(), any(ProgressContext.class)))
+                .thenAnswer(invocation -> {
+                    analysisCalls.incrementAndGet();
+                    return "论文精读完成：";
+                });
+
+        String result = flow.researchWriteReview(brief, threadContext("pause-thread"));
+
+        assertThat(result).contains("WORKFLOW_WAITING_FOR_PAPERS", "Missing-Paper");
+        // The pause happens *before* close reading, so nothing expensive was spent.
+        assertThat(analysisCalls).hasValue(0);
+        // Registered for resume, carrying the same topic and brief.
+        assertThat(resumeStore.get("pause-thread")).hasValueSatisfying(task -> {
+            assertThat(task.topic()).isEqualTo(topic);
+            assertThat(task.brief()).isEqualTo(brief);
+            assertThat(task.missing()).extracting(ResearchResumeStore.MissingPaper::shortName)
+                    .containsExactly("Missing-Paper");
+        });
+    }
+
+    /**
+     * The whole point of re-checking the library at pause time: a paper the user has
+     * since supplied is no longer missing, so the run continues instead of asking again.
+     */
+    @Test
+    void aPaperAlreadyInTheLibraryDoesNotPauseTheRun() throws IOException {
+        DownloadFailureRegistry failures = new DownloadFailureRegistry();
+        PaperLibrary library = new PaperLibrary(new com.itajay.superassistant.config.PaperDownloadProperties());
+        Path libraryDir = WorkspacePaths.paperLibraryDir();
+        Path libraryPdf = libraryDir.resolve("Library-Paper.pdf");
+        AtomicInteger reviews = new AtomicInteger();
+
+        Files.createDirectories(libraryDir);
+        try (org.apache.pdfbox.pdmodel.PDDocument doc = new org.apache.pdfbox.pdmodel.PDDocument()) {
+            doc.addPage(new org.apache.pdfbox.pdmodel.PDPage());
+            doc.save(libraryPdf.toFile());
+        }
+
+        try {
+            var flow = new ResearchWriteReviewWorkflow((input, config) -> {
+                // Fails to download, but the same paper is already in the library.
+                failures.record("library-thread", topic, "Library-Paper",
+                        "https://example.com/x.pdf", "HTTP 403");
+                return "本轮材料：Alpha";
+            }, (input, config) -> {
+                Files.createDirectories(document.getParent());
+                Files.writeString(document, "# 文档");
+                return "file: " + WorkspacePaths.relative(document);
+            }, (input, config) -> {
+                reviews.incrementAndGet();
+                return PASS;
+            }, analysis, new ProgressChannelRegistry(), library, failures, null);
+
+            when(analysis.analyzeTopicSync(any(), any(), anyInt(), any(), any(ProgressContext.class)))
+                    .thenReturn("论文精读完成：");
+
+            String result = flow.researchWriteReview(brief, threadContext("library-thread"));
+
+            assertThat(result).doesNotContain("WORKFLOW_WAITING_FOR_PAPERS");
+            assertThat(reviews).hasValue(1);
+        } finally {
+            Files.deleteIfExists(libraryPdf);
+        }
+    }
+
+    private static ToolContext threadContext(String threadId) {
+        return new ToolContext(Map.of("_AGENT_CONFIG_", RunnableConfig.builder()
+                .threadId(threadId).build()));
     }
 }

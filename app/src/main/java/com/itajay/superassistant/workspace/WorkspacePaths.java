@@ -40,6 +40,16 @@ public final class WorkspacePaths {
     public static final String FIGURES_SUBDIR = "figures";
     public static final String DOCUMENTS_SUBDIR = "document";
 
+    /**
+     * Project-wide paper library, shared by every conversation and every topic.
+     *
+     * <p>Deliberately <em>outside</em> {@code investigation/}: a topic directory is one
+     * investigation's workspace, while the library is the corpus every investigation draws
+     * from. Papers land here on download and are copied — never moved — into a topic, so a
+     * later topic researching the same area costs nothing.</p>
+     */
+    public static final String PAPER_LIBRARY_DIR = "paper-library";
+
     private static final int MAX_SEGMENT_LENGTH = 80;
 
     /** Resolved once: walking the filesystem on every tool call would be wasteful. */
@@ -104,6 +114,16 @@ public final class WorkspacePaths {
     /** The {@code investigation} folder itself, used as the boundary for path checks. */
     public static Path investigationRoot() {
         return root().resolve(INVESTIGATION_DIR).normalize();
+    }
+
+    /**
+     * {@code paper-library/papers} — the shared corpus every topic draws from.
+     *
+     * <p>Flat, keyed by paper short name, so a human can drop a PDF in by hand during a
+     * waiting-for-download pause without guessing any sub-structure.</p>
+     */
+    public static Path paperLibraryDir() {
+        return root().resolve(PAPER_LIBRARY_DIR).resolve(PAPERS_SUBDIR).normalize();
     }
 
     /**

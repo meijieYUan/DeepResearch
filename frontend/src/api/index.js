@@ -107,6 +107,12 @@ export const chatStream = (threadId, message, mode, handlers, signal) =>
 export const approveStream = (threadId, decisions, handlers, signal) =>
   streamChatEvents(threadId, '/approve', { decisions }, handlers, signal)
 
+// Continue a research run that paused for manually downloaded papers. No body:
+// the server holds the paused topic and brief, which is what makes the resume
+// idempotent and keeps the client from having to remember them.
+export const resumeStream = (threadId, handlers, signal) =>
+  streamChatEvents(threadId, '/resume', {}, handlers, signal)
+
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId }, silent: true })
 export const getPendingTodos = (threadId) => api.get('/todos/pending', { params: { threadId } })

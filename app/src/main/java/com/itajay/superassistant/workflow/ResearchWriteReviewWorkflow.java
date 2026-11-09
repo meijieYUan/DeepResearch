@@ -15,7 +15,9 @@ import com.itajay.superassistant.progress.ProgressEvent.Status;
 import com.itajay.superassistant.progress.ProgressEvent;
 import com.itajay.superassistant.progress.ProgressStage;
 import com.itajay.superassistant.tool.AnalysisStore;
+import com.itajay.superassistant.tool.DownloadFailureRegistry;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
+import com.itajay.superassistant.tool.PaperLibrary;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,27 +83,57 @@ public class ResearchWriteReviewWorkflow {
     private final WorkflowAgentRun reviewerRun;
     private final PaperAnalysisTool paperAnalysisTool;
     private final ProgressChannelRegistry progress;
+    /** Shared corpus, consulted before pausing: a paper added there is no longer missing. */
+    private final PaperLibrary paperLibrary;
+    /** What the research stage failed to download, recorded where the fetch happened. */
+    private final DownloadFailureRegistry downloadFailures;
+    /** Paused runs, so the resume endpoint can continue them. */
+    private final ResearchResumeStore resumeStore;
 
     @Autowired
     public ResearchWriteReviewWorkflow(ResearchAgent researchAgent,
                                        WriterAgent writerAgent,
                                        ReviewerAgent reviewerAgent,
                                        PaperAnalysisTool paperAnalysisTool,
-                                       ProgressChannelRegistry progress) {
+                                       ProgressChannelRegistry progress,
+                                       PaperLibrary paperLibrary,
+                                       DownloadFailureRegistry downloadFailures,
+                                       ResearchResumeStore resumeStore) {
         this((input, config) -> invoke(researchAgent.reactAgent, input, config, "research-agent"),
                 (input, config) -> invoke(writerAgent.reactAgent, input, config, "writer-agent"),
                 (input, config) -> invoke(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
-                paperAnalysisTool, progress);
+                paperAnalysisTool, progress, paperLibrary, downloadFailures, resumeStore);
     }
 
     ResearchWriteReviewWorkflow(WorkflowAgentRun researchRun, WorkflowAgentRun writerRun,
                                WorkflowAgentRun reviewerRun, PaperAnalysisTool paperAnalysisTool,
                                ProgressChannelRegistry progress) {
+        this(researchRun, writerRun, reviewerRun, paperAnalysisTool, progress, null, null, null);
+    }
+
+    ResearchWriteReviewWorkflow(WorkflowAgentRun researchRun, WorkflowAgentRun writerRun,
+                               WorkflowAgentRun reviewerRun, PaperAnalysisTool paperAnalysisTool,
+                               ProgressChannelRegistry progress,
+                               PaperLibrary paperLibrary,
+                               DownloadFailureRegistry downloadFailures) {
+        this(researchRun, writerRun, reviewerRun, paperAnalysisTool, progress,
+                paperLibrary, downloadFailures, null);
+    }
+
+    ResearchWriteReviewWorkflow(WorkflowAgentRun researchRun, WorkflowAgentRun writerRun,
+                               WorkflowAgentRun reviewerRun, PaperAnalysisTool paperAnalysisTool,
+                               ProgressChannelRegistry progress,
+                               PaperLibrary paperLibrary,
+                               DownloadFailureRegistry downloadFailures,
+                               ResearchResumeStore resumeStore) {
         this.researchRun = researchRun;
         this.writerRun = writerRun;
         this.reviewerRun = reviewerRun;
         this.paperAnalysisTool = paperAnalysisTool;
         this.progress = progress;
+        this.paperLibrary = paperLibrary;
+        this.downloadFailures = downloadFailures;
+        this.resumeStore = resumeStore;
     }
 
     @Tool(description = """
@@ -165,6 +197,16 @@ public class ResearchWriteReviewWorkflow {
             publish(activity, Operation.STAGE, Status.RUNNING, "开始检索与筛选论文");
             materials = researchRun.invoke(researchInput(topicId, brief), activity.childConfig(brief));
             publish(activity, Operation.STAGE, Status.SUCCEEDED, "检索与筛选完成");
+
+            // Anything the research stage could not obtain is a decision point, not a
+            // footnote: continuing would silently build the document on missing material.
+            // Pausing here — before the expensive close-reading pass — leaves the topic
+            // folder and every successfully downloaded paper in place, so resuming costs
+            // only the papers that were actually missing.
+            Waiting waiting = pausedForManualDownload(threadId, topicId, brief, run, activity);
+            if (waiting != null) {
+                return waiting.report;
+            }
 
             while (rounds < MAX_REVIEW_ROUNDS) {
                 rounds++;
@@ -253,6 +295,99 @@ public class ResearchWriteReviewWorkflow {
                     + (documentOutput == null ? "" : "\n(An earlier draft may still have been written.)")
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)";
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Waiting for a manual download
+    // ──────────────────────────────────────────────────────────────────────
+
+    /** Outcome of a pause: the report the caller returns, plus what is missing. */
+    private record Waiting(String report) {
+    }
+
+    /**
+     * Stops the workflow when the research stage could not obtain some papers.
+     *
+     * <p>The failure list comes from {@link DownloadFailureRegistry}, not from parsing
+     * the research agent's prose: what actually failed is known exactly where the fetch
+     * happened, and a model-written summary would make this decision drift run to run.</p>
+     *
+     * <p>Papers the user supplied through the library are re-checked here — the library
+     * copy makes a paper available that was missing a moment ago, so a resumed run with
+     * the files added proceeds without another network attempt.</p>
+     *
+     * @return the pause result, or {@code null} when there is nothing missing
+     */
+    private Waiting pausedForManualDownload(String threadId, String topicId, String brief,
+                                            ProgressContext run, ProgressContext activity) {
+        if (downloadFailures == null || threadId == null) {
+            return null;
+        }
+        DownloadFailureRegistry.Snapshot snapshot = downloadFailures.drain(threadId, topicId);
+        if (snapshot.isEmpty()) {
+            return null;
+        }
+
+        // A paper that has since appeared in the library is no longer missing. Checked
+        // here so an interrupted run resumed after the user dropped files in does not
+        // pause again on papers it now has.
+        List<DownloadFailureRegistry.Failure> stillMissing = snapshot.items().stream()
+                .filter(failure -> paperLibrary == null
+                        || paperLibrary.find(failure.shortName(), failure.url()).isEmpty())
+                .toList();
+        if (stillMissing.isEmpty()) {
+            log.info("Research stage reported failures, but all are present in the paper library [topic={}]",
+                    topicId);
+            return null;
+        }
+
+        ProgressContext paused = run.at(ProgressStage.WAITING, 1);
+        publish(paused, Operation.STAGE, Status.RUNNING, "缺少论文全文，等待人工补充");
+        log.info("Research stage paused for manual download [topic={}, missing={}]",
+                topicId, stillMissing.size());
+
+        // Registered so POST /api/chat/{threadId}/resume can pick the run back up. The
+        // brief travels verbatim: the resumed run must research the same thing, and the
+        // topic folder is what makes every already-downloaded paper free.
+        if (resumeStore != null) {
+            resumeStore.put(threadId, topicId, brief, stillMissing.stream()
+                    .map(f -> new ResearchResumeStore.MissingPaper(f.shortName(), f.reason()))
+                    .toList());
+        }
+        return new Waiting(waitingReport(topicId, brief, stillMissing));
+    }
+
+    /** The message the model (and through it, the user) receives when the run pauses. */
+    private String waitingReport(String topicId, String brief,
+                                 List<DownloadFailureRegistry.Failure> missing) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("WORKFLOW_WAITING_FOR_PAPERS\n");
+        sb.append("课题方向: ").append(topicId).append('\n');
+        sb.append("状态: 研究阶段已暂停，等待人工补充论文全文（未进入精读与写作）。\n\n");
+        sb.append("以下 ").append(missing.size()).append(" 篇论文自动下载失败：\n");
+        for (DownloadFailureRegistry.Failure failure : missing) {
+            sb.append("- ").append(failure.shortName());
+            if (failure.url() != null && !failure.url().isBlank()) {
+                sb.append("  (").append(failure.url()).append(')');
+            }
+            if (failure.reason() != null && !failure.reason().isBlank()) {
+                sb.append("\n  原因: ").append(failure.reason());
+            }
+            sb.append('\n');
+        }
+        sb.append("""
+
+                请向用户说明：
+                1. 上述论文需要手动下载 PDF，文件名用「短名.pdf」放到本地论文库：
+                   paper-library/papers/
+                2. 放好后调用 resume 接口继续本次调研：
+                   POST /api/chat/{threadId}/resume          （接着本次会话继续）
+                3. 已下载的论文、论文库与课题目录都保留着，继续时不会重新检索或重新下载它们。
+
+                本次运行到此为止，不要声称已完成调研，也不要凭摘要编造全文内容。
+                """);
+        sb.append("\n原始调研要求（恢复时沿用）：\n").append(truncate(brief));
+        return sb.toString();
     }
 
     // ──────────────────────────────────────────────────────────────────────
