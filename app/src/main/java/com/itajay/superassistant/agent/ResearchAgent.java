@@ -46,7 +46,8 @@ public class ResearchAgent {
 
                         然后严格按 research-guide.md 执行：
                         1. 解析输入课题的范围参数（时间范围、目标论文数、语言），候选池规模 = 目标论文数 × 3。
-                        2. 构造 2-4 组中英文检索式，在至少 3 个站点检索（arXiv / Semantic Scholar / OpenReview / DBLP / Google Scholar / CNKI / PubMed / IEEE Xplore），建立候选池。
+                        2. 构造 2-4 组中英文检索式，在实测可用的入口检索（arXiv API / OpenReview API / PubMed / webSearch），建立候选池。
+                           不要使用 Semantic Scholar、DBLP、Google Scholar、IEEE Xplore —— 这几个站点已实测不可用。
                         3. 轻量初筛后，按 research-guide.md §5 的五维评分表做摘要级相关性判定。
                         4. **下载是唯一闸门**：只有判定为 RELEVANT（或补入的 BORDERLINE）且判定行附有摘要原文证据的论文，才允许下载。
                         5. 每篇论文标注来源等级（FULL_TEXT / ABSTRACT_ONLY / SNIPPET），供 writer-agent 判断可信度。
