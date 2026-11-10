@@ -164,7 +164,7 @@ public class PaperDownloadTool {
         // already fetched is copied in, costing nothing. The copy — not a move — keeps
         // the library intact for the next topic.
         Optional<Path> fromLibrary = library == null ? Optional.empty()
-                : library.importInto(safeName, topic);
+                : library.importInto(safeName, topic, normalizedUrl);
         if (fromLibrary.isPresent()) {
             Path copied = fromLibrary.get();
             Integer pages = PaperStore.pageCount(copied);

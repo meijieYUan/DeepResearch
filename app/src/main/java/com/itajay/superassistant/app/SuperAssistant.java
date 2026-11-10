@@ -94,6 +94,14 @@ public class SuperAssistant {
             RunnableConfig config = buildConfig(threadId);
             config.context().put("threadId", threadId);
             config.context().put("planEnabled", String.valueOf(planEnabled));
+            // Carried in the context rather than prefixed onto the message: the model
+            // must not have to re-derive which folder is meant, and a value it can
+            // merely restate correctly is one it can also restate wrongly.
+            if (request.continueTopic() != null && !request.continueTopic().isBlank()) {
+                config.context().put(
+                        com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow.CONTINUE_TOPIC_CONTEXT_KEY,
+                        request.continueTopic().trim());
+            }
             // The user message is persisted only after the run is actually accepted:
             // persisting first (the old order) left a never-processed user message in
             // the history whenever start() rejected because the thread was busy.
@@ -262,7 +270,7 @@ public class SuperAssistant {
                 .build();
     }
 
-    public record ChatRequest(String message, String mode) {
+    public record ChatRequest(String message, String mode, String continueTopic) {
         public ChatRequest {
             if (mode == null || mode.isBlank()) mode = "Default";
         }

@@ -73,6 +73,17 @@ public class ResearchWriteReviewWorkflow {
     private static final Pattern TOPIC_BREAK = Pattern.compile("[:：\\n。]");
 
     /**
+     * Run context key carrying the direction the user picked in the UI.
+     *
+     * <p>Deliberately a context value rather than text in the message. The frontend knows
+     * the exact folder name; the model only knows what it was told. Passing it through the
+     * context means a continuation lands in the right folder even when the model's copy of
+     * the name is a paraphrase — and it is what makes the tool's {@code continueTopic}
+     * argument optional rather than load-bearing.</p>
+     */
+    public static final String CONTINUE_TOPIC_CONTEXT_KEY = "continueTopic";
+
+    /**
      * A topic identifier longer than this is prose that lost its colon. Folder names have to stay
      * short enough to be recognisable and typable, so such a string is cut at its first comma.
      */
@@ -153,6 +164,14 @@ public class ResearchWriteReviewWorkflow {
                     then the details: time range, target paper count, language, required document \
                     structure. Everything before the colon becomes the folder name, so a long opening \
                     sentence produces an unusable directory and breaks reuse across conversations.""") String topic,
+            @ToolParam(description = """
+                    Optional. Set ONLY when the user asked to continue an existing investigation
+                    direction. Use the exact folder name returned by GET /api/research/topics — no
+                    paraphrase, no translation, no trimming. When set, the topic identifier is taken
+                    from here verbatim instead of from the brief, so the papers, per-paper analyses
+                    and document of that direction are reused, and the brief may then open with the
+                    details rather than with an identifier. When the user wants a new direction,
+                    leave it empty.""", required = false) String continueTopic,
             ToolContext toolContext) {
 
         String threadId = threadIdOf(toolContext);
@@ -171,7 +190,20 @@ public class ResearchWriteReviewWorkflow {
         // sentence. The review then reported an empty document and an empty figure inventory as
         // blockers, blaming the writer for a mismatch the workflow had created.
         String brief = topic;
-        String topicId = topicIdentifier(brief);
+        // A continuation names its folder outright. Taking the identifier from the brief
+        // instead would re-derive it — and a paraphrase of an existing folder is a new
+        // folder, which silently splits one investigation into two.
+        //
+        // The UI-supplied direction wins over the tool argument: it came from the folder
+        // listing itself, while the argument came through the model.
+        String requestedTopic = continueTopicOf(toolContext);
+        if (requestedTopic == null || requestedTopic.isBlank()) {
+            requestedTopic = continueTopic;
+        }
+        boolean continuing = requestedTopic != null && !requestedTopic.isBlank();
+        String topicId = continuing
+                ? WorkspacePaths.slugify(requestedTopic, "课题方向")
+                : topicIdentifier(brief);
         ProgressContext run = new ProgressContext(threadId, UUID.randomUUID().toString(),
                 ProgressEvent.Workflow.RESEARCH_WRITE_REVIEW, ProgressStage.RESEARCHING, 0, topicId, null);
         ProgressContext activity = run;
@@ -191,11 +223,25 @@ public class ResearchWriteReviewWorkflow {
         // draft and the loop could never converge. The workflow owns the layout.
         String documentPath = null;
 
+        // Where a continuation's superseded document went, so the research and writer
+        // stages can read it as their baseline. Null for a fresh investigation.
+        String archivedDocument = null;
+
         try {
             documentPath = documentPathFor(topicId);
+            // A continuation rewrites the direction's one document. Move the previous
+            // version aside first so the rewrite is not a silent overwrite: the writer is
+            // told to build on that document, and the user may still want the old one.
+            if (continuing) {
+                archivedDocument = archiveDocument(topicId);
+                publish(run, Operation.WORKFLOW, Status.RUNNING,
+                        "继续已有方向：" + topicId + "（复用已有论文与精读结果）");
+            }
             activity = run.at(ProgressStage.RESEARCHING, 1);
             publish(activity, Operation.STAGE, Status.RUNNING, "开始检索与筛选论文");
-            materials = researchRun.invoke(researchInput(topicId, brief), activity.childConfig(brief));
+            materials = researchRun.invoke(
+                    researchInput(topicId, brief, continuing, archivedDocument),
+                    activity.childConfig(brief));
             publish(activity, Operation.STAGE, Status.SUCCEEDED, "检索与筛选完成");
 
             // Anything the research stage could not obtain is a decision point, not a
@@ -226,7 +272,8 @@ public class ResearchWriteReviewWorkflow {
                 publish(activity, Operation.STAGE, Status.RUNNING,
                         rounds == 1 ? "开始撰写文档" : "按审查意见修订文档");
                 documentOutput = writerRun.invoke(
-                        writerInput(topicId, brief, materials, analysisIndex, review, reviewed),
+                        writerInput(topicId, brief, materials, analysisIndex, review, reviewed,
+                                continuing, archivedDocument),
                         activity.childConfig(brief));
                 publish(activity, Operation.STAGE, Status.SUCCEEDED,
                         rounds == 1 ? "文档写作阶段结束" : "文档修订阶段结束");
@@ -295,6 +342,17 @@ public class ResearchWriteReviewWorkflow {
                     + (documentOutput == null ? "" : "\n(An earlier draft may still have been written.)")
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)";
         }
+    }
+
+    /**
+     * Entry without a selected direction: the topic identifier is derived from the brief.
+     *
+     * <p>Not annotated as a tool — an overload of a tool method would be ambiguous to the
+     * framework's schema introspection. It exists so Java callers (tests, and any future
+     * internal driver) do not have to pass a null for a parameter they do not use.</p>
+     */
+    String researchWriteReview(String topic, ToolContext toolContext) {
+        return researchWriteReview(topic, null, toolContext);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -378,8 +436,10 @@ public class ResearchWriteReviewWorkflow {
         sb.append("""
 
                 请向用户说明：
-                1. 上述论文需要手动下载 PDF，文件名用「短名.pdf」放到本地论文库：
-                   paper-library/papers/
+                1. 上述论文需要手动下载 PDF，放进本地论文库：paper-library/papers/
+                   文件名**不必**精确匹配短名——系统会读取 PDF 首页的 arXiv 编号 / DOI / 标题来识别。
+                   若某篇识别不出来，再把它改名为「上面列出的短名.pdf」即可。
+                   已下载的一律保持原名也可以，不要为了改名而重复下载。
                 2. 放好后调用 resume 接口继续本次调研：
                    POST /api/chat/{threadId}/resume          （接着本次会话继续）
                 3. 已下载的论文、论文库与课题目录都保留着，继续时不会重新检索或重新下载它们。
@@ -403,16 +463,45 @@ public class ResearchWriteReviewWorkflow {
      * then nothing else in the run agreed with the answer.</p>
      */
     private String researchInput(String topicId, String brief) {
-        return """
-                课题方向：%s
+        return researchInput(topicId, brief, false, null);
+    }
 
-                本次调研的要求：
-
-                %s
-
+    /**
+     * Research stage input.
+     *
+     * <p>A continuation says so explicitly, and says what is already in the folder. The
+     * research agent's default instinct on a fresh instruction is to rebuild a candidate
+     * pool from scratch and download it again; without this paragraph the same papers get
+     * re-fetched under slightly different short names, which is precisely the duplicate
+     * corpus the shared library exists to avoid.</p>
+     *
+     * @param continuing      this run extends an existing direction rather than starting one
+     * @param previousDocument project-relative path of the document being superseded, if any
+     */
+    private String researchInput(String topicId, String brief, boolean continuing, String previousDocument) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("课题方向：").append(topicId).append("\n\n");
+        sb.append("本次调研的要求：\n\n").append(brief.strip()).append("\n\n");
+        if (continuing) {
+            sb.append("""
+                    这是对**已有课题方向**的续调研，不是新课题：
+                    - 该方向下已有的论文、精读结果和文档都已保留，会被本次运行复用。
+                    - 先用 listDownloadedPapers(topic) 和 listLibraryPapers() 看清已有什么，
+                      不要重复下载已有的论文；检索的目标是**本次新增要求**覆盖到的那部分材料。
+                    - 只补充与本次新要求相关、且现有论文里没有的文献。若现有材料已经足够，
+                      就明确说明"无需新增论文"，不要再凑数。
+                    """);
+            if (previousDocument != null) {
+                sb.append('\n').append("上一版文档（本次将在此基础上续写/改写）：")
+                        .append(previousDocument).append('\n');
+            }
+            sb.append('\n');
+        }
+        sb.append("""
                 论文必须下载到这个课题方向下（`downloadPaper` 的 topic 参数逐字使用上面这行），
                 后续各阶段会用同一个课题方向取回它们。不要另起名称、不要改写、不要截短。
-                """.formatted(topicId, brief.strip());
+                """);
+        return sb.toString();
     }
 
     /** Research revision pass: the previous material plus the findings that need more of it. */
@@ -441,6 +530,26 @@ public class ResearchWriteReviewWorkflow {
     /** Writer input for round 1 (materials only) and later rounds (materials plus findings). */
     private String writerInput(String topicId, String brief, String materials,
                                String analysisIndex, ReviewResult previousReview, ReadBack previousDocument) {
+        return writerInput(topicId, brief, materials, analysisIndex, previousReview, previousDocument,
+                false, null);
+    }
+
+    /**
+     * Writer input.
+     *
+     * <p>A continuation differs in one way that matters to the writer: the document is not
+     * being created, it is being extended. Without saying so the writer treats the brief as
+     * the whole scope and produces a document covering only what this run researched,
+     * silently dropping the papers the direction already had — the document shrinks on
+     * every continuation. Naming the archived copy makes "build on this, don't replace it"
+     * checkable rather than a matter of the model's reading of the brief.</p>
+     *
+     * @param continuing       this run extends an existing direction
+     * @param archivedDocument the superseded document moved to {@code document/history/}
+     */
+    private String writerInput(String topicId, String brief, String materials,
+                               String analysisIndex, ReviewResult previousReview, ReadBack previousDocument,
+                               boolean continuing, String archivedDocument) {
         StringBuilder sb = new StringBuilder();
         sb.append("课题方向：").append(topicId).append("\n\n");
         sb.append("本次调研的要求：\n").append(brief.strip()).append("\n\n");
@@ -462,6 +571,25 @@ public class ResearchWriteReviewWorkflow {
                 --- 调研材料 ---
                 """);
         sb.append(truncate(materials)).append("\n--- 材料结束 ---\n");
+
+        if (continuing && archivedDocument != null) {
+            sb.append("""
+
+                    这是对**已有方向**的续调研，不是新课题。
+                    该方向上已有论文的精读结果都在上面的索引里（含早先轮次留下的），本次文档要在它们
+                    全部基础上续写，而不是只写本次新补的论文。
+                    上一版文档已归档到：%s
+                    请先 readFile 读它，把上一版已有的内容保留并整合进新版：新增材料补充进去、
+                    本次要求涉及的结论按新证据修订。不要因为本次 brief 只提到新增内容就把旧篇目删掉。
+                    最终仍然写入同一个路径（documentName 不变），归档文件只读不改。
+                    """.formatted(archivedDocument));
+        } else if (continuing) {
+            sb.append("""
+
+                    这是对**已有方向**的续调研。该方向上已有论文的精读结果都在上面的索引里，
+                    本次文档要在它们的全部基础上撰写，而不是只写本次新补的论文。
+                    """);
+        }
 
         sb.append("""
 
@@ -773,6 +901,48 @@ public class ResearchWriteReviewWorkflow {
     }
 
     /**
+     * Moves a direction's current document into {@code document/history/} before a
+     * continuation rewrites it, and returns where it went.
+     *
+     * <p>Overwriting in place would make "continue this direction" destroy the only copy
+     * of what was written last time — and that document is the thing the user judged
+     * unsatisfactory, so being able to compare is the point. Timestamped rather than
+     * numbered because runs are not strictly sequential across conversations.</p>
+     *
+     * @return the archived file's project-relative path, or null when there was nothing
+     *         to archive (a fresh direction, or the move failed — which must not stop the
+     *         run, only cost the history entry)
+     */
+    static String archiveDocument(String topic) {
+        Path current;
+        try {
+            current = WorkspacePaths.documentsDir(topic).resolve(documentName(topic) + ".md");
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+        if (!Files.isRegularFile(current)) {
+            return null;
+        }
+        try {
+            Path history = WorkspacePaths.documentHistoryDir(topic);
+            Files.createDirectories(history);
+            String stamp = java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            Path target = history.resolve(documentName(topic) + "-" + stamp + ".md").normalize();
+            if (!target.startsWith(history)) {
+                return null;
+            }
+            Files.move(current, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            log.info("Archived previous document [{} -> {}]", WorkspacePaths.relative(current),
+                    WorkspacePaths.relative(target));
+            return WorkspacePaths.relative(target);
+        } catch (IOException | RuntimeException e) {
+            log.warn("归档旧文档失败，将原地覆盖 [topic={}]: {}", topic, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * The relative path of the document the writer reported saving, or null.
      *
      * <p>Scans for the first {@code investigation/…} token and requires it to be a
@@ -874,6 +1044,21 @@ public class ResearchWriteReviewWorkflow {
         return ToolContextHelper.getConfig(toolContext)
                 .flatMap(com.alibaba.cloud.ai.graph.RunnableConfig::threadId)
                 .orElse(null);
+    }
+
+    /**
+     * The direction the client picked, carried on the run context by the chat endpoint.
+     *
+     * <p>Read from the config context rather than from the model's arguments so the value
+     * is the folder name the UI listed, not a copy of it the model produced. Absent for
+     * every run that did not select a direction — the ordinary new-investigation path.</p>
+     */
+    static String continueTopicOf(ToolContext toolContext) {
+        if (toolContext == null || toolContext.getContext() == null) {
+            return null;
+        }
+        Object value = toolContext.getContext().get(CONTINUE_TOPIC_CONTEXT_KEY);
+        return value == null || String.valueOf(value).isBlank() ? null : String.valueOf(value).trim();
     }
 
     private void publish(ProgressContext context, Operation operation, Status status, String detail) {

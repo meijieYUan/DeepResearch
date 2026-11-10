@@ -88,7 +88,9 @@ test('chat/approval URLs, HTTP bodies and signal remain unchanged', async t => {
   await chatStream('A', 'hello', 'PlanMode', {}, signal)
   await approveStream('B', [{ toolId: 'tool', result: 'APPROVED' }], {}, signal)
   assert.equal(stats.requests[0].url, '/api/chat/A')
-  assert.equal(stats.requests[0].options.body, JSON.stringify({ message: 'hello', mode: 'PlanMode' }))
+  assert.equal(stats.requests[0].options.body, JSON.stringify({
+    message: 'hello', mode: 'PlanMode', continueTopic: null
+  }))
   assert.equal(stats.requests[1].url, '/api/chat/B/approve')
   assert.equal(stats.requests[1].options.body, JSON.stringify({ decisions: [{ toolId: 'tool', result: 'APPROVED' }] }))
   assert.strictEqual(stats.requests[0].options.signal, signal)

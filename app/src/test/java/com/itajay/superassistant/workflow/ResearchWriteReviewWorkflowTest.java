@@ -27,6 +27,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -38,6 +39,12 @@ class ResearchWriteReviewWorkflowTest {
     private static final String PASS = "{\"verdict\":\"PASS\",\"summary\":\"ok\",\"issues\":[]}";
     private final String topic = "workflow-contract-" + UUID.randomUUID();
     private final String brief = topic + ": 仅2025-2026年，2篇论文，中文，重点核对推理约束";
+    /**
+     * What the writer must receive as its requirements. Normally the brief itself; a
+     * continuation passes a different brief because the folder comes from the selected
+     * direction, not from the text.
+     */
+    private String expectedRequirements = brief;
     private final PaperAnalysisTool analysis = mock(PaperAnalysisTool.class);
     private final List<String> researchInputs = new ArrayList<>();
     private final List<String> writerInputs = new ArrayList<>();
@@ -57,7 +64,7 @@ class ResearchWriteReviewWorkflowTest {
     }
 
     private ResearchWriteReviewWorkflow workflow(List<String> reviews) {
-        when(analysis.analyzeTopicSync(eq(topic), isNull(), anyInt(), eq(brief), any(ProgressContext.class)))
+        when(analysis.analyzeTopicSync(any(), isNull(), anyInt(), anyString(), any(ProgressContext.class)))
                 .thenReturn("论文精读完成：本地测试索引");
         AtomicInteger reviewIndex = new AtomicInteger();
         return new ResearchWriteReviewWorkflow((input, config) -> {
@@ -66,7 +73,8 @@ class ResearchWriteReviewWorkflowTest {
         }, (input, config) -> {
             writerInputs.add(input);
             assertThat(config).isNotNull();
-            assertThat(config.metadata(PaperAnalysisTool.REQUIREMENTS_METADATA_KEY)).contains(brief);
+            assertThat(config.metadata(PaperAnalysisTool.REQUIREMENTS_METADATA_KEY))
+                    .contains(expectedRequirements);
             Files.createDirectories(document.getParent());
             Files.writeString(document, writerInputs.size() == 1
                     ? "# 原始文档\n\n固定正确段落。\n\n待修错误结论。" : "# 原始文档\n\n固定正确段落。\n\n已修结论。");
@@ -165,6 +173,94 @@ class ResearchWriteReviewWorkflowTest {
         assertThat(researchInputs).hasSize(2);
         assertThat(researchInputs.get(1)).contains(brief, "原始调研要求", "Alpha、Beta", "结论不符");
         assertThat(writerInputs.get(1)).contains("更新后的材料或精读结果", "固定正确段落。");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Continuing an existing direction
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * The direction selected in the UI wins over the brief — and over a paraphrase the
+     * model may have produced. A continuation that lands in a different folder splits one
+     * investigation in two, which is exactly what this parameter exists to prevent.
+     */
+    @Test
+    void aContinuationUsesTheSelectedDirectionInsteadOfTheBrief() {
+        String selected = "selected-direction-" + UUID.randomUUID();
+        String continuationBrief = "本次希望补充 2026 年的工作，重点看训练目标";
+        expectedRequirements = continuationBrief;
+        try {
+            workflow(List.of(PASS)).researchWriteReview(
+                    continuationBrief,
+                    selected,
+                    new ToolContext(Map.of()));
+
+            // Every stage was handed the selected folder, not one derived from the brief.
+            assertThat(researchInputs.get(0)).contains("课题方向：" + selected, "续调研");
+            assertThat(writerInputs.get(0)).contains("课题方向：" + selected, "已有方向");
+        } finally {
+            deleteTopic(selected);
+        }
+    }
+
+    /** The UI-carried direction takes precedence over the tool argument the model passed. */
+    @Test
+    void theClientSuppliedDirectionOutranksTheModelArgument() {
+        String fromClient = "client-direction-" + UUID.randomUUID();
+        String fromModel = "model-direction-" + UUID.randomUUID();
+        try {
+            ToolContext context = new ToolContext(Map.of(
+                    ResearchWriteReviewWorkflow.CONTINUE_TOPIC_CONTEXT_KEY, fromClient));
+            workflow(List.of(PASS)).researchWriteReview(brief, fromModel, context);
+
+            assertThat(researchInputs.get(0)).contains("课题方向：" + fromClient).doesNotContain(fromModel);
+        } finally {
+            deleteTopic(fromClient);
+        }
+    }
+
+    /**
+     * A continuation rewrites one document, so the version it replaces is moved aside
+     * first — the user wants to compare against the one they found unsatisfactory.
+     */
+    @Test
+    void aContinuationArchivesThePreviousDocument() throws IOException {
+        String continued = "archive-direction-" + UUID.randomUUID();
+        Path dir = WorkspacePaths.documentsDir(continued);
+        Path current = dir.resolve(continued + ".md");
+        try {
+            Files.createDirectories(dir);
+            Files.writeString(current, "# 上一版\n\n旧内容\n");
+
+            String archived = ResearchWriteReviewWorkflow.archiveDocument(continued);
+
+            assertThat(archived).isNotNull();
+            assertThat(archived).startsWith("investigation/" + continued + "/document/history/");
+            assertThat(Files.exists(current)).isFalse();
+            assertThat(Files.readString(WorkspacePaths.root().resolve(archived))).contains("旧内容");
+        } finally {
+            deleteTopic(continued);
+        }
+    }
+
+    /** Nothing to archive is not a failure: a first run just has no history. */
+    @Test
+    void archivingAnAbsentDocumentIsHarmless() {
+        assertThat(ResearchWriteReviewWorkflow.archiveDocument("never-written-" + UUID.randomUUID())).isNull();
+    }
+
+    private static void deleteTopic(String name) {
+        Path directory = WorkspacePaths.topicDir(name);
+        if (!Files.exists(directory)) {
+            return;
+        }
+        try (var paths = Files.walk(directory)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        } catch (IOException ignored) {
+            // best effort
+        }
     }
 
     @Test

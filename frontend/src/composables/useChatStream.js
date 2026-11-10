@@ -191,10 +191,11 @@ export function useChatStream({
 
   /**
    * Send a user turn and open the run that answers it. `text` is the trimmed
-   * composer value, `mode` the plan-mode selection. Returns false when there is
+   * composer value, `mode` the plan-mode selection, `continueTopic` the existing
+   * direction the user chose to extend (optional). Returns false when there is
    * no thread to send into.
    */
-  function send(text, mode) {
+  function send(text, mode, continueTopic = '') {
     const threadId = activeThreadId.value
     const t = threadId ? threads.value[threadId] : null
     if (!t || loading.value || liveStream) return false
@@ -212,7 +213,7 @@ export function useChatStream({
     const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
     t.messages.push(bubble)
     runStream(threadId, bubble.id, (signal, handlers) =>
-      requestChat(threadId, text, mode, handlers, signal))
+      requestChat(threadId, text, mode, handlers, signal, continueTopic))
     return true
   }
 

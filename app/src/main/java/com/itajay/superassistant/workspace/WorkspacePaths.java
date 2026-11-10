@@ -39,6 +39,7 @@ public final class WorkspacePaths {
     public static final String ANALYSIS_SUBDIR = "analysis";
     public static final String FIGURES_SUBDIR = "figures";
     public static final String DOCUMENTS_SUBDIR = "document";
+    public static final String HISTORY_SUBDIR = "history";
 
     /**
      * Project-wide paper library, shared by every conversation and every topic.
@@ -109,6 +110,20 @@ public final class WorkspacePaths {
     /** {@code investigation/{topic}/document} */
     public static Path documentsDir(String topic) {
         return topicDir(topic).resolve(DOCUMENTS_SUBDIR).normalize();
+    }
+
+    /**
+     * {@code investigation/{topic}/document/history} — superseded versions of the
+     * document.
+     *
+     * <p>A continuation rewrites the topic's document in place, so the version it
+     * replaces is moved here first. Kept inside the topic rather than as sibling files
+     * because the reusable path the writer and reviewer are told about must stay one
+     * file: {@code document/{topic}.md} is the answer, and the history is the record of
+     * how it got there.</p>
+     */
+    public static Path documentHistoryDir(String topic) {
+        return documentsDir(topic).resolve(HISTORY_SUBDIR).normalize();
     }
 
     /** The {@code investigation} folder itself, used as the boundary for path checks. */
