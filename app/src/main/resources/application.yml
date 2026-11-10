@@ -6,6 +6,15 @@ spring:
     exclude:
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeMultimodalEmbeddingAutoConfiguration
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      # DashScope 仅用于可选的文本 Embedding。其余 DashScope 能力（Agent/图像/视频/
+      # 语音/精排）本项目未使用，且会在 API Key 为空时创建 Bean 并直接失败，
+      # 因此全部排除；Embedding 未配置时由 OptionalMilvusVectorStore 自动降级。
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeImageAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeVideoAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioSpeechAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioTranscriptionAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeRerankAutoConfiguration
       # 排除 Spring AI 的 JDBC 会话记忆自动配置。
       # 原因：它的 @ConditionalOnMissingBean 推断的是自己的 JdbcChatMemoryRepository 类型，
       # 而本项目的 CustomJdbcChatMemoryRepository 是实现同一接口的另一个类，无法满足该条件，
@@ -17,14 +26,19 @@ spring:
 
   ai:
     dashscope:
-      api-key: ${EMBEDDING_KEY}
+      # Embedding 是可选能力，默认关闭：DashScope 自动配置在 API Key 为空时会
+      # 直接抛错，因此不能只留空 Key。需要向量检索时设置
+      #   EMBEDDING_ENABLED=true + EMBEDDING_KEY=...
+      # 未启用时向量检索/写入自动禁用，RAG 退化为 BM25，主进程不受影响。
+      enabled: ${EMBEDDING_ENABLED:false}
+      api-key: ${EMBEDDING_KEY:}
 
     deepseek:
       api-key: ${DEEPSEEK_API_KEY}
-      base-url: https://api.deepseek.com
+      base-url: https://llm-gateway.momenta.works
       chat:
         options:
-          model: deepseek-chat
+          model: deepseek-v4.1-flash
           temperature: 0.7
           # 输出上限，显式固定而非依赖供应商默认值。8192 已是 deepseek-chat 的上限。
           # writer-agent 把整篇文档作为 writeResearchDocument 的单个参数一次输出，因此文档越大越
@@ -36,7 +50,13 @@ spring:
 
     mcp:
       client:
-        enabled: true
+        # MCP 是可选能力，不是启动前提：
+        #   - initialized=false 让客户端不在启动阶段主动连接，首次解析工具时才按需初始化；
+        #   - 主 Agent 通过 McpToolLoader 尽力加载工具，服务不存在/连不上只记 WARN 并跳过，
+        #     不影响主进程、本地工具和调研工作流；
+        #   - 完全不需要 MCP 时设置 MCP_ENABLED=false 可彻底关闭 MCP 客户端自动配置。
+        enabled: ${MCP_ENABLED:true}
+        initialized: false
         name: super-assistant
         version: 1.0.0
         type: SYNC
@@ -48,7 +68,8 @@ spring:
               url: ${MCP_EMAIL_URL:http://localhost:8081}
               sse-endpoint: /sse
 
-  # 数据源由 Spring Boot 自动配置装配（SaverConfig 不再手写 DataSource Bean）。
+  # 数据源配置由本段驱动；SaverConfig 显式声明 DataSource Bean（原因见 SaverConfig 注释：
+  # Spring Boot 4 的包迁移破坏了 MyBatis-Plus 3.5.17 的自动配置排序）。
   # 凭据一律走环境变量，冒号后为本地开发默认值；生产部署必须显式设置 DB_PASSWORD。
   datasource:
     url: ${DB_URL:jdbc:mysql://localhost:3306/superassistant}
@@ -67,6 +88,13 @@ server:
   port: 8080
 
 rag:
+  vector:
+    # Milvus 与 Embedding 均为可选依赖；不可用时 RAG 自动退化为 BM25。
+    # Windows 下 localhost 可能优先解析为 IPv6，而 Docker 映射通常只监听 IPv4，
+    # 因此默认使用 127.0.0.1。
+    milvus:
+      host: ${MILVUS_HOST:127.0.0.1}
+      port: ${MILVUS_PORT:9090}
   retrieval:
     vector:
       top-k: 5

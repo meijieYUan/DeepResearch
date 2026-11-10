@@ -72,7 +72,7 @@ investigation/智能体的上下文管理/
 ## 快速开始
 
 ```bash
-# 后端（需配置 LLM API Key、MySQL 与 MCP 邮件服务）
+# 后端（需配置 LLM API Key 与 MySQL；MCP 邮件服务是可选能力，未启动也能正常运行）
 ./mvnw -pl app spring-boot:run            # :8080
 
 # 前端

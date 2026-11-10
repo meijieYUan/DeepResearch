@@ -46,7 +46,8 @@ public class ResearchAgent {
 
                         然后严格按 research-guide.md 执行：
                         1. 解析输入课题的范围参数（时间范围、目标论文数、语言），候选池规模 = 目标论文数 × 3。
-                        2. 构造 2-4 组中英文检索式，在至少 3 个站点检索（arXiv / Semantic Scholar / OpenReview / DBLP / Google Scholar / CNKI / PubMed / IEEE Xplore），建立候选池。
+                        2. 构造 2-4 组中英文检索式，在实测可用的入口检索（arXiv API / OpenReview API / PubMed / webSearch），建立候选池。
+                           不要使用 Semantic Scholar、DBLP、Google Scholar、IEEE Xplore —— 这几个站点已实测不可用。
                         3. 轻量初筛后，按 research-guide.md §5 的五维评分表做摘要级相关性判定。
                         4. **下载是唯一闸门**：只有判定为 RELEVANT（或补入的 BORDERLINE）且判定行附有摘要原文证据的论文，才允许下载。
                         5. 每篇论文标注来源等级（FULL_TEXT / ABSTRACT_ONLY / SNIPPET），供 writer-agent 判断可信度。
@@ -72,9 +73,17 @@ public class ResearchAgent {
                         - webSearch 每次最多返回 8 条结果，靠多检索式、多站点扩大候选池。
                         - webCrawl 只解析 HTML，无法解析 PDF 二进制；摘要请从 /abs/ 等 HTML 摘要页读取，不要用 webCrawl 打开 .pdf 链接。
                         - listDownloadedPapers(topic) 先查重，避免重复下载同一课题下已有的论文。
+                        - listLibraryPapers 查看本地论文库（所有课题共用）。downloadPaper 会**先查论文库**，
+                          命中就复制进课题目录，不联网；因此重复的论文不必自己再找源。
                         - downloadPaper(topic, url, shortName) 下载已判定相关的论文 PDF（接受 PDF 链接、arXiv abs 页、DOI、出版社 landing page），
                           会自动重试、校验并去重；返回的 path 形如 investigation/{课题方向}/papers/{论文短名}.pdf。
                         你**没有**读取 PDF 正文的工具，这是有意为之，不要尝试绕过。
+
+                        下载失败的处置：
+                        - 单篇失败先换源（arXiv 镜像 / OpenReview / 作者主页）再试，不要反复重试同一个 URL。
+                        - 换源后仍然失败的，如实记录该论文的短名与原始链接，**不要**为了凑数改标为相关、
+                          也不要把摘要页当成全文下载。工作流会据此暂停并请用户手动补齐这篇论文。
+                        - 论文库里已有同名的直接复用，不要因为它"看起来没下载过"就重新联网。
 
                         约束：除 downloadPaper 下载论文外，不要执行写入、删除、发送邮件等副作用操作。
                         输出格式：按 research-guide.md 的"输出契约"节输出 Markdown 材料，

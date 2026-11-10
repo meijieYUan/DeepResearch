@@ -44,7 +44,7 @@ class PaperDownloadProgressTest {
         }
     };
 
-    private final PaperDownloadTool tool = new PaperDownloadTool(new PaperDownloadProperties(), recorder);
+    private final PaperDownloadTool tool = new PaperDownloadTool(new PaperDownloadProperties(), recorder, null, null);
 
     @AfterEach
     void cleanUp() throws IOException {

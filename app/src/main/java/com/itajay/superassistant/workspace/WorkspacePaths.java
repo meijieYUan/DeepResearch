@@ -39,6 +39,17 @@ public final class WorkspacePaths {
     public static final String ANALYSIS_SUBDIR = "analysis";
     public static final String FIGURES_SUBDIR = "figures";
     public static final String DOCUMENTS_SUBDIR = "document";
+    public static final String HISTORY_SUBDIR = "history";
+
+    /**
+     * Project-wide paper library, shared by every conversation and every topic.
+     *
+     * <p>Deliberately <em>outside</em> {@code investigation/}: a topic directory is one
+     * investigation's workspace, while the library is the corpus every investigation draws
+     * from. Papers land here on download and are copied — never moved — into a topic, so a
+     * later topic researching the same area costs nothing.</p>
+     */
+    public static final String PAPER_LIBRARY_DIR = "paper-library";
 
     private static final int MAX_SEGMENT_LENGTH = 80;
 
@@ -101,9 +112,33 @@ public final class WorkspacePaths {
         return topicDir(topic).resolve(DOCUMENTS_SUBDIR).normalize();
     }
 
+    /**
+     * {@code investigation/{topic}/document/history} — superseded versions of the
+     * document.
+     *
+     * <p>A continuation rewrites the topic's document in place, so the version it
+     * replaces is moved here first. Kept inside the topic rather than as sibling files
+     * because the reusable path the writer and reviewer are told about must stay one
+     * file: {@code document/{topic}.md} is the answer, and the history is the record of
+     * how it got there.</p>
+     */
+    public static Path documentHistoryDir(String topic) {
+        return documentsDir(topic).resolve(HISTORY_SUBDIR).normalize();
+    }
+
     /** The {@code investigation} folder itself, used as the boundary for path checks. */
     public static Path investigationRoot() {
         return root().resolve(INVESTIGATION_DIR).normalize();
+    }
+
+    /**
+     * {@code paper-library/papers} — the shared corpus every topic draws from.
+     *
+     * <p>Flat, keyed by paper short name, so a human can drop a PDF in by hand during a
+     * waiting-for-download pause without guessing any sub-structure.</p>
+     */
+    public static Path paperLibraryDir() {
+        return root().resolve(PAPER_LIBRARY_DIR).resolve(PAPERS_SUBDIR).normalize();
     }
 
     /**

@@ -1,5 +1,7 @@
 package com.itajay.superassistant.rag;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.rag.Query;
 import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
@@ -13,9 +15,14 @@ import java.util.List;
 /**
  * 多路检索：向量检索（Milvus）+ BM25 关键字检索（Lucene），
  * 再通过 RRF 融合为候选列表，交给后续精排。
+ *
+ * <p>两路相互独立：向量路失败（Embedding 未配置、Milvus 不可达）只损失向量候选，
+ * BM25 仍照常参与融合；反之亦然。RAG 的可用性不依赖向量能力。</p>
  */
 @Component
 public class DocumentRetrieval {
+
+    private static final Logger log = LoggerFactory.getLogger(DocumentRetrieval.class);
 
     private final DocumentRetriever vectorRetriever;
     private final Bm25DocumentRetriever bm25Retriever;
@@ -45,8 +52,29 @@ public class DocumentRetrieval {
      * @return 融合后的候选文档列表
      */
     public List<Document> doRetrieve(Query query) {
-        List<Document> vectorDocs = vectorRetriever.retrieve(query);
-        List<Document> bm25Docs = bm25Retriever.retrieve(query);
+        List<Document> vectorDocs = retrieveWithVector(query);
+        List<Document> bm25Docs = retrieveWithBm25(query);
+        if (vectorDocs.isEmpty() && bm25Docs.isEmpty()) {
+            return List.of();
+        }
         return DocumentFusion.reciprocalRankFusion(List.of(vectorDocs, bm25Docs), fusionTopK, rrfK);
+    }
+
+    private List<Document> retrieveWithVector(Query query) {
+        try {
+            return vectorRetriever.retrieve(query);
+        } catch (Exception e) {
+            log.warn("向量检索不可用，本次仅使用 BM25：{}", e.toString());
+            return List.of();
+        }
+    }
+
+    private List<Document> retrieveWithBm25(Query query) {
+        try {
+            return bm25Retriever.retrieve(query);
+        } catch (Exception e) {
+            log.warn("BM25 检索失败，本次仅使用向量结果（若可用）：{}", e.toString());
+            return List.of();
+        }
     }
 }

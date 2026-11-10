@@ -473,6 +473,7 @@ public class PaperDeepReadWorkflow {
             case LOCAL_COPY -> "来源：本地复制";
             case REUSED_IN_TOPIC -> "来源：本课题已有";
             case COPIED_FROM_OTHER_TOPIC -> "来源：复用其他课题 — " + acquired.detail();
+            case COPIED_FROM_LIBRARY -> "来源：本地论文库 — " + acquired.detail();
             case DOWNLOAD -> "来源：下载";
             case NOT_FOUND -> "来源：未获取";
         };

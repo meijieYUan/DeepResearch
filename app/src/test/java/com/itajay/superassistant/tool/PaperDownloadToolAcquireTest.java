@@ -42,7 +42,9 @@ class PaperDownloadToolAcquireTest {
                 public void publish(String threadId, ProgressEvent event) {
                     progressEvents.add(event);
                 }
-            });
+            },
+            null,
+            null);
 
     @AfterEach
     void cleanUp() throws IOException {

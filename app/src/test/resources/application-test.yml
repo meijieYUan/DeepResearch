@@ -3,8 +3,9 @@
 # 用途：为不依赖真实外部基础设施的测试提供可启动的 Spring 上下文。
 # 启用方式：在测试类上标注 @ActiveProfiles("test")（Spring Boot 不会自动激活本文件）。
 #
-# 说明：启动完整应用上下文还需要 MySQL 表结构（checkpoint / mybatis 表）、Milvus 向量库、
-# 以及 MCP 邮件服务；本文件只把「能靠内存替身满足的部分」替换掉，作为后续单测的起点，
+# 说明：启动完整应用上下文还需要 MySQL 表结构（checkpoint / mybatis 表）与 Milvus 向量库；
+# MCP 邮件服务是可选能力（不可用时只跳过对应工具），不再是启动前提。
+# 本文件只把「能靠内存替身满足的部分」替换掉，作为后续单测的起点，
 # 不保证 standalone 就能撑起整个 SuperAssistantApplication 上下文。
 # 因此 SuperAssistantApplicationTests#contextLoads 仍标注 @Disabled，
 # 需要真机依赖的集成验证请显式启用集成 profile 后运行。

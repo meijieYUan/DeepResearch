@@ -101,11 +101,22 @@ export async function streamChatEvents(threadId, path, body, handlers, signal) {
   }
 }
 
-export const chatStream = (threadId, message, mode, handlers, signal) =>
-  streamChatEvents(threadId, '', { message, mode }, handlers, signal)
+// `continueTopic` is the direction picked from /research/topics, passed through
+// untouched. It goes in the request body rather than at the start of `message`:
+// the folder name is what the backend keys everything on, so it must not be
+// re-typed by whoever (or whatever) writes the message text.
+export const chatStream = (threadId, message, mode, handlers, signal, continueTopic = '') =>
+  streamChatEvents(threadId, '', { message, mode, continueTopic: continueTopic || null },
+    handlers, signal)
 
 export const approveStream = (threadId, decisions, handlers, signal) =>
   streamChatEvents(threadId, '/approve', { decisions }, handlers, signal)
+
+// Continue a research run that paused for manually downloaded papers. No body:
+// the server holds the paused topic and brief, which is what makes the resume
+// idempotent and keeps the client from having to remember them.
+export const resumeStream = (threadId, handlers, signal) =>
+  streamChatEvents(threadId, '/resume', {}, handlers, signal)
 
 // Todos — every query is scoped to a conversation threadId
 export const getTodos = (threadId) => api.get('/todos', { params: { threadId }, silent: true })
@@ -113,6 +124,12 @@ export const getPendingTodos = (threadId) => api.get('/todos/pending', { params:
 export const getOverdueTodos = (threadId) => api.get('/todos/overdue', { params: { threadId } })
 export const queryTodos = (threadId, status, priority, keyword) =>
   api.post('/todos/query', { threadId, status, priority, keyword })
+
+// Existing investigation directions, most recently touched first. Each row's
+// `topic` is the folder name — the exact value a continuation must send back as
+// `continueTopic`, so the client never reconstructs it.
+export const getResearchTopics = () =>
+  api.get('/research/topics', { silent: true, timeout: 15000 })
 
 // Knowledge
 export const uploadKnowledge = (file) => {

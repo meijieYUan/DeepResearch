@@ -11,6 +11,8 @@ import com.itajay.superassistant.plan.PlanModeContext;
 import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.security.HITLHelper;
 import com.itajay.superassistant.security.PendingInterruptionStore;
+import com.itajay.superassistant.workflow.ResearchResumeStore;
+import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,6 +86,8 @@ public class ChatStreamingService {
     private final AgentRunner agentRunner;
     private final ProgressChannelRegistry progressChannels;
     private final PendingInterruptionStore pendingInterruptionStore;
+    /** Paused-for-papers runs; consulted at the end of a run to emit the {@code waiting} event. */
+    private final ResearchResumeStore resumeStore;
 
     private final ExecutorService runner = new ThreadPoolExecutor(
             0, MAX_CONCURRENT_RUNS, 60L, TimeUnit.SECONDS,
@@ -108,16 +112,25 @@ public class ChatStreamingService {
     @Autowired
     public ChatStreamingService(ReactAgent mainAgent,
                                 ProgressChannelRegistry progressChannels,
-                                PendingInterruptionStore pendingInterruptionStore) {
-        this(mainAgent::stream, progressChannels, pendingInterruptionStore);
+                                PendingInterruptionStore pendingInterruptionStore,
+                                ResearchResumeStore resumeStore) {
+        this(mainAgent::stream, progressChannels, pendingInterruptionStore, resumeStore);
     }
 
     ChatStreamingService(AgentRunner agentRunner,
                          ProgressChannelRegistry progressChannels,
                          PendingInterruptionStore pendingInterruptionStore) {
+        this(agentRunner, progressChannels, pendingInterruptionStore, null);
+    }
+
+    ChatStreamingService(AgentRunner agentRunner,
+                         ProgressChannelRegistry progressChannels,
+                         PendingInterruptionStore pendingInterruptionStore,
+                         ResearchResumeStore resumeStore) {
         this.agentRunner = agentRunner;
         this.progressChannels = progressChannels;
         this.pendingInterruptionStore = pendingInterruptionStore;
+        this.resumeStore = resumeStore;
     }
 
     /**
@@ -239,7 +252,16 @@ public class ChatStreamingService {
                     answer = last.get().toString();
                 }
                 pendingInterruptionStore.remove(threadId);
-                sendIfOpen(open, emitter, "answer", answerPayload(threadId, answer, planEnabled));
+                // A run that paused for missing papers is neither a normal answer nor a
+                // failure: the workflow stopped on purpose and can be resumed. The event
+                // carries what is missing so the client can render a download list.
+                ResearchResumeStore.ResumeTask paused = resumeStore == null
+                        ? null : resumeStore.get(threadId).orElse(null);
+                if (paused != null) {
+                    sendIfOpen(open, emitter, "waiting", waitingPayload(threadId, paused, planEnabled));
+                } else {
+                    sendIfOpen(open, emitter, "answer", answerPayload(threadId, answer, planEnabled));
+                }
             }
         } catch (Exception e) {
             log.error("Chat stream failed [thread={}]", threadId, e);
@@ -264,6 +286,27 @@ public class ChatStreamingService {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("threadId", threadId);
         payload.put("text", answer);
+        payload.put("planEnabled", planEnabled);
+        payload.put("planActive", PlanModeContext.isActive(threadId));
+        return payload;
+    }
+
+    /**
+     * Payload for a run that stopped waiting for a manual download.
+     *
+     * <p>Mirrors {@code answer} ({@code threadId}/{@code text}/plan flags) so existing
+     * clients still render the bubble, and adds {@code missingPapers} + {@code resumeUrl}
+     * so the user knows exactly which files to fetch and how to continue.</p>
+     */
+    private Map<String, Object> waitingPayload(String threadId, ResearchResumeStore.ResumeTask paused,
+                                               boolean planEnabled) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("threadId", threadId);
+        payload.put("text", paused.brief());
+        payload.put("topic", paused.topic());
+        payload.put("libraryPath", WorkspacePaths.relative(WorkspacePaths.paperLibraryDir()));
+        payload.put("missingPapers", paused.missing());
+        payload.put("resumeUrl", "/api/chat/" + threadId + "/resume");
         payload.put("planEnabled", planEnabled);
         payload.put("planActive", PlanModeContext.isActive(threadId));
         return payload;
