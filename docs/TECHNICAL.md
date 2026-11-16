@@ -414,10 +414,10 @@ done          终止标记，随后服务端关流
 | **语言** | Java 21 |
 | **框架** | Spring Boot 4.1.0 · Spring AI 2.0 · Spring AI Alibaba 2.0.0-M1.1 |
 | **LLM** | DeepSeek (deepseek-chat) |
-| **Embedding** | DashScope（`EMBEDDING_KEY`） |
+| **Embedding** | DashScope（可选；`EMBEDDING_ENABLED=true` + `EMBEDDING_KEY`） |
 | **Agent** | ReactAgent + StateGraph + MysqlSaver（checkpoint 持久化） |
 | **RAG** | QueryExpansion · DocumentRetrieval（向量 + BM25 + RRF）· LlmDocumentReranker |
-| **向量库** | Milvus 2.4.15 (localhost:9090 → 容器 19530) |
+| **向量库** | Milvus 2.4.15 (localhost:9090 → 容器 19530)，可选 |
 | **数据库** | MySQL 8.0（`superassistant`） |
 | **ORM** | MyBatis Plus |
 | **文档解析** | PDF (ParagraphPdfDocumentReader) · Markdown · TXT/Code (TextReader) |
@@ -597,9 +597,62 @@ DeepResearchAgent/
 |--------|------|---------|----------|
 | POST | `/api/chat/{threadId}` | `{"message":"...", "mode":"Default|PlanMode"}` | `text/event-stream`：`progress` / `delta` / 终止事件（`answer` \| `interruption` \| `error`）/ `done` |
 | POST | `/api/chat/{threadId}/approve` | `{"decisions":[{"toolId","result","description?","editedArguments?"}]}` | 同 chat 流格式（恢复的运行继续在本流上输出） |
+| POST | `/api/chat/{threadId}/resume` | — | 继续「等待人工补充论文」的调研；同 chat 流格式（新增终止事件 `waiting`） |
 | GET | `/api/chat/{threadId}/stream` | — | `text/event-stream`，调试用进度旁路监听（`progress` / `done`） |
 
-`answer` / `interruption` 事件体中包含 `planEnabled` / `planActive` 字段反映计划模式状态。无法开始的请求（会话占用中、消息为空/过长、审批悬置时发新消息、decisions 校验失败、并发已达上限）同样以 `error` + `done` 事件流返回，HTTP 状态保持 200——状态行无法承载逐运行的语义。
+`answer` / `interruption` / `waiting` 事件体中包含 `planEnabled` / `planActive` 字段反映计划模式状态。无法开始的请求（会话占用中、消息为空/过长、审批悬置时发新消息、decisions 校验失败、并发已达上限）同样以 `error` + `done` 事件流返回，HTTP 状态保持 200——状态行无法承载逐运行的语义。
+
+### 本地论文库与人工介入
+
+**本地论文库** `paper-library/papers/`（项目根目录，与 `investigation/` 平级）是所有会话、所有课题共用的论文原件集合。
+
+- 下载论文时**先查论文库**：命中就复制进 `investigation/{课题}/papers/`，不联网；未命中才下载。
+- 下载成功后同时写入课题目录与论文库；课题目录里的副本被删除不影响论文库。
+- 命中判定按三层依次尝试：短名 → 记录的 arXiv ID / DOI → **从 PDF 自身读出的指纹**。
+  后一层是为人工下载准备的：`index.tsv` 追加 `title` / `fingerprintArxivId` / `fingerprintDoi` / `scanned`
+  四列，首次命中未果时扫描库内 PDF 的第 1 页（arXiv 水印章 `arXiv:2401.12345v2` 与 DOI 都印在首页），
+  结果缓存下来，此后不再解析。因此人工把文件随便命名（`2401.12345v2.pdf`、出版社默认名）也能被复用；
+  比对 arXiv 编号时忽略版本后缀，标题按去标点小写全等比对（宁可不中，也不误配另一篇）。
+  旧版 `index.tsv` 少这几列时按「未扫描」读取，首次用到时自动补齐，无需迁移。
+- 论文只复制不移动；`paper-library/` 已加入 `.gitignore`。
+
+**下载失败 → 等待人工介入**：研究阶段结束后，工作流检查本次失败的下载清单（由
+`DownloadFailureRegistry` 在下载失败处记录，不解析模型文本）。仍有缺失时不进入精读，而是：
+
+1. 推送 `progress` 事件，阶段为 `WAITING`（`等待人工补充论文`）；
+2. 以 `waiting` 事件终止本次流，携带 `topic` / `libraryPath` / `missingPapers[]` / `resumeUrl`；
+3. 用户把 PDF 放进 `paper-library/papers/`（文件名任意）后调用 `POST /api/chat/{threadId}/resume`。
+
+resume 以原课题方向与原始要求重跑同一工作流；已下载论文、论文库命中、已有精读结果都会跳过，
+因此只重做真正缺失的部分。若缺失依旧存在，会再次进入 `waiting` 并给出新清单（`ResearchResumeStore`，TTL 24 小时）。
+
+### 调研方向清单与「续调研」
+
+**方向即目录**：`investigation/{方向}/` 既是隔离单位也是复用单位，方向名是唯一键。
+
+| Method | Path | Response |
+|--------|------|----------|
+| GET | `/api/research/topics` | `[{topic, papers, analyses, hasDocument, documentPath, updatedAt}]`，按最近修改倒序 |
+
+`topic` 字段就是目录名，也是 `POST /api/chat/{threadId}` 里 `continueTopic` 应当携带的值——前端原样回传，
+不重新拼写。`TopicCatalog` 只枚举与统计（论文数、精读数、是否有文档、最后修改时间），不读文档内容。
+
+**续调研**（默认拒绝静默分叉的语义）：
+
+- 请求体新增可选字段 `continueTopic`。它被放进本次运行的 `config.context`，而不是拼进用户消息：
+  值来自目录清单本身，不是模型的复述；模型即使改写也无法影响落点。
+- 工作流同时接受工具参数 `continueTopic`（供提示词驱动的场景），但**请求字段优先**。
+  设了它，方向标识就逐字取自该值，**不再从 brief 里截取**——改写过的方向名就是另一个目录，
+  会把一次调研拆成两半。
+- 研究阶段明确被告知这是续调研：先 `listDownloadedPapers` / `listLibraryPapers` 盘点已有材料，
+  只补新要求覆盖到、且现有论文里没有的文献；若已足够，如实说明「无需新增论文」，不凑数。
+- 精读默认全部复用（`analyzeTopicSync` 已存在即跳过），只精读本轮新增论文；
+  需要重读时走已有的 `reanalyzePaper`（审查意见驱动）。
+- 写作阶段被告知这是「续写而非重写」：必须整合该方向全部精读结果，不得因本次 brief 只提新增内容
+  就删掉旧篇目。
+- 文档始终落同一个路径 `document/{方向}.md`；续调研开始前先把旧版移入
+  `document/history/{方向}-{yyyyMMdd-HHmmss}.md`（`archiveDocument`），归档件只读不改。
+  归档失败不阻塞运行，只丧失历史版本。
 
 ### 知识库
 
@@ -630,27 +683,42 @@ DeepResearchAgent/
 
 独立进程，端口 8081，通过 Spring AI MCP SSE 自动暴露工具回调给主应用。
 
+主应用对 MCP 是**软依赖**：启动阶段不主动连接（`spring.ai.mcp.client.initialized=false`），
+主 Agent 构建时由 `McpToolLoader` 尽力加载可用的工具提供者。MCP 服务不存在、地址不通或
+握手失败时只记录一条 WARN 并跳过，主进程、本地工具与调研工作流照常运行。完全不需要
+MCP 时可设置 `MCP_ENABLED=false` 关闭客户端自动配置。
+
 ## 配置说明
 
-**环境变量**（必须）：
+**环境变量**：
 
 ```bash
-DEEPSEEK_API_KEY=sk-xxxxxxxx    # DeepSeek API 密钥（对话/摘要/精排）
-EMBEDDING_KEY=sk-xxxxxxxx       # DashScope API 密钥（向量化）
-SMTP_USER=you@example.com       # 发信邮箱（MCP Email Server，无默认值）
-SMTP_PASSWORD=xxxxxxxx          # 邮箱 SMTP 密码（MCP Email Server）
+DEEPSEEK_API_KEY=sk-xxxxxxxx    # 必须：DeepSeek API 密钥（对话/摘要/精排）
+SMTP_USER=you@example.com       # 可选：发信邮箱（MCP Email Server）
+SMTP_PASSWORD=xxxxxxxx          # 可选：邮箱 SMTP 密码（MCP Email Server）
 # 可选：SMTP_HOST（默认 smtp.163.com）、SMTP_PORT（默认 465）
 # 可选（有本地开发默认值，生产必须显式设置）：
 #   DB_URL / DB_USERNAME / DB_PASSWORD   主库连接（默认 localhost:3306/superassistant, root/123456）
 #   MCP_EMAIL_URL                        MCP 邮件服务地址（默认 http://localhost:8081）
+#   MCP_ENABLED                          MCP 客户端开关（默认 true；false 时完全不连接 MCP）
+#   EMBEDDING_ENABLED                    向量能力开关（默认 false）
+#   EMBEDDING_KEY                        DashScope API 密钥；EMBEDDING_ENABLED=true 时必填
+#   MILVUS_HOST / MILVUS_PORT            Milvus 地址（默认 127.0.0.1:9090）
 #   MYSQL_ROOT_PASSWORD / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   docker-compose 基础设施凭据（见 .env.example）
 ```
+
+**可选能力降级**：Embedding / Milvus 不是启动前提。默认不启用向量能力，RAG 仅使用
+BM25 关键字召回；配置 `EMBEDDING_ENABLED=true` + `EMBEDDING_KEY` 后启用向量检索，
+若运行时 Milvus 或 Embedding 服务不可达，向量路径自动跳过，BM25 继续工作。
 
 **`app/application.yml` 关键配置**：
 
 ```yaml
 spring.ai.deepseek.api-key: ${DEEPSEEK_API_KEY}
-spring.ai.dashscope.api-key: ${EMBEDDING_KEY}
+spring.ai.dashscope.enabled: ${EMBEDDING_ENABLED:false}   # 向量能力可选，默认关闭
+spring.ai.dashscope.api-key: ${EMBEDDING_KEY:}
+spring.ai.mcp.client.enabled: ${MCP_ENABLED:true}
+spring.ai.mcp.client.initialized: false   # 启动时不主动连接，按需懒初始化
 spring.ai.mcp.client.sse.connections.email-server.url: ${MCP_EMAIL_URL:http://localhost:8081}
 # 数据源由 Spring Boot 自动配置装配（SaverConfig 只负责把 MysqlSaver 接到该 DataSource 上）
 spring.datasource.url: ${DB_URL:jdbc:mysql://localhost:3306/superassistant}
@@ -700,8 +768,8 @@ agent.checkpoint-retention:
 **外依赖启动**：
 
 ```
-Milvus    → localhost:9090
-MySQL     → localhost:3306（database: superassistant）
+MySQL     → localhost:3306（database: superassistant，必须）
+Milvus    → localhost:9090（可选；未启动时仅 BM25 检索）
 ```
 
 也可直接用项目根目录的 Docker Compose 启动 MySQL + Milvus（含 etcd / minio 依赖）：
@@ -721,9 +789,9 @@ mysql -u root -p superassistant < app/src/main/resources/sql/custom_chat_memory.
 ## 快速启动
 
 ```bash
-# 1. 确保 Milvus + MySQL 已启动（可用 docker compose up -d）
+# 1. 确保 MySQL 已启动；Milvus 可选（可用 docker compose up -d）
 
-# 2. 启动 MCP Email Server
+# 2. （可选）启动 MCP Email Server；不启动时主应用自动降级为无邮件工具
 cd server
 mvn spring-boot:run    # → :8081
 

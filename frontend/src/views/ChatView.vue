@@ -26,11 +26,25 @@
           </button>
           <span class="thread-label">{{ activeThread ? activeThread.title || 'New conversation' : 'Select a conversation' }}</span>
         </div>
-        <label :class="['plan-toggle', { on: planMode }]" title="Enable Plan Mode: when ON, the assistant may enter plan mode for complex tasks">
-          <input type="checkbox" v-model="planMode" />
-          <span class="toggle-label">Plan Mode</span>
-          <span v-if="planMode && planActive" class="plan-active-badge">Planning</span>
-        </label>
+        <div class="header-right">
+          <!-- Continue an existing direction. The value sent is the folder name
+               exactly as the backend listed it, never a label the user retypes:
+               a near-miss folder name silently starts a second investigation. -->
+          <label class="topic-picker" :class="{ on: continueTopic }" title="在该方向下继续调研：复用已有论文与精读结果">
+            <Library :size="14" />
+            <select v-model="continueTopic" :disabled="loading">
+              <option value="">新调研方向</option>
+              <option v-for="t in topics" :key="t.topic" :value="t.topic">
+                {{ t.topic }}（{{ t.papers }} 篇）
+              </option>
+            </select>
+          </label>
+          <label :class="['plan-toggle', { on: planMode }]" title="Enable Plan Mode: when ON, the assistant may enter plan mode for complex tasks">
+            <input type="checkbox" v-model="planMode" />
+            <span class="toggle-label">Plan Mode</span>
+            <span v-if="planMode && planActive" class="plan-active-badge">Planning</span>
+          </label>
+        </div>
       </div>
 
       <div class="chat-messages scrollbar" ref="msgContainer" @scroll="onScroll">
@@ -48,6 +62,7 @@
           :msg="msg"
           :approval-disabled="loading || msg.approvalsSubmitted"
           @submit-approvals="onSubmitApprovals"
+          @resume-research="onResumeResearch"
         />
 
         <!-- Shown only once the user has scrolled away from the bottom, which is
@@ -85,10 +100,11 @@
 
 <script setup>
 import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ArrowDown, MessageSquare, PanelLeftClose, PanelLeftOpen, Send } from 'lucide-vue-next'
+import { ArrowDown, Library, MessageSquare, PanelLeftClose, PanelLeftOpen, Send } from 'lucide-vue-next'
 import MessageItem from '../components/MessageItem.vue'
 import TaskPanel from '../components/TaskPanel.vue'
 import ThreadSidebar from '../components/ThreadSidebar.vue'
+import { getResearchTopics } from '../api'
 import { useChatStream } from '../composables/useChatStream'
 import { useResizablePanel } from '../composables/useResizablePanel'
 import { useTasks } from '../composables/useTasks'
@@ -124,7 +140,30 @@ const stream = useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown
 })
-const { loading, stopStream, send, submitApprovals } = stream
+const { loading, stopStream, send, submitApprovals, resumeResearch } = stream
+
+// --- research directions ----------------------------------------------------
+// What the backend already has under investigation/. Held here rather than in the
+// stream composable: it is a property of the workspace, not of a conversation, and
+// it is refreshed after a run because a run may have created a direction.
+const topics = ref([])
+const continueTopic = ref('')
+
+async function refreshTopics() {
+  try {
+    const { data } = await getResearchTopics()
+    topics.value = Array.isArray(data) ? data : []
+  } catch {
+    // Silent: an empty picker is a correct degradation — the user can still start
+    // a new direction, and the global toast would nag on every failed poll.
+    topics.value = []
+  }
+  // A direction that vanished from disk must not stay selected and silently
+  // become a fresh folder of the same name.
+  if (continueTopic.value && !topics.value.some(t => t.topic === continueTopic.value)) {
+    continueTopic.value = ''
+  }
+}
 
 // --- composer ---------------------------------------------------------------
 const input = ref('')
@@ -154,7 +193,7 @@ function onSend() {
   // Sending is an explicit "I'm following this" signal: re-pin to the bottom
   // even if the user had scrolled up to read earlier in the conversation.
   stickToBottom.value = true
-  if (send(text, planMode.value ? 'PlanMode' : 'Default')) {
+  if (send(text, planMode.value ? 'PlanMode' : 'Default', continueTopic.value)) {
     clearInput()
     nextTick(adjustTextarea)
   }
@@ -163,6 +202,13 @@ function onSend() {
 function onSubmitApprovals(msg) {
   if (loading.value || msg.approvalsSubmitted) return
   if (submitApprovals(msg)) { stickToBottom.value = true; scrollDown(true) }
+}
+
+// Continue a run that paused on missing papers; the user has dropped them into
+// the library by now (or wants to retry the same failing set).
+function onResumeResearch(msg) {
+  if (loading.value || msg.waitingResumed) return
+  if (resumeResearch(msg)) { stickToBottom.value = true; scrollDown(true) }
 }
 
 // --- scroll -----------------------------------------------------------------
@@ -207,6 +253,13 @@ onMounted(() => {
   loadThreadSidebarPrefs()
   threadStore.init()
   refreshTasks()
+  refreshTopics()
+})
+
+// A finished run may have created or extended a direction, so the picker is
+// refreshed whenever the stream settles rather than only on mount.
+watch(loading, (busy, wasBusy) => {
+  if (wasBusy && !busy) refreshTopics()
 })
 
 // A route change unmounts the view while a run may still be streaming: abort it,
@@ -240,6 +293,7 @@ onUnmounted(() => stopStream())
   background: var(--bg2); border-bottom: 1px solid var(--border);
 }
 .header-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .icon-btn {
   display: flex; align-items: center; justify-content: center; padding: 6px;
   background: transparent; color: var(--text2); border-radius: 7px; flex-shrink: 0;
@@ -307,6 +361,21 @@ onUnmounted(() => stopStream())
 .plan-toggle.on .toggle-label { font-weight: 600; }
 .plan-toggle input { accent-color: var(--accent); cursor: pointer; margin: 0; }
 .toggle-label { font-weight: 550; }
+
+/* Direction picker: reads as a sibling of the plan toggle, but carries the
+   folder name as its value rather than a display label. */
+.topic-picker {
+  display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px 11px;
+  border-radius: 999px; border: 1px solid var(--border); background: var(--bg);
+  color: var(--text2); font-size: 12px; transition: all .15s; max-width: 260px;
+}
+.topic-picker:hover { border-color: var(--border-strong); color: var(--text); }
+.topic-picker.on { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+.topic-picker select {
+  border: none; background: transparent; color: inherit; font: inherit;
+  outline: none; cursor: pointer; max-width: 200px; text-overflow: ellipsis;
+}
+.topic-picker select:disabled { cursor: default; }
 .plan-active-badge { padding: 2px 9px; border-radius: 999px; font-size: 10px; font-weight: 600; background: var(--accent-soft-2); color: var(--accent); }
 
 @media (max-width: 720px) {

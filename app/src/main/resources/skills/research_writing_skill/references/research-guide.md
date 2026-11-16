@@ -17,23 +17,25 @@
 
 | 工具 | 实际行为 | 关键限制 |
 |------|---------|---------|
-| `webSearch` | Bing 检索（cn.bing.com），返回**最多 8 条**结果的标题 + 摘要片段 + URL | 只返回 8 条，因此**必须靠多组检索式扩大候选池**，不能指望一次搜索拿到全部候选 |
-| `webCrawl` | 抓取 URL 并抽取正文纯文本 | **只处理 HTML**，返回内容**超过 8000 字符会被截断**；**无法解析 PDF 二进制** |
-| `downloadPaper` | 下载论文 PDF 到 `investigation/{课题方向}/papers/`，自动重试、校验、去重 | 接受 PDF 链接 / arXiv abs 页 / DOI / 出版社 landing page；**仅用于已判定相关的论文** |
+| `webSearch` | Bing 检索（cn.bing.com），返回**最多 8 条**结果的标题 + 摘要片段 + URL | 只返回 8 条，因此**必须靠多组检索式扩大候选池**；支持 `site:` 与 `after:` 语法 |
+| `webCrawl` | 抓取 URL 并抽取正文纯文本 | 只处理 HTML/XML，返回内容**超过 8000 字符会被截断**；**无法解析 PDF 二进制**；可用于读 arXiv Atom API 的返回 |
+| `downloadPaper` | 下载论文 PDF 到 `investigation/{课题方向}/papers/`，自动重试、校验、去重；**下载前先查本地论文库** | 接受 PDF 链接 / arXiv abs 页 / DOI / 出版社 landing page；**仅用于已判定相关的论文** |
 | `listDownloadedPapers` | 列出某课题下已下载的论文（大小、页数） | 下载前先查，避免重复下载 |
+| `listLibraryPapers` | 列出**本地论文库**（所有课题共用）里的论文 | 库里有就直接复用，不必再联网 |
 
 > 读取 PDF 正文与从 PDF 截图的能力都属于 `analyst-agent`——精读与取图是为写作准备素材的环节，不属于检索。不要尝试用 `webCrawl` 打开 `.pdf` 链接来代劳（它只解析 HTML，对 PDF 只会返回乱码或空内容）。
 
-由此推出三条硬性结论：
+由此推出四条硬性结论：
 
-1. **候选池靠"多检索式 × 多站点"堆出来**，而不是靠单次搜索。
-2. **摘要必须从论文的 HTML 摘要页读取**（arXiv `/abs/` 页、Semantic Scholar 论文页、PubMed 页、出版社 landing page 等），**不要试图用 `webCrawl` 打开 `.pdf` 链接**——那只会拿到乱码或空内容。
+1. **候选池靠"多检索式 × 多入口"堆出来**，而不是靠单次搜索；可用入口只有 arXiv / OpenReview / PubMed / `webSearch` 四个（见 §2.3）。
+2. **摘要必须从论文的 HTML 摘要页或 API 返回读取**（arXiv `/abs/` 页与 Atom `<summary>`、OpenReview 笔记、PubMed 页），**不要试图用 `webCrawl` 打开 `.pdf` 链接**——那只会拿到乱码或空内容。
 3. **`downloadPaper` 是唯一的副作用操作**，且只对通过 §5 判定的论文调用；其余一律只读。
+4. **先查库再下载**：`listLibraryPapers` / `downloadPaper` 已内建论文库命中，同一篇论文第二次调研不该再花联网成本。
 
 **降级链（所有抓取动作都适用）**：
 
 ```
-论文 HTML 摘要页  →  会议/期刊 landing page  →  聚合站页面（Semantic Scholar / DBLP / OpenReview）
+论文 HTML 摘要页 / arXiv Atom <summary>  →  会议/期刊 landing page  →  OpenReview 笔记
    →  搜索结果里的摘要片段  →  标记 SOURCE_LEVEL=SNIPPET 并显式记录
 ```
 
@@ -66,9 +68,19 @@
 - **限定词 / 方法词**：约束研究角度（如 `layout control`、`personalization`、`diffusion`）
 - **同义词与缩写**：同义表达、领域惯用缩写（如 `T2I`、`text-to-image`、`personalized diffusion`）
 
-中文课题额外提取中文关键词用于 CNKI 检索。
+中文课题额外提取中文关键词，用 `webSearch` 跑中文检索式（CNKI 检索页需登录，不作为主路径，见 §2.3）。
 
 ### 2.2 检索式模板
+
+**A. arXiv API（主力入口，直接用 `webCrawl` 抓 URL）**
+
+```
+https://export.arxiv.org/api/query?search_query=all:"<核心概念词>" AND all:"<限定词>"&max_results=20&sortBy=submittedDate&sortOrder=descending
+```
+
+变体：`ti:` 限定标题、`cat:cs.CV` 限定分类、`sortBy=relevance` 找经典论文。
+
+**B. `webSearch`（Bing）兜底与站点限定**
 
 ```
 # 精确式（先跑，命中少但准）
@@ -77,7 +89,7 @@
 # 宽式（补候选池用）
 <核心概念词> <限定词> (survey OR review)
 
-# 站点限定式
+# 站点限定式 —— 只限定仍可用的站点
 site:arxiv.org <核心概念词> <限定词>
 site:openreview.net <核心概念词> <限定词>
 
@@ -85,22 +97,76 @@ site:openreview.net <核心概念词> <限定词>
 <核心概念词> <限定词> after:2022-01-01
 ```
 
-**每篇论文的检索至少覆盖 3 组不同检索式**，避免单一措辞造成的系统性漏检。
+> **不要**再写 `site:scholar.google.com`、`site:dblp.org`、`site:semanticscholar.org`
+> —— 这几个站点已实测不可用（§2.3），限定它们只会拿到空结果。
 
-### 2.3 检索站点矩阵（按推荐优先级）
+**C. OpenReview API（ML 顶会）**
 
-| 优先级 | 站点 | 适用领域 | 检索策略 | 摘要可读性 |
-|-------|------|---------|---------|-----------|
-| 1 | [arXiv](https://arxiv.org) | CS、数学、物理 | `/list` 或 `site:` 检索，按 relevance 排序，关注近 3 年 | 高（`/abs/` 页有完整摘要） |
-| 2 | [Semantic Scholar](https://semanticscholar.org) | 全学科 | 关键词检索 + 按引用量筛选 | 高（页面含 TL;DR 与摘要） |
-| 3 | [OpenReview](https://openreview.net) | ML 顶会 | 按会议检索，可读到评审意见 | 高 |
-| 4 | [DBLP](https://dblp.org) | 计算机科学 | 按会议/期刊定位顶会论文 | 低（仅题录，需跳转） |
-| 5 | [Google Scholar](https://scholar.google.com) | 全学科 | 按引用量排序 | 中（可能被反爬拦截） |
-| 6 | [中国知网 CNKI](https://cnki.net) | 中文学术 | 中文课题必查 | 中（摘要页可读） |
-| 7 | [PubMed](https://pubmed.ncbi.nlm.nih.gov) | 生物医学 | 生命科学课题 | 高 |
-| 8 | [IEEE Xplore](https://ieeexplore.ieee.org) | 电子工程、CS | 工程类课题 | 中（landing page 有摘要） |
+```
+https://api2.openreview.net/notes/search?term=<关键词>&limit=20
+```
 
-**至少检索 3 个站点**，其中 arXiv 或 Semantic Scholar 必查（CS 类课题）。中文课题必须包含 CNKI。
+**每篇论文的检索至少覆盖 3 组不同检索式**（可以混用 A/B/C 三种入口），避免单一措辞造成的系统性漏检。
+
+### 2.3 检索站点矩阵（2026-11 实测）
+
+下表的「实测」列是本项目在目标网络环境下用真实请求验证过的结果，**不是预期值**。
+不可用的站点已经剔除，不要把它们写进检索计划——那样只会浪费轮次并污染候选池。
+
+| 优先级 | 站点 | 适用领域 | 检索入口 | 实测 | 摘要可读性 |
+|-------|------|---------|---------|------|-----------|
+| 1 | **arXiv** | CS、数学、物理 | `export.arxiv.org/api/query`（Atom XML）或 `arxiv.org/list` | ✅ 可用，响应快 | 高（`/abs/` 页有完整摘要） |
+| 2 | **OpenReview** | ML 顶会 | `api2.openreview.net/notes/search`（JSON）或 `openreview.net/search` | ✅ 可用 | 高（含评审意见） |
+| 3 | **PubMed** | 生物医学 | `pubmed.ncbi.nlm.nih.gov/?term=` | ✅ 可用 | 高 |
+| 4 | **Bing（`webSearch` 工具）** | 全学科 | 工具内置，无需拼 URL | ✅ 可用（正常返回 8 条） | 中（摘要片段） |
+| 5 | **中国知网 CNKI** | 中文学术 | 首页可访问，检索页需登录 | ⚠️ 部分可用 | 低（多数全文收费） |
+| — | Semantic Scholar | — | — | ❌ **已剔除**：网页 202 空响应，API 返回 429 限流 | — |
+| — | DBLP | — | — | ❌ **已剔除**：返回反爬验证页（"Making sure you're not a bot!"） | — |
+| — | Google Scholar | — | — | ❌ **已剔除**：302 跳转至验证页，无法抓取 | — |
+| — | IEEE Xplore | — | — | ❌ **已剔除**：418 反爬拦截 | — |
+
+**可用站点只有前四个。** 检索计划必须建立在它们之上：
+
+- **arXiv 是主力**，CS/物理/数学课题几乎都从这里出候选。
+- **OpenReview 补 ML 顶会**（NeurIPS/ICLR/ICML 的投稿与评审）。
+- **PubMed 只用于生命科学课题**，其他课题不要浪费轮次。
+- **`webSearch`（Bing）用来兜底**：发现 arXiv 上没有的论文、定位官方项目页与作者主页，
+  也用于 `site:arxiv.org <词>` 这类站点限定式。
+- **CNKI 不要作为主检索路径**：首页能开，但检索页需要登录、全文基本收费。
+  中文课题优先用 `webSearch` 搜中文关键词，命中后再判断能否拿到 PDF。
+
+**至少检索 2 个可用站点**（arXiv 必查），中文课题额外用 `webSearch` 跑中文关键词。
+不要再写「至少 3 个站点」——可用站点本来就只有四个，凑数会让计划偏离现实。
+
+### 2.4 如何用 arXiv API 检索（推荐直接拼 URL 交给 `webCrawl`）
+
+arXiv 的 Atom API 是当前最稳定的入口，比在网页上翻列表精确得多：
+
+```
+https://export.arxiv.org/api/query?search_query=all:"layout control"&max_results=20&sortBy=submittedDate&sortOrder=descending
+```
+
+要点：
+
+- `search_query` 支持 `all:` / `ti:`（标题）/ `au:`（作者）/ `cat:cs.CV`（分类）等前缀，
+  精确短语用双引号（需 URL 编码为 `%22`），多个条件用 `AND` / `OR` / `ANDNOT` 连接。
+- `sortBy=submittedDate&sortOrder=descending` 取最新的；要看高影响论文改 `sortBy=relevance`。
+- 返回的是 Atom XML：`<entry>` 里含 `<title>`、`<id>`（即 `arxiv.org/abs/xxxx`）、`<summary>`（摘要）、
+  `<published>`。**`<summary>` 就是可用的摘要证据**，可直接摘录进 §5 判定表。
+- `webCrawl` 对 XML 也能取到文本；若返回内容被 8000 字符截断，把 `max_results` 调小后重跑。
+
+### 2.5 站点不可用时的处置（不要重试，直接换路）
+
+| 站点 | 现象 | 处置 |
+|------|------|------|
+| Semantic Scholar | 网页 202 空响应 / API 429 | 不再使用；改用 arXiv + `webSearch` |
+| DBLP | 返回 "Making sure you're not a bot!" | 不再使用；题录信息改用 arXiv 分类列表 |
+| Google Scholar | 302 到验证页 | 不再使用；改 `webSearch` 或 arXiv |
+| IEEE Xplore | 418 | 不再使用；工程类论文用 `webSearch` 找作者主页/arXiv 版 |
+| CNKI | 检索页需登录 | 用 `webSearch` 搜中文关键词；拿不到全文就标 `ABSTRACT_ONLY` |
+
+> 站点矩阵会随网络环境变化。若某个「可用」站点连续两次失败，按不可用处理并在交付材料里注明，
+> 不要在一轮调研里反复冲击同一个站点。
 
 ---
 
@@ -370,8 +436,8 @@ downloadPaper(topic = {课题方向}, url = {PDF 链接 / arXiv abs 页 / DOI �
 |------|------|------|
 | 搜索结果只有 8 条 | `webSearch` 的固有上限 | 换检索式、换站点，多次检索堆候选池 |
 | `webCrawl` 打开 PDF 返回乱码/空 | 工具只解析 HTML | 改抓 `/abs/` 摘要页；下载改用 `downloadPaper` |
-| 摘要页正文被截断（>8000 字符） | 工具截断 | 摘要在页面开头，通常不受影响；若被截，改用 Semantic Scholar 页 |
-| Google Scholar 被拦截 | 反爬 | 改用 arXiv / Semantic Scholar / OpenReview |
+| 摘要页正文被截断（>8000 字符） | 工具截断 | 摘要在页面开头，通常不受影响；若被截，改用 arXiv Atom `<summary>` 或调小 `max_results` |
+| Google Scholar / DBLP / Semantic Scholar / IEEE 被拦截 | 反爬或限流（实测均不可用） | 不再使用该站点；改用 arXiv API + `webSearch` |
 | 某篇论文找不到 HTML 摘要页 | 闭源期刊 | 走降级链，最终标 `SNIPPET` 或 `UNKNOWN` |
 | 判定为 RELEVANT 的数量不足 | 检索式覆盖不足 | **回到 §2 追加检索式**，不降低阈值 |
 | 候选池全是同一方法流派 | 检索式偏斜 | 追加对立流派的检索词（如加 `training-free`） |
@@ -389,7 +455,8 @@ downloadPaper(topic = {课题方向}, url = {PDF 链接 / arXiv abs 页 / DOI �
 交付材料前逐项确认：
 
 - [ ] 候选池规模 ≥ `target_count × 2`（理想为 ×3）
-- [ ] 至少检索了 3 个站点，中文课题含 CNKI
+- [ ] 检索只用了实测可用的入口（arXiv / OpenReview / PubMed / webSearch），没有冲击已剔除的站点
+- [ ] 中文课题额外用 `webSearch` 跑了中文关键词
 - [ ] 每篇入选论文都有摘要原文证据摘录
 - [ ] 判定表完整，包含被排除论文及排除理由
 - [ ] `downloadPaper` 仅针对判定通过的论文调用，且下载前已用 `listDownloadedPapers` 查重

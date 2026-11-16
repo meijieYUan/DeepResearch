@@ -1,5 +1,5 @@
 import { getCurrentScope, onScopeDispose, ref, watch } from 'vue'
-import { chatStream, approveStream } from '../api'
+import { chatStream, approveStream, resumeStream } from '../api'
 import { newId } from '../utils/id'
 import { reduceResearchProgress, setProgressTransport } from '../utils/researchProgress'
 
@@ -18,7 +18,7 @@ const TITLE_MAX = 40
 export function useChatStream({
   threads, activeThreadId, planMode, planActive,
   saveThreads, refreshTasks, scrollDown,
-  requestChat = chatStream, requestApproval = approveStream
+  requestChat = chatStream, requestApproval = approveStream, requestResume = resumeStream
 }) {
   // A run is in flight: the composer stays disabled until the stream settles.
   const loading = ref(false)
@@ -113,6 +113,28 @@ export function useChatStream({
           })
         }
       },
+      onWaiting(p) {
+        if (!accepts()) return
+        reconcilePlan(p)
+        cancelFrame()
+        flushDeltas()
+        const b = liveBubble()
+        // The run stopped on purpose: keep it out of the "answer" and "error" paths.
+        // It is resumable, so the bubble carries the missing-paper list and the resume
+        // entry point rather than a terminal error.
+        b.waiting = {
+          topic: p?.topic || '',
+          libraryPath: p?.libraryPath || '',
+          resumeUrl: p?.resumeUrl || '',
+          missingPapers: Array.isArray(p?.missingPapers) ? p.missingPapers : []
+        }
+        b.content = waitingText(b.waiting)
+        b.streaming = false
+        b.incomplete = false
+        slot.receivedAnswer = true
+        persist()
+        refreshTasks()
+      },
       onAnswer(p) {
         if (!accepts()) return
         reconcilePlan(p)
@@ -169,10 +191,11 @@ export function useChatStream({
 
   /**
    * Send a user turn and open the run that answers it. `text` is the trimmed
-   * composer value, `mode` the plan-mode selection. Returns false when there is
+   * composer value, `mode` the plan-mode selection, `continueTopic` the existing
+   * direction the user chose to extend (optional). Returns false when there is
    * no thread to send into.
    */
-  function send(text, mode) {
+  function send(text, mode, continueTopic = '') {
     const threadId = activeThreadId.value
     const t = threadId ? threads.value[threadId] : null
     if (!t || loading.value || liveStream) return false
@@ -190,7 +213,7 @@ export function useChatStream({
     const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
     t.messages.push(bubble)
     runStream(threadId, bubble.id, (signal, handlers) =>
-      requestChat(threadId, text, mode, handlers, signal))
+      requestChat(threadId, text, mode, handlers, signal, continueTopic))
     return true
   }
 
@@ -221,5 +244,32 @@ export function useChatStream({
     return true
   }
 
-  return { loading, stopStream, send, submitApprovals }
+  /**
+   * Continue a run that paused waiting for manually downloaded papers. Same
+   * single-flight rules as an approval: a fresh bubble receives the continued run.
+   */
+  function resumeResearch(msg) {
+    if (loading.value || liveStream) return false
+    const threadId = activeThreadId.value
+    const t = threads.value[threadId]
+    const source = t?.messages?.find(m => m.id === msg?.id)
+    if (!source || !source.waiting || source.waitingResumed) return false
+    source.waitingResumed = true
+    const bubble = { id: newId('msg'), role: 'assistant', content: '', streaming: true, transportStatus: 'running' }
+    t.messages.push(bubble)
+    saveThreads()
+    runStream(threadId, bubble.id, (signal, handlers) =>
+      requestResume(threadId, handlers, signal))
+    return true
+  }
+
+  return { loading, stopStream, send, submitApprovals, resumeResearch }
+}
+
+/** The readable body of a paused-for-papers bubble. */
+function waitingText(waiting) {
+  const lines = [`调研已暂停：还有 ${waiting.missingPapers.length} 篇论文没能自动下载。`]
+  if (waiting.libraryPath) lines.push(`把 PDF 放进去（文件名用「短名.pdf」）：${waiting.libraryPath}`)
+  for (const paper of waiting.missingPapers) lines.push(`- ${paper.shortName || paper}`)
+  return lines.join('\n')
 }

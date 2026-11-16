@@ -16,6 +16,7 @@ import com.itajay.superassistant.tool.CreateAgentTool;
 import com.itajay.superassistant.workflow.PaperDeepReadWorkflow;
 import com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow;
 import com.itajay.superassistant.interceptor.PlanModeToolInterceptor;
+import com.itajay.superassistant.mcp.McpToolLoader;
 import com.itajay.superassistant.prompt.PromptSubmitHook;
 import com.itajay.superassistant.rag.RagAgent;
 import com.itajay.superassistant.rag.ModelMessagePersistenceHook;
@@ -27,10 +28,8 @@ import com.itajay.superassistant.tool.TodoTool;
 import com.itajay.superassistant.tool.WebSearchTool;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.lang.Nullable;
 
 @Configuration
 public class AgentConfig {
@@ -123,7 +122,7 @@ public class AgentConfig {
                                  LoopGuardToolInterceptor loopGuardToolInterceptor,
                                  ToolRetryInterceptor toolRetryInterceptor,
                                  ToolErrorInterceptor toolErrorInterceptor,
-                                 @Nullable ToolCallbackProvider mcpToolCallbackProvider) {
+                                 McpToolLoader mcpToolLoader) {
 
         HumanInTheLoopHook humanInTheLoopHook = HumanInTheLoopHook.builder()
                 .approvalOn("writeFile", ToolConfig.builder()
@@ -148,6 +147,11 @@ public class AgentConfig {
         // is the writer's analyzePapers tool, so it has no reason to exist in this list.
         ToolCallback ragTool = AgentTool.create(ragAgent.reactAgent);
 
+        // MCP is an optional capability. McpToolLoader resolves whatever providers are
+        // present and swallows connection/handshake failures, so an absent or unreachable
+        // MCP server degrades to "no external tools" instead of failing context startup.
+        var mcpTools = mcpToolLoader.loadAvailableTools();
+
         var builder = ReactAgent.builder()
                 .name("main-agent")
                 .description("Main agent: handles user interaction, planning, tool orchestration, and workflow delegation.")
@@ -157,6 +161,7 @@ public class AgentConfig {
                              planTool, terminalTool, createAgentTool, researchWriteReviewWorkflow,
                              paperDeepReadWorkflow)
                 .tools(ragTool)
+                .tools(mcpTools)
                 .hooks(compactHook, skillsAgentHook, humanInTheLoopHook,
                        modelCallLimitHook, modelMessagePersistenceHook)
                 .interceptors(promptSubmitHook,
@@ -164,10 +169,6 @@ public class AgentConfig {
                               loopGuardToolInterceptor, toolRetryInterceptor, toolErrorInterceptor)
                 .saver(mysqlSaver)
                 .outputKey("output");
-
-        if (mcpToolCallbackProvider != null) {
-            builder = builder.toolCallbackProviders(mcpToolCallbackProvider);
-        }
 
         return builder.build();
     }

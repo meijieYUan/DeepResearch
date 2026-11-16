@@ -23,6 +23,27 @@
         <span>{{ incompleteLabel }}</span>
       </div>
       <div v-if="msg.error" class="incomplete-note" role="alert">{{ msg.error }}</div>
+      <!-- The research stage stopped because some papers could not be downloaded.
+           Not an error: the topic folder and everything already fetched are intact,
+           so the run continues once the files are in the library. -->
+      <fieldset v-if="msg.waiting" class="waiting-gate" :disabled="approvalDisabled">
+        <p class="waiting-title">
+          缺少 {{ msg.waiting.missingPapers.length }} 篇论文全文，调研已暂停
+        </p>
+        <p v-if="msg.waiting.libraryPath" class="waiting-note">
+          把 PDF 放进本地论文库（文件名用「论文短名.pdf」）：<code>{{ msg.waiting.libraryPath }}</code>
+        </p>
+        <ul v-if="msg.waiting.missingPapers.length" class="waiting-list">
+          <li v-for="paper in msg.waiting.missingPapers" :key="paper.shortName">
+            <strong>{{ paper.shortName }}</strong>
+            <span v-if="paper.reason" class="muted"> · {{ paper.reason }}</span>
+          </li>
+        </ul>
+        <button type="button" class="waiting-resume" @click="$emit('resume-research', msg)">
+          论文已补齐，继续调研
+        </button>
+        <p v-if="msg.waitingResumed" class="waiting-note">已提交继续请求</p>
+      </fieldset>
       <fieldset v-if="msg.approvals" class="approval-gate" :disabled="approvalDisabled">
         <ApprovalPanel
           :approvals="msg.approvals"
@@ -45,7 +66,7 @@ const props = defineProps({
   msg: { type: Object, required: true },
   approvalDisabled: { type: Boolean, default: false }
 })
-defineEmits(['submit-approvals'])
+defineEmits(['submit-approvals', 'resume-research'])
 
 // Memoised markdown. A computed re-runs only when its reactive dependencies
 // change, and a message is rendered by its own component instance, so a settled
@@ -68,6 +89,13 @@ const incompleteLabel = computed(() => {
 </script>
 
 <style scoped>
+.waiting-gate { margin-top: 10px; padding: 10px 12px; border: 1px solid #d8a13a; border-radius: 8px; background: #fff8e8; }
+.waiting-title { margin: 0 0 6px; font-weight: 600; font-size: 13px; }
+.waiting-note { margin: 0 0 8px; font-size: 12px; color: var(--text2); }
+.waiting-note code { padding: 1px 4px; border-radius: 4px; background: rgba(0,0,0,.06); }
+.waiting-list { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; }
+.waiting-resume { padding: 6px 12px; border-radius: 6px; border: 1px solid #d8a13a; background: #fff; cursor: pointer; font-size: 12px; }
+.waiting-resume:hover { background: #fff3d6; }
 .message { display: flex; gap: 12px; max-width: 100%; margin: 0 auto 22px; animation: msgIn .28s ease; }
 @keyframes msgIn { from { opacity: 0; transform: translateY(8px); } }
 .message.user { flex-direction: row-reverse; }

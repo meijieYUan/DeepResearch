@@ -9,6 +9,8 @@ import com.itajay.superassistant.security.ApprovalDecision;
 import com.itajay.superassistant.security.HITLHelper;
 import com.itajay.superassistant.security.PendingInterruptionStore;
 import com.itajay.superassistant.service.ChatMessagePersistenceService;
+import com.itajay.superassistant.workflow.ResearchResumeStore;
+import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -39,15 +41,18 @@ public class SuperAssistant {
     private final PendingInterruptionStore pendingInterruptionStore;
     private final ChatMessagePersistenceService messagePersistenceService;
     private final ProgressChannelRegistry progressChannels;
+    private final ResearchResumeStore researchResumeStore;
 
     public SuperAssistant(ChatStreamingService chatStreamingService,
                           PendingInterruptionStore pendingInterruptionStore,
                           ChatMessagePersistenceService messagePersistenceService,
-                          ProgressChannelRegistry progressChannels) {
+                          ProgressChannelRegistry progressChannels,
+                          ResearchResumeStore researchResumeStore) {
         this.chatStreamingService = chatStreamingService;
         this.pendingInterruptionStore = pendingInterruptionStore;
         this.messagePersistenceService = messagePersistenceService;
         this.progressChannels = progressChannels;
+        this.researchResumeStore = researchResumeStore;
     }
 
     /** Debug listener for a thread's progress events. Not used by the chat client. */
@@ -89,6 +94,14 @@ public class SuperAssistant {
             RunnableConfig config = buildConfig(threadId);
             config.context().put("threadId", threadId);
             config.context().put("planEnabled", String.valueOf(planEnabled));
+            // Carried in the context rather than prefixed onto the message: the model
+            // must not have to re-derive which folder is meant, and a value it can
+            // merely restate correctly is one it can also restate wrongly.
+            if (request.continueTopic() != null && !request.continueTopic().isBlank()) {
+                config.context().put(
+                        com.itajay.superassistant.workflow.ResearchWriteReviewWorkflow.CONTINUE_TOPIC_CONTEXT_KEY,
+                        request.continueTopic().trim());
+            }
             // The user message is persisted only after the run is actually accepted:
             // persisting first (the old order) left a never-processed user message in
             // the history whenever start() rejected because the thread was busy.
@@ -144,6 +157,77 @@ public class SuperAssistant {
         }
     }
 
+    /**
+     * Continues a research run that paused because some papers could not be downloaded.
+     *
+     * <p>The pause is a normal end of the previous run, not an interruption inside a tool
+     * call, so there is no saved agent config to resume from. The workflow is therefore
+     * re-entered with the same topic and brief: the topic folder, the shared paper library
+     * and the existing per-paper analyses all dedup, so the only work actually repeated is
+     * for the papers that were missing. If the user has not supplied them, the run pauses
+     * again and reports the same list rather than burning through the research stage.
+     */
+    @PostMapping(value = "/chat/{threadId}/resume", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter resume(@PathVariable String threadId) {
+        var task = researchResumeStore.get(threadId);
+        if (task.isEmpty()) {
+            return chatStreamingService.rejected(threadId,
+                    "该会话没有等待补充论文的调研任务（可能已完成或已过期）");
+        }
+        if (pendingInterruptionStore.get(threadId) != null) {
+            return chatStreamingService.rejected(threadId,
+                    "该会话有待审批的高危操作，请先同意或拒绝后再继续调研");
+        }
+
+        ResearchResumeStore.ResumeTask paused = task.get();
+        String message = resumeMessage(paused);
+        log.info("Resume request [thread={}, topic={}, missing={}]",
+                threadId, paused.topic(), paused.missing().size());
+
+        boolean planEnabled = PlanModeContext.isEnabled(threadId);
+        try {
+            RunnableConfig config = buildConfig(threadId);
+            config.context().put("threadId", threadId);
+            config.context().put("planEnabled", String.valueOf(planEnabled));
+            // Cleared before starting: the run itself re-registers if it has to pause
+            // again, so a stale entry cannot make the next failure look resolved.
+            researchResumeStore.remove(threadId);
+            return chatStreamingService.start(threadId, message, config, planEnabled,
+                    () -> messagePersistenceService.saveUserMessage(threadId, message));
+        } catch (Exception e) {
+            log.error("Resume request failed before the run started [thread={}]", threadId, e);
+            return chatStreamingService.rejected(threadId, e.getMessage());
+        }
+    }
+
+    /**
+     * The synthetic user turn that continues the paused investigation.
+     *
+     * <p>Written as a user message rather than a special command so the resumed run goes
+     * through the ordinary plan → tool → workflow path, and the conversation history keeps
+     * a readable record of why the run restarted.</p>
+     */
+    private static String resumeMessage(ResearchResumeStore.ResumeTask paused) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("继续上次暂停的调研。\n\n");
+        sb.append("课题方向必须逐字使用：").append(paused.topic()).append("\n\n");
+        sb.append("原始调研要求（不得改写范围）：\n").append(paused.brief()).append("\n\n");
+        if (!paused.missing().isEmpty()) {
+            sb.append("上次未能下载的论文（已放入本地论文库 "
+                            + WorkspacePaths.relative(WorkspacePaths.paperLibraryDir()) + " 的请直接复用）：\n");
+            for (ResearchResumeStore.MissingPaper paper : paused.missing()) {
+                sb.append("- ").append(paper.shortName()).append('\n');
+            }
+            sb.append('\n');
+        }
+        sb.append("""
+                重新调用 researchWriteReview 工作流，课题方向参数以上面给出的为准。
+                已下载的论文、本地论文库与已有精读结果都会被复用；只需要补齐仍然缺失的论文。
+                如果仍有论文拿不到全文，工作流会再次暂停并给出新的清单。
+                """);
+        return sb.toString();
+    }
+
     /** Returns an error message for the client, or {@code null} when the decisions are usable. */
     private static String validateDecisions(List<ApprovalDecision> decisions) {
         if (decisions == null || decisions.isEmpty()) {
@@ -186,7 +270,7 @@ public class SuperAssistant {
                 .build();
     }
 
-    public record ChatRequest(String message, String mode) {
+    public record ChatRequest(String message, String mode, String continueTopic) {
         public ChatRequest {
             if (mode == null || mode.isBlank()) mode = "Default";
         }

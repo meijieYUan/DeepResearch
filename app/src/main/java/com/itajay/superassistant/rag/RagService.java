@@ -54,7 +54,7 @@ public class RagService {
         log.info("Split into {} chunks from {}", chunks.size(), resource.getFilename());
 
         storeDocuments(chunks);
-        log.info("Stored {} chunks to vector store and BM25 index", chunks.size());
+        log.info("Indexed {} chunks (BM25; vector store is optional)", chunks.size());
 
         return chunks.size();
     }
@@ -72,7 +72,8 @@ public class RagService {
 
         if (!allChunks.isEmpty()) {
             storeDocuments(allChunks);
-            log.info("Batch stored {} chunks from {} resources", allChunks.size(), resources.size());
+            log.info("Batch indexed {} chunks from {} resources (BM25; vector store is optional)",
+                    allChunks.size(), resources.size());
         }
         return allChunks.size();
     }
@@ -133,7 +134,14 @@ public class RagService {
      * （此前只留一行 error 日志，检索侧表现为"关键字召回悄悄变少"）。</p>
      */
     private void storeDocuments(List<Document> chunks) {
-        vectorStore.add(chunks);
+        // 向量库是可选路径：Embedding 未配置或 Milvus 不可用时，仍然写入 BM25，
+        // 保证关键字检索可用；不能让上传接口因为向量能力缺失而失败。
+        try {
+            vectorStore.add(chunks);
+        } catch (Exception e) {
+            log.warn("向量库不可用，已跳过向量写入，仅写入 BM25 索引（{} 个 chunk）：{}",
+                    chunks.size(), e.toString());
+        }
         try {
             chunks.stream()
                     .map(c -> c.getMetadata() == null ? null : c.getMetadata().get(Bm25Index.SOURCE_METADATA_KEY))
@@ -149,8 +157,8 @@ public class RagService {
                     });
             bm25Index.add(chunks);
         } catch (java.io.IOException e) {
-            log.error("BM25 indexing FAILED — the vector store has these chunks but keyword "
-                    + "recall will miss them; re-upload the source to repair. Cause: {}", e.getMessage(), e);
+            log.error("BM25 indexing FAILED — keyword recall will miss these chunks; "
+                    + "re-upload the source to repair. Cause: {}", e.getMessage(), e);
         }
     }
 }

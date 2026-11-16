@@ -20,8 +20,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Verifies the paper-download tool wires up and that {@code agent.paper.*} binds.
  *
  * <p>Uses {@link ApplicationContextRunner} rather than {@code @SpringBootTest}: the full
- * application context requires the MCP email server on :8081 and a live database, neither
- * of which is available in a unit test. This exercises exactly the beans under test.</p>
+ * application context requires a live database, which is not available in a unit test.
+ * This exercises exactly the beans under test.</p>
  */
 class PaperDownloadWiringTest {
 
@@ -29,6 +29,7 @@ class PaperDownloadWiringTest {
             .withConfiguration(AutoConfigurations.of(ConfigurationPropertiesAutoConfiguration.class))
             .withUserConfiguration(PaperDownloadPropertiesConfig.class,
                     ProgressChannelRegistry.class,
+                    PaperLibrary.class, DownloadFailureRegistry.class,
                     PaperDownloadTool.class, PaperTextTool.class);
 
     @Test
@@ -145,7 +146,9 @@ class PaperDownloadWiringTest {
                 .map(Method::getName)
                 .sorted()
                 .toList();
-        assertThat(names).containsExactly("downloadPaper", "listDownloadedPapers");
+        // listLibraryPapers is the shared library inventory: it reads filenames only and
+        // never a paper's body, so it belongs on this side of the boundary too.
+        assertThat(names).containsExactly("downloadPaper", "listDownloadedPapers", "listLibraryPapers");
     }
 
     @Test
@@ -156,9 +159,12 @@ class PaperDownloadWiringTest {
             if (!method.isAnnotationPresent(Tool.class)) {
                 continue;
             }
-            assertThat(method.getParameterCount())
-                    .as("%s should take a topic first", method.getName())
-                    .isGreaterThan(0);
+            // The library inventory is topic-independent by design: it lists the corpus
+            // every topic shares, so it takes no topic at all.
+            if (method.getParameterCount() == 0) {
+                assertThat(method.getName()).isEqualTo("listLibraryPapers");
+                continue;
+            }
             assertThat(method.getParameterTypes()[0])
                     .as("%s first parameter should be the topic", method.getName())
                     .isEqualTo(String.class);

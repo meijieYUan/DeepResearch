@@ -1,31 +1,35 @@
 package com.itajay.superassistant.config;
 
-import io.milvus.client.MilvusServiceClient;
-import io.milvus.param.ConnectParam;
+import com.itajay.superassistant.rag.OptionalMilvusVectorStore;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.milvus.MilvusVectorStore;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
-import org.springframework.stereotype.Service;
+import org.springframework.context.annotation.Configuration;
 
-import java.io.IOException;
-
-@Service
+/**
+ * 向量库装配。
+ *
+ * <p>向量检索依赖 Embedding 模型与 Milvus，两者都是可选能力：
+ * {@link OptionalMilvusVectorStore} 在首次真正使用前不创建 Milvus 客户端，
+ * 也不解析 {@link EmbeddingModel}。因此未配置 {@code EMBEDDING_KEY}、Milvus
+ * 未启动或 Embedding 服务不可用时，应用仍能正常启动，RAG 自动退化为 BM25
+ * 关键字召回。</p>
+ */
+@Configuration
 public class VectorConfig {
-    @Bean
-    public VectorStore vectorStore(MilvusServiceClient milvusServiceClient, EmbeddingModel embeddingModel){
-        return MilvusVectorStore
-                .builder(milvusServiceClient,embeddingModel)
-                .build();
-    }
 
-    @Bean
-    public MilvusServiceClient milvusServiceClient(){
-        ConnectParam build = ConnectParam.newBuilder()
-                .withHost("localhost")
-                .withPort(9090)
-                .build();
-
-        return new MilvusServiceClient(build);
+    /**
+     * {@code destroyMethod = "close"} releases the lazily created gRPC channel on shutdown;
+     * without it the client would outlive the context.
+     */
+    @Bean(destroyMethod = "close")
+    public VectorStore vectorStore(
+            ObjectProvider<EmbeddingModel> embeddingModel,
+            @Value("${spring.ai.dashscope.api-key:}") String embeddingApiKey,
+            @Value("${rag.vector.milvus.host:127.0.0.1}") String milvusHost,
+            @Value("${rag.vector.milvus.port:9090}") int milvusPort) {
+        return new OptionalMilvusVectorStore(embeddingModel, embeddingApiKey, milvusHost, milvusPort);
     }
 }

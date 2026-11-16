@@ -31,7 +31,7 @@ class PaperDownloadToolManualTest {
     }
 
     private PaperDownloadTool tool() {
-        return new PaperDownloadTool(props(), new ProgressChannelRegistry());
+        return new PaperDownloadTool(props(), new ProgressChannelRegistry(), null, null);
     }
 
     private PaperTextTool textTool() {
