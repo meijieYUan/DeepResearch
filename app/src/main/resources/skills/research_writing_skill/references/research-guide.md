@@ -13,33 +13,17 @@
 
 ## 0. 工具能力边界（先读这一节，它决定所有策略）
 
-必须先清楚手上工具的真实能力，否则会写出无效的检索计划：
+| 工具 | 用法 | 关键限制 |
+|------|------|---------|
+| `webSearch` | Bing 检索，返回**最多 8 条**结果的标题 + 摘要片段 + URL | 结果条数少，必须靠多组检索式扩大候选池；支持 `site:` 与 `after:` 语法 |
+| `webCrawl` | 抓取 URL 并抽取正文纯文本；也可读 arXiv Atom API 的返回 | 只处理 HTML/XML，超过 8000 字符截断；**无法解析 PDF 二进制** |
+| `downloadPaper` / `listDownloadedPapers` / `listLibraryPapers` | 按论文**标识**（标题 / DOI / arXiv ID）下载与查重 | **仅用于已判定相关的论文**；取文渠道、重试、校验与去重都由工具内建，你只负责传对标识、如实记录结果 |
 
-| 工具 | 实际行为 | 关键限制 |
-|------|---------|---------|
-| `webSearch` | Bing 检索（cn.bing.com），返回**最多 8 条**结果的标题 + 摘要片段 + URL | 只返回 8 条，因此**必须靠多组检索式扩大候选池**；支持 `site:` 与 `after:` 语法 |
-| `webCrawl` | 抓取 URL 并抽取正文纯文本 | 只处理 HTML/XML，返回内容**超过 8000 字符会被截断**；**无法解析 PDF 二进制**；可用于读 arXiv Atom API 的返回 |
-| `downloadPaper` | 下载论文 PDF 到 `investigation/{课题方向}/papers/`，自动重试、校验、去重；**下载前先查本地论文库** | 接受 PDF 链接 / arXiv abs 页 / DOI / 出版社 landing page；**仅用于已判定相关的论文** |
-| `listDownloadedPapers` | 列出某课题下已下载的论文（大小、页数） | 下载前先查，避免重复下载 |
-| `listLibraryPapers` | 列出**本地论文库**（所有课题共用）里的论文 | 库里有就直接复用，不必再联网 |
-
-> 读取 PDF 正文与从 PDF 截图的能力都属于 `analyst-agent`——精读与取图是为写作准备素材的环节，不属于检索。不要尝试用 `webCrawl` 打开 `.pdf` 链接来代劳（它只解析 HTML，对 PDF 只会返回乱码或空内容）。
-
-由此推出四条硬性结论：
+由此推出三条硬性结论：
 
 1. **候选池靠"多检索式 × 多入口"堆出来**，而不是靠单次搜索；可用入口只有 arXiv / OpenReview / PubMed / `webSearch` 四个（见 §2.3）。
 2. **摘要必须从论文的 HTML 摘要页或 API 返回读取**（arXiv `/abs/` 页与 Atom `<summary>`、OpenReview 笔记、PubMed 页），**不要试图用 `webCrawl` 打开 `.pdf` 链接**——那只会拿到乱码或空内容。
 3. **`downloadPaper` 是唯一的副作用操作**，且只对通过 §5 判定的论文调用；其余一律只读。
-4. **先查库再下载**：`listLibraryPapers` / `downloadPaper` 已内建论文库命中，同一篇论文第二次调研不该再花联网成本。
-
-**降级链（所有抓取动作都适用）**：
-
-```
-论文 HTML 摘要页 / arXiv Atom <summary>  →  会议/期刊 landing page  →  OpenReview 笔记
-   →  搜索结果里的摘要片段  →  标记 SOURCE_LEVEL=SNIPPET 并显式记录
-```
-
-任何一级成功即停止下降。走到底仍拿不到摘要时，**标记为 `UNKNOWN` 且不下载**，在材料中如实记录。
 
 ---
 
@@ -97,7 +81,7 @@ site:openreview.net <核心概念词> <限定词>
 <核心概念词> <限定词> after:2022-01-01
 ```
 
-> **不要**再写 `site:scholar.google.com`、`site:dblp.org`、`site:semanticscholar.org`
+> **不要**写 `site:scholar.google.com`、`site:dblp.org`、`site:semanticscholar.com`
 > —— 这几个站点已实测不可用（§2.3），限定它们只会拿到空结果。
 
 **C. OpenReview API（ML 顶会）**
@@ -110,63 +94,53 @@ https://api2.openreview.net/notes/search?term=<关键词>&limit=20
 
 ### 2.3 检索站点矩阵（2026-11 实测）
 
-下表的「实测」列是本项目在目标网络环境下用真实请求验证过的结果，**不是预期值**。
-不可用的站点已经剔除，不要把它们写进检索计划——那样只会浪费轮次并污染候选池。
+下表的「实测」列是本项目在目标网络环境下用真实请求验证过的结果，**不是预期值**。不可用的站点已经剔除，不要把它们写进检索计划——那样只会浪费轮次并污染候选池。
 
 | 优先级 | 站点 | 适用领域 | 检索入口 | 实测 | 摘要可读性 |
 |-------|------|---------|---------|------|-----------|
-| 1 | **arXiv** | CS、数学、物理 | `export.arxiv.org/api/query`（Atom XML）或 `arxiv.org/list` | ✅ 可用，响应快 | 高（`/abs/` 页有完整摘要） |
-| 2 | **OpenReview** | ML 顶会 | `api2.openreview.net/notes/search`（JSON）或 `openreview.net/search` | ✅ 可用 | 高（含评审意见） |
+| 1 | **arXiv** | CS、数学、物理 | `export.arxiv.org/api/query`（Atom XML） | ✅ 可用，响应快 | 高（`/abs/` 页有完整摘要） |
+| 2 | **OpenReview** | ML 顶会 | `api2.openreview.net/notes/search`（JSON）或 `openreview.net/search` | ⚠️ **不稳定**：2026-11 实测 API 返回 403 | 高（含评审意见） |
 | 3 | **PubMed** | 生物医学 | `pubmed.ncbi.nlm.nih.gov/?term=` | ✅ 可用 | 高 |
 | 4 | **Bing（`webSearch` 工具）** | 全学科 | 工具内置，无需拼 URL | ✅ 可用（正常返回 8 条） | 中（摘要片段） |
 | 5 | **中国知网 CNKI** | 中文学术 | 首页可访问，检索页需登录 | ⚠️ 部分可用 | 低（多数全文收费） |
+| — | arXiv 的 HTML 高级检索 | — | `arxiv.org/search/advanced?...` | ❌ **不可用**：参数格式易错，实测返回 400 | — |
 | — | Semantic Scholar | — | — | ❌ **已剔除**：网页 202 空响应，API 返回 429 限流 | — |
 | — | DBLP | — | — | ❌ **已剔除**：返回反爬验证页（"Making sure you're not a bot!"） | — |
 | — | Google Scholar | — | — | ❌ **已剔除**：302 跳转至验证页，无法抓取 | — |
 | — | IEEE Xplore | — | — | ❌ **已剔除**：418 反爬拦截 | — |
 
-**可用站点只有前四个。** 检索计划必须建立在它们之上：
+**可用站点只有前四个**，其中 OpenReview 不稳定：
 
-- **arXiv 是主力**，CS/物理/数学课题几乎都从这里出候选。
-- **OpenReview 补 ML 顶会**（NeurIPS/ICLR/ICML 的投稿与评审）。
+- **arXiv 是主力**：只用 Atom API（`export.arxiv.org/api/query`），不要拼 `arxiv.org/search/advanced?...`
+  —— 那是网页表单的参数格式，拼错一个字段就返回 400。`arxiv.org/list` 只用于按分类浏览最新投稿。
+- **OpenReview 补 ML 顶会**（NeurIPS/ICLR/ICML 的投稿与评审），但**经常返回 403**：
+  第一次 403 后改用 `webSearch` 的 `site:openreview.net` 兜底；拿不到就如实说明该站点本轮不可用，
+  **不要因此把候选池缩小当作"没有更多论文"**。
 - **PubMed 只用于生命科学课题**，其他课题不要浪费轮次。
-- **`webSearch`（Bing）用来兜底**：发现 arXiv 上没有的论文、定位官方项目页与作者主页，
-  也用于 `site:arxiv.org <词>` 这类站点限定式。
-- **CNKI 不要作为主检索路径**：首页能开，但检索页需要登录、全文基本收费。
-  中文课题优先用 `webSearch` 搜中文关键词，命中后再判断能否拿到 PDF。
+- **`webSearch`（Bing）用来兜底**：发现 arXiv 上没有的论文、定位官方项目页与作者主页。
+- **CNKI 不要作为主检索路径**：检索页需要登录、全文基本收费。中文课题优先用 `webSearch` 搜中文关键词。
 
 **至少检索 2 个可用站点**（arXiv 必查），中文课题额外用 `webSearch` 跑中文关键词。
 不要再写「至少 3 个站点」——可用站点本来就只有四个，凑数会让计划偏离现实。
 
 ### 2.4 如何用 arXiv API 检索（推荐直接拼 URL 交给 `webCrawl`）
 
-arXiv 的 Atom API 是当前最稳定的入口，比在网页上翻列表精确得多：
-
 ```
 https://export.arxiv.org/api/query?search_query=all:"layout control"&max_results=20&sortBy=submittedDate&sortOrder=descending
 ```
 
-要点：
-
 - `search_query` 支持 `all:` / `ti:`（标题）/ `au:`（作者）/ `cat:cs.CV`（分类）等前缀，
   精确短语用双引号（需 URL 编码为 `%22`），多个条件用 `AND` / `OR` / `ANDNOT` 连接。
 - `sortBy=submittedDate&sortOrder=descending` 取最新的；要看高影响论文改 `sortBy=relevance`。
-- 返回的是 Atom XML：`<entry>` 里含 `<title>`、`<id>`（即 `arxiv.org/abs/xxxx`）、`<summary>`（摘要）、
-  `<published>`。**`<summary>` 就是可用的摘要证据**，可直接摘录进 §5 判定表。
-- `webCrawl` 对 XML 也能取到文本；若返回内容被 8000 字符截断，把 `max_results` 调小后重跑。
+- 返回的 Atom XML 里 `<entry>` 含 `<title>`、`<id>`（即 `arxiv.org/abs/xxxx`）、`<summary>`（摘要）、`<published>`。
+  **`<summary>` 就是可用的摘要证据**，可直接摘录进 §5 判定表。`webCrawl` 对 XML 也能取到文本；
+  若被 8000 字符截断，把 `max_results` 调小后重跑。
 
 ### 2.5 站点不可用时的处置（不要重试，直接换路）
 
-| 站点 | 现象 | 处置 |
-|------|------|------|
-| Semantic Scholar | 网页 202 空响应 / API 429 | 不再使用；改用 arXiv + `webSearch` |
-| DBLP | 返回 "Making sure you're not a bot!" | 不再使用；题录信息改用 arXiv 分类列表 |
-| Google Scholar | 302 到验证页 | 不再使用；改 `webSearch` 或 arXiv |
-| IEEE Xplore | 418 | 不再使用；工程类论文用 `webSearch` 找作者主页/arXiv 版 |
-| CNKI | 检索页需登录 | 用 `webSearch` 搜中文关键词；拿不到全文就标 `ABSTRACT_ONLY` |
-
-> 站点矩阵会随网络环境变化。若某个「可用」站点连续两次失败，按不可用处理并在交付材料里注明，
-> 不要在一轮调研里反复冲击同一个站点。
+站点矩阵会随网络环境变化。某个「可用」站点连续两次失败即按不可用处理，不再冲击同一入口，
+改用 arXiv + `webSearch` 并在交付材料里注明。**检索阶段的失败靠换检索式、换站点解决，不靠重试。**
+CNKI 检索页需要登录时用 `webSearch` 搜中文关键词，拿不到全文就标 `ABSTRACT_ONLY`。
 
 ---
 
@@ -176,14 +150,28 @@ https://export.arxiv.org/api/query?search_query=all:"layout control"&max_results
 
 ```markdown
 ### C{序号}
-- **标题**: {完整标题}
+- **标题**: {完整标题，逐字照抄摘要页——下载时它用来查 DOI，一个字母都不要改}
 - **年份**: {年份}
 - **来源**: {会议/期刊/arXiv 编号}
+- **DOI**: {DOI，如 10.1109/WACV57701.2024.00526；没有写 NONE}
+- **arXiv ID**: {如 2304.03373；没有写 NONE}
 - **URL**: {链接}
 - **摘要片段**: {搜索结果中给出的摘要片段原文，若无则写 NONE}
 - **发现于**: {检索式 / 站点}
 - **初步印象**: {待判定}
 ```
+
+**DOI 与 arXiv ID 从哪里读**（读摘要时顺手记下，不要额外检索）：
+
+| 来源 | DOI 在哪 | arXiv ID 在哪 |
+|------|---------|--------------|
+| arXiv Atom API | `<arxiv:doi>`（作者填了才有，多数没有） | `<id>` 里的 `abs/` 之后，去掉版本号 |
+| arXiv `/abs/` 页 | 右侧 "DOI" / "Journal reference" | URL 本身 |
+| 出版社 / 会议页 | 页面上的 "DOI:" 或 `https://doi.org/...` 链接 | — |
+| OpenReview | 通常没有 DOI | 笔记里若附 arXiv 链接则有 |
+| PubMed | 页面上的 "DOI:" | — |
+
+拿不到 DOI 不要紧——下载时会用标题找 DOI。但标题必须完整、准确（逐字照抄）。
 
 **去重规则**（在候选池阶段就要做）：
 
@@ -217,11 +205,20 @@ https://export.arxiv.org/api/query?search_query=all:"layout control"&max_results
 
 ## 5. 摘要级相关性判定（下载的唯一闸门）
 
+**获取摘要的降级链**（任何一级成功即停止下降）：
+
+```
+论文 HTML 摘要页 / arXiv Atom <summary>  →  会议/期刊 landing page  →  OpenReview 笔记
+   →  搜索结果里的摘要片段  →  标记 SOURCE_LEVEL=SNIPPET 并显式记录
+```
+
+走到底仍拿不到摘要时，**标记为 `UNKNOWN` 且不下载**，在材料中如实记录。
+
 ### 5.1 判定流程
 
 对每个通过初筛的候选：
 
-1. **获取摘要**：按 §0 的降级链读取论文 HTML 摘要页。**标题不足以判定，必须读到摘要正文。**
+1. **获取摘要**：按上面的降级链读取论文 HTML 摘要页。**标题不足以判定，必须读到摘要正文。**
 2. **逐维打分**：按 §5.2 的五维评分表打分。
 3. **摘录证据**：**必须从摘要原文中摘录一段支撑判定的原句**（英文原句照抄，不翻译、不改写）。
 4. **给出结论**：按 §5.4 阈值判定 `RELEVANT` / `BORDERLINE` / `IRRELEVANT`。
@@ -288,98 +285,70 @@ https://export.arxiv.org/api/query?search_query=all:"layout control"&max_results
 
 ---
 
-## 6. 下载与保存
+## 6. 下载与来源等级
 
-### 6.1 下载前置检查
+### 6.1 只下载判定通过的论文
 
 下载前逐条确认：
 
 - [ ] 该论文在 §5.5 判定表中为 `RELEVANT`（或经 §5.4 补入的 `BORDERLINE`）
 - [ ] 判定行包含摘要原文证据摘录
 - [ ] 已确认这是该论文的正确版本（会议版优先，arXiv 版备用）
-- [ ] 目标路径与文件名已按 §6.2 规范确定，且不与已有文件冲突
+- [ ] 已备好**完整标题**，以及能拿到的 **DOI / arXiv ID**（§3）
 
-### 6.2 命名与目录规范
+**论文短名**：优先用论文的通用缩写（如 `MS-Diffusion`、`AnyMS`）；无通用缩写时用标题首字母缩写 + 年份（如 `LCPD2024`）。
 
-所有产出按**课题方向**归档在项目根目录下：
+- **短名只是标签，不代表是哪一篇论文**：不同论文可能被起成同一个短名。工具按标题 / DOI / arXiv ID 认论文；返回里多一行 `shortName:` 时（短名被另一篇占用、或这篇已用别的名字保存），**此后一律用那个名字**。
+- 短名一旦确定，在**全文所有位置保持一致**（PDF 文件名、精读文件名、文档清单与汇总表）：`analyst-agent` 按短名找到 PDF，`writer-agent` 按短名读取精读结果，图也跟着短名走（`analysis/figures/{论文短名}_Fig{N}.png`）。
+- **不下载图片**：你的工具只处理 PDF。原文中的框架图由 `analyst-agent` 从 PDF 截取，你既不用下载图片，也不要在下载清单里记录图片链接。
 
-```
-{项目根目录}/
-└── investigation/
-    └── {课题方向}/                    # 本次调研的课题方向
-        ├── papers/                    # 论文原件（你负责的一层）
-        │   └── {论文短名}.pdf
-        ├── analysis/                  # 逐篇精读结果（analyst-agent 产出）
-        │   └── {论文短名}.md
-        └── document/                  # 调研文档（writer-agent 产出）
-            └── {文档名}.md
-```
+### 6.2 怎么调用
 
-**课题方向（topic）是目录的唯一键**：
-
-- 你手上的两个论文工具（`downloadPaper` / `listDownloadedPapers`）都必须传入课题方向。后续的精读与写作阶段用同一个课题方向读取论文、落盘分析与文档。
-- 同一次调研中，**所有工具调用的课题方向必须完全相同**，否则论文和文档会被拆到不同目录。
-- 课题方向**不区分对话（thread）**：换一个对话继续调研同一课题，只要课题方向一致，就能直接复用已下载的论文。这正是 `listDownloadedPapers` 查重的意义。
-- 取值应稳定、简洁，直接用课题名称即可（如 `多主体布局控制`）；工具会自动做安全处理。
-
-- **论文短名**：优先用论文的通用缩写（如 `MS-Diffusion`、`AnyMS`）；无通用缩写时用标题首字母缩写 + 年份（如 `LCPD2024`）。
-- 短名一旦确定，在**全文所有位置保持一致**（PDF 文件名、精读文件名、文档清单与汇总表）。`analyst-agent` 按短名找到 PDF，`writer-agent` 按短名读取精读结果、也让读者用短名找到对应文件——短名不一致会导致整条链断开。图也会跟着短名走（`analysis/figures/{论文短名}_Fig{N}.png`），短名不一致同样会让图找不到归属。
-- **不下载图片**：你的工具只处理 PDF，也没有把图落盘的能力。原文中的框架图由 `analyst-agent` 用 `extractPaperFigures` **从 PDF 里直接截取**（不需要你去找图片 URL），再由精读结果与调研文档各自引用。你既不用下载图片，也不要在下载清单里记录图片链接。
-
-### 6.3 下载执行
-
-**先查重**：调用 `listDownloadedPapers(topic = {课题方向})`，看该课题下是否已下载过，避免重复抓取。
-
-**再下载**：对每篇判定通过的论文调用一次
+下载前先 `listDownloadedPapers(topic = {课题方向})` 查重。然后对每篇判定通过的论文调用一次，
+**传论文的标识，而不是只传一个链接**：
 
 ```
-downloadPaper(topic = {课题方向}, url = {PDF 链接 / arXiv abs 页 / DOI 页}, shortName = {论文短名})
+downloadPaper(
+  topic    = {课题方向},
+  shortName= {论文短名},
+  title    = {完整标题，逐字照抄}        ← 每篇必传
+  year     = {发表年份}                 ← 每篇必传
+  doi      = {DOI}                      ← 已发表论文必传
+  arxivId  = {arXiv ID}                 ← 有 arXiv 版就传；与 DOI 都有就都传
+  url      = {链接}                     ← 可选，仅当没有 DOI 也没有 arXiv ID 时需要
+)
 ```
 
-保存路径为 `investigation/{课题方向}/papers/{论文短名}.pdf`，返回值中的 `path` 即实际路径。
+保存路径为 `investigation/{课题方向}/papers/{论文短名}.pdf`；返回值里的 `path` 是实际路径，
+`source` 写明这篇是从哪个渠道拿到的，`shortName:` 行给出实际文件名。
 
-`downloadPaper` 已内建以下保障，**不需要你手动重试或校验**：
+**标识传得越全，成功率越高**：只传标题时工具要靠标题找 DOI，纯 arXiv 论文可能找不到；
+只传一个出版社链接（且链接里没有 DOI）是最容易失败的组合，**避免这样调用**。
 
-| 保障 | 说明 |
-|------|------|
-| 自动重试 | 传输错误与 408/425/429/5xx 会按指数退避 + 抖动重试，并遵守 `Retry-After` |
-| 落地页解析 | 传入 arXiv abs 页 / DOI / 出版社页面时，自动定位真正的 PDF 链接 |
-| 真实性校验 | 校验 `%PDF-` 魔数与 PDFBox 可解析性，避免把 HTML 错误页存成 PDF |
-| 去重 | **按解析后的文件名判重**：目标文件已存在且可解析时，重复调用会跳过而非重下。因此短名就是去重键——**同一篇论文换了短名会被重新下载**。 |
-| 路径安全 | 课题方向与短名中的分隔符、`..` 会被清理，文件始终落在该课题的 `papers/` 内 |
+### 6.3 失败时
 
-**下载完成后你的工作即结束**：不要读取正文（你没有这个工具）。把短名与来源等级写进 §7 输出契约，交给 `analyst-agent` 去精读。
+`downloadPaper` 返回 `DOWNLOAD_FAILED` 时，报告里列出了**用到的标识、试过的每个来源、每次失败的原因**，
+最后一行 `Next:` 写明缺什么。按它处理，**同一篇最多再调用一次**（通常是补齐 DOI / arXiv ID 后重调）；
+仍失败就**不要再调用**，标 `SOURCE_LEVEL=ABSTRACT_ONLY`，在下载清单里如实列出。
 
-**下载失败处理**：`downloadPaper` 返回 `DOWNLOAD_FAILED` 时，它会列出每次尝试的失败原因，据此决策：
+**不要做的事**：
 
-| 失败原因 | 处置 |
-|---------|------|
-| 404 / 链接失效 | 换 arXiv 版、OpenReview 版或作者主页 |
-| 403（bot 防护） | 换镜像站或聚合站；`host-fallbacks` 可配置镜像 |
-| 超时 / 连接错误 | 已自动重试；仍失败则换源 |
-| 无 PDF 链接（付费墙） | 降级为 `SOURCE_LEVEL=ABSTRACT_ONLY` 并显式标注 |
+- 不要用同一组标识重复调用——工具已经把所有渠道都试过、都重试过了；
+- 不要自己去找镜像站、拼出版社的 PDF 链接、或用 `webCrawl` 翻作者主页找 PDF——取文是工具的职责；
+- 不要把摘要页当全文下载，也不要为了凑数把下载失败的论文改标为相关。
 
-**仍然失败时**，输出下载清单交由主 Agent 处理：
-
-```markdown
-## 下载清单
-
-| 序号 | 论文短名 | 判定得分 | PDF URL | 目标路径 | 备用 URL |
-|------|---------|---------|---------|---------|---------|
-| 1 | MS-Diffusion | 96 | https://arxiv.org/pdf/xxxx | investigation/{课题方向}/papers/MS-Diffusion.pdf | https://... |
-```
-
-**不允许对同一 URL 无意义重试**——`downloadPaper` 内部已重试过，你的职责是换源，不是再调一次。
+全部失败的论文会被工作流收集并请用户补齐后续跑，不需要你处理。
 
 ### 6.4 来源等级标注
 
-每篇论文必须标注来源等级，供 `analyst-agent` 判断能写多深、供 `writer-agent` 与 `reviewer-agent` 核对可信度：
+每篇论文必须标注来源等级，它直接决定下游能写多深：
 
-| 等级 | 含义 | 可用信息 |
+| 等级 | 含义 | 下游可用的信息 |
 |------|------|---------|
-| `FULL_TEXT` | 已获取全文 | 全部四维信息，公式可逐字核对 |
+| `FULL_TEXT` | 已获取全文（下载成功即为此级） | 四维信息完整，公式可逐字核对 |
 | `ABSTRACT_ONLY` | 仅摘要页 | 概要与意图可靠；**方法细节与公式不得展开** |
 | `SNIPPET` | 仅搜索结果片段 | 仅可用于背景铺垫，**不得作为论据** |
+| `UNKNOWN` | 摘要也拿不到 | **不下载**，仅记录 |
 
 **`ABSTRACT_ONLY` 与 `SNIPPET` 的论文，其公式一律不得写入精读结果，也不得写入文档。** 这是防止编造公式的第一道防线。
 
@@ -399,26 +368,17 @@ downloadPaper(topic = {课题方向}, url = {PDF 链接 / arXiv abs 页 / DOI �
 
 ### 7.3 下载清单
 
-按 §6.3 格式的下载清单，每篇必须标明：
-
 ```markdown
 ## 下载清单
 
-| 序号 | 论文短名 | 判定得分 | 来源等级 | 目标路径 | 备用 URL |
-|------|---------|---------|---------|---------|---------|
-| 1 | MS-Diffusion | 96 | FULL_TEXT | investigation/{课题方向}/papers/MS-Diffusion.pdf | https://... |
+| 序号 | 论文短名 | 判定得分 | 来源等级 | 取文渠道 | DOI | arXiv ID | 目标路径 |
+|------|---------|---------|---------|---------|-----|----------|---------|
+| 1 | MS-Diffusion | 96 | FULL_TEXT | Unpaywall 开放获取 | 10.xxxx/... | 2406.07209 | investigation/{课题方向}/papers/MS-Diffusion.pdf |
+| 2 | Optuna | 88 | ABSTRACT_ONLY | 无（全部渠道失败） | 10.1145/3292500.3330701 | NONE | — |
 ```
 
-**`来源等级` 是你必须逐篇给出的字段**，它直接决定下游能写多深：
-
-| 等级 | 含义 | 下游可用的信息 |
-|------|------|------------------------|
-| `FULL_TEXT` | PDF 已成功下载且可解析 | 可精读正文、四维信息完整、公式可逐字核对 |
-| `ABSTRACT_ONLY` | 仅有摘要页 | 仅概要与意图可靠；**不得展开方法细节与公式** |
-| `SNIPPET` | 仅搜索结果片段 | 仅可作背景铺垫，**不得作为论据** |
-| `UNKNOWN` | 摘要也拿不到 | **不下载**，仅记录 |
-
-> 你不需要判断 PDF 正文能否解析——`downloadPaper` 已做真实性校验，下载成功即 `FULL_TEXT`；它明确失败并降级时按降级等级标注。
+- `取文渠道` 照抄 `downloadPaper` 返回的 `source` 行；DOI 与 arXiv ID 没有就写 NONE。
+- `来源等级` 按 §6.4 逐篇给出；下载失败的论文也列入（目标路径写 —）。
 
 ### 7.4 参考文献
 
@@ -430,40 +390,15 @@ downloadPaper(topic = {课题方向}, url = {PDF 链接 / arXiv abs 页 / DOI �
 
 ---
 
-## 8. 失败模式与处置速查
-
-| 现象 | 原因 | 处置 |
-|------|------|------|
-| 搜索结果只有 8 条 | `webSearch` 的固有上限 | 换检索式、换站点，多次检索堆候选池 |
-| `webCrawl` 打开 PDF 返回乱码/空 | 工具只解析 HTML | 改抓 `/abs/` 摘要页；下载改用 `downloadPaper` |
-| 摘要页正文被截断（>8000 字符） | 工具截断 | 摘要在页面开头，通常不受影响；若被截，改用 arXiv Atom `<summary>` 或调小 `max_results` |
-| Google Scholar / DBLP / Semantic Scholar / IEEE 被拦截 | 反爬或限流（实测均不可用） | 不再使用该站点；改用 arXiv API + `webSearch` |
-| 某篇论文找不到 HTML 摘要页 | 闭源期刊 | 走降级链，最终标 `SNIPPET` 或 `UNKNOWN` |
-| 判定为 RELEVANT 的数量不足 | 检索式覆盖不足 | **回到 §2 追加检索式**，不降低阈值 |
-| 候选池全是同一方法流派 | 检索式偏斜 | 追加对立流派的检索词（如加 `training-free`） |
-| `downloadPaper` 返回 403 | bot 防护 | 换镜像站 / 聚合站；可在 `agent.paper.host-fallbacks` 配置镜像 |
-| `downloadPaper` 返回"不是可解析 PDF" | 拿到的是错误页 | 换源；不要重复调用同一 URL |
-| `downloadPaper` 提示已下载 | 目标文件名已存在 | 确认是同一篇论文即复用；**若是不同论文，换一个短名** |
-| 全文拿不到但论文很关键 | 闭源 | 标 `ABSTRACT_ONLY`，显式标注，只写概要级信息 |
-
-> 检索阶段的失败**不要靠重试解决**，靠换源、换检索式、换站点。同一 URL 或同一检索式失败两次即改变策略。
-
----
-
-## 9. 执行自检清单
-
-交付材料前逐项确认：
+## 8. 交付前自检
 
 - [ ] 候选池规模 ≥ `target_count × 2`（理想为 ×3）
 - [ ] 检索只用了实测可用的入口（arXiv / OpenReview / PubMed / webSearch），没有冲击已剔除的站点
 - [ ] 中文课题额外用 `webSearch` 跑了中文关键词
-- [ ] 每篇入选论文都有摘要原文证据摘录
-- [ ] 判定表完整，包含被排除论文及排除理由
-- [ ] `downloadPaper` 仅针对判定通过的论文调用，且下载前已用 `listDownloadedPapers` 查重
-- [ ] 所有工具调用使用了**同一个**课题方向取值，论文均落在 `investigation/{课题方向}/papers/` 下
-- [ ] 所有文件名与短名规范一致，无冲突
-- [ ] 下载清单中每篇都标注了**来源等级**
-- [ ] 参考文献列表信息完整准确，缺失字段已标注 `[信息缺失]`
-- [ ] **未尝试读取任何 PDF 正文**（那是 analyst-agent 的工作）
-- [ ] 未执行任何写入/删除/邮件等副作用操作（除约定的下载外）
-
+- [ ] 每篇入选论文都有摘要原文证据摘录；判定表包含被排除论文及排除理由
+- [ ] `downloadPaper` 仅针对判定通过的论文调用，每篇都传了**完整标题**与能拿到的 **DOI / arXiv ID**
+- [ ] 没有自己拼镜像链接或出版社 PDF 链接；同一篇论文最多补齐标识后重调一次
+- [ ] 所有工具调用使用了**同一个**课题方向取值
+- [ ] 材料里的短名与 `downloadPaper` 返回的一致（返回里有 `shortName:` 时以它为准）
+- [ ] 下载清单中每篇都标注了**来源等级**；参考文献缺失字段已标注 `[信息缺失]`
+- [ ] **未尝试读取任何 PDF 正文**（那是 analyst-agent 的工作），未执行下载以外的副作用操作

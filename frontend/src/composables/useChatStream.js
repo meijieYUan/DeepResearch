@@ -267,9 +267,17 @@ export function useChatStream({
 }
 
 /** The readable body of a paused-for-papers bubble. */
-function waitingText(waiting) {
+export function waitingText(waiting) {
   const lines = [`调研已暂停：还有 ${waiting.missingPapers.length} 篇论文没能自动下载。`]
-  if (waiting.libraryPath) lines.push(`把 PDF 放进去（文件名用「短名.pdf」）：${waiting.libraryPath}`)
-  for (const paper of waiting.missingPapers) lines.push(`- ${paper.shortName || paper}`)
+  if (waiting.libraryPath) lines.push(`把 PDF 放进去（文件名任意）：${waiting.libraryPath}`)
+  for (const paper of waiting.missingPapers) {
+    const name = paper.shortName || paper
+    const parts = [name]
+    if (paper.title) parts.push(paper.title)
+    if (paper.doi) parts.push(`DOI ${paper.doi}`)
+    if (paper.arxivId) parts.push(`arXiv ${paper.arxivId}`)
+    if (paper.fileName) parts.push(`认不出时改名为 ${paper.fileName}`)
+    lines.push(`- ${parts.join(' · ')}`)
+  }
   return lines.join('\n')
 }

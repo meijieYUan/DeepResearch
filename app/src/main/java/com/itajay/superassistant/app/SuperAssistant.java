@@ -207,7 +207,7 @@ public class SuperAssistant {
      * through the ordinary plan → tool → workflow path, and the conversation history keeps
      * a readable record of why the run restarted.</p>
      */
-    private static String resumeMessage(ResearchResumeStore.ResumeTask paused) {
+    static String resumeMessage(ResearchResumeStore.ResumeTask paused) {
         StringBuilder sb = new StringBuilder();
         sb.append("继续上次暂停的调研。\n\n");
         sb.append("课题方向必须逐字使用：").append(paused.topic()).append("\n\n");
@@ -216,9 +216,24 @@ public class SuperAssistant {
             sb.append("上次未能下载的论文（已放入本地论文库 "
                             + WorkspacePaths.relative(WorkspacePaths.paperLibraryDir()) + " 的请直接复用）：\n");
             for (ResearchResumeStore.MissingPaper paper : paused.missing()) {
-                sb.append("- ").append(paper.shortName()).append('\n');
+                sb.append("- ").append(paper.shortName());
+                if (paper.title() != null) {
+                    sb.append("：").append(paper.title());
+                }
+                if (paper.doi() != null) {
+                    sb.append("（DOI ").append(paper.doi()).append('）');
+                }
+                if (paper.arxivId() != null) {
+                    sb.append("（arXiv ").append(paper.arxivId()).append('）');
+                }
+                if (paper.doi() == null && paper.arxivId() == null
+                        && paper.url() != null && !paper.url().isBlank()) {
+                    sb.append("（链接 ").append(paper.url()).append('）');
+                }
+                sb.append('\n');
             }
-            sb.append('\n');
+            sb.append("调用工作流时把这份清单连同标题、DOI、arXiv 编号一起写进调研要求，"
+                    + "下载时原样传给 downloadPaper：短名可能与另一篇论文重名，只传短名认不出是哪一篇。\n\n");
         }
         sb.append("""
                 重新调用 researchWriteReview 工作流，课题方向参数以上面给出的为准。

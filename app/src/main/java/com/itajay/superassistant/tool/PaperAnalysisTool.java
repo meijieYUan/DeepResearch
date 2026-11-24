@@ -253,6 +253,50 @@ public class PaperAnalysisTool {
         }
         runPending(topic, threadId, round, pending, outcomes, reason, requirements, context, activity);
 
+        // A failed paper gets one more try, in Java rather than by asking the model to
+        // retry: the most common failure here is a truncated tool argument (the analyst's
+        // writePaperAnalysis call exceeds the output ceiling and the JSON ends mid-string),
+        // and that is per-run variance — the same paper usually succeeds on a second pass.
+        // Leaving it to the writer's instructions made the outcome depend on whether the
+        // model noticed the failure in the index, which is not something a quality gate
+        // should be contingent on. Still bounded to two attempts: a systematically
+        // unreadable PDF must fail, not loop.
+        List<PendingJob> retry = new ArrayList<>();
+        for (PendingJob job : pending) {
+            if (outcomes.get(job.index()) != null && outcomes.get(job.index()).status() == Status.FAILED) {
+                retry.add(job);
+            }
+        }
+        if (!retry.isEmpty() && !Thread.currentThread().isInterrupted()) {
+            log.info("Retrying {} failed analysis lane(s) once [topic={}]", retry.size(), topic);
+            int retried = 0;
+            for (PendingJob job : retry) {
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
+                retried++;
+                activity.started(topic, job.shortName());
+                Outcome outcome;
+                try {
+                    outcome = analyzeOne(topic, job.shortName(), job.pdf(), job.target(),
+                            reason + "（失败重试）", requirements, threadId, context);
+                } finally {
+                    activity.exited(topic, job.shortName());
+                }
+                if (outcome.status() == Status.ANALYSED) {
+                    outcomes.set(job.index(), outcome);
+                    activity.finished(topic, outcome);
+                    if (context == null) {
+                        publishPaperDone(threadId, round, outcome, retried, retry.size());
+                    }
+                } else {
+                    // Keep the original failure detail: the retry's own error is usually the
+                    // same, and replacing it would hide the first, more informative one.
+                    activity.finished(topic, outcomes.get(job.index()));
+                }
+            }
+        }
+
         long failed = outcomes.stream().filter(o -> o.status == Status.FAILED).count();
         activity.batch(failed > 0 ? ProgressEvent.Status.FAILED : skipped == pdfs.size()
                 ? ProgressEvent.Status.SKIPPED : ProgressEvent.Status.SUCCEEDED, "精读批次处理结束");

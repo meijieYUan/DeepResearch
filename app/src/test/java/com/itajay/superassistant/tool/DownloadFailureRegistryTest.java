@@ -33,9 +33,51 @@ class DownloadFailureRegistryTest {
     @Test
     void aLaterSuccessCancelsTheFailure() {
         registry.record("t1", "topic-a", "Paper-One", "https://x/1.pdf", "HTTP 403");
-        registry.resolved("t1", "topic-a", "Paper-One");
+        registry.resolved("t1", "topic-a", "Paper-One", PaperIdentity.fromReference("https://x/1.pdf"));
 
         assertThat(registry.drain("t1", "topic-a").isEmpty()).isTrue();
+    }
+
+    private static final PaperIdentity ATTENTION =
+            new PaperIdentity("1706.03762", null, "Attention Is All You Need", null);
+    private static final PaperIdentity RESNET =
+            new PaperIdentity("1512.03385", null, "Deep Residual Learning for Image Recognition", null);
+
+    /** Otherwise the run goes on without a paper it never got. */
+    @Test
+    void anotherPaperSucceedingUnderTheSameNameCancelsNothing() {
+        registry.record("t1", "topic-a", "Survey", "https://x/1.pdf", "HTTP 403", RESNET);
+        registry.resolved("t1", "topic-a", "Survey", ATTENTION);
+
+        assertThat(registry.drain("t1", "topic-a").items()).hasSize(1);
+    }
+
+    @Test
+    void theSamePaperSucceedingUnderAnotherNameCancelsTheFailure() {
+        registry.record("t1", "topic-a", "Survey", "https://x/1.pdf", "HTTP 403", RESNET);
+        registry.resolved("t1", "topic-a", "ResNet", new PaperIdentity("1512.03385", null, null, null));
+
+        assertThat(registry.drain("t1", "topic-a").isEmpty()).isTrue();
+    }
+
+    @Test
+    void twoPapersFailingUnderOneNameAreBothKept() {
+        registry.record("t1", "topic-a", "Survey", null, "HTTP 403", RESNET);
+        registry.record("t1", "topic-a", "Survey", null, "HTTP 403", ATTENTION);
+
+        assertThat(registry.drain("t1", "topic-a").items())
+                .extracting(DownloadFailureRegistry.Failure::fileName)
+                .containsExactlyInAnyOrder("Survey-1512.03385.pdf", "Survey-1706.03762.pdf");
+    }
+
+    /** A retry with corrected identifiers is the same request, not a second missing paper. */
+    @Test
+    void aCorrectedRetryReplacesTheEarlierFailure() {
+        registry.record("t1", "topic-a", "ResNet", null, "no DOI",
+                new PaperIdentity(null, null, "ResNet: Deep Residual Learning for Image Recognition", null));
+        registry.record("t1", "topic-a", "ResNet", null, "HTTP 403", RESNET);
+
+        assertThat(registry.drain("t1", "topic-a").items()).hasSize(1);
     }
 
     @Test

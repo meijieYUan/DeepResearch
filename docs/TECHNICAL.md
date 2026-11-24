@@ -286,7 +286,7 @@ MemoryTool 提供 Agent 可调用的记忆管理能力，存储于 `.memory/` �
 | **TerminalTool** | `executeCommand`（纳入 HITL 审批）。工作目录强制限定在 workspace 内（绝对路径/`..` 逃逸被拒）；输出泵在独立线程、30s 超时可靠生效；计划模式的"只读命令"判定拒绝一切 shell 操作符（管道/重定向/命令替换）与 `find -delete`、`git config <key> <value>` 等变相写入 |
 | **CreateAgentTool** | 动态创建子 Agent 执行独立任务 |
 | **SkillResourceTool** | `readSkillResource`，只读读取 skill 的参考文件（路径限定在 skills 目录内），供子 Agent 加载参考指南 |
-| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按文件名去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用**。另有工作流面的 `acquirePaper`（非 @Tool）：按「本地文件 → 本课题已有 → 其他课题复制 → URL 下载」的顺序把论文弄进 `papers/`，返回结构化 `AcquireResult`（含来源枚举，供报告如实说明是否复用了本地文件） |
+| **PaperDownloadTool** | `downloadPaper` / `listDownloadedPapers`，论文 PDF 下载（重试、校验、按论文身份去重；仅 http/https，每跳重定向都做 SSRF 校验——解析后 IP 为环回/内网/链路本地/组播时拒绝）。**仅 `research-agent` 使用**。另有工作流面的 `acquirePaper`（非 @Tool）：按「本地文件 → 本课题已有 → 论文库 → 其他课题复制 → URL 下载」的顺序把论文弄进 `papers/`（每一步都按论文身份判断；一个短名对应多篇不同论文时不猜，返回候选让调用方指明），返回结构化 `AcquireResult`（含来源枚举，供报告如实说明是否复用了本地文件） |
 | **PaperTextTool** | `extractPaperText` / `listDownloadedPapers`，读取已下载 PDF 的正文（支持分页、超长截断）。**`analyst-agent` 与 `reviewer-agent` 使用** |
 | **PaperFigureTool** | `extractPaperFigures`，取出 PDF 里**原生嵌入的图片**并落盘为 PNG，**同时返回两种相对路径**（写进 analysis 文件的 `figures/…` 与写进文档的 `../analysis/figures/…`）。**仅 `analyst-agent` 使用** |
 | **DocumentWriteTool** | `writeResearchDocument`，把调研文档写入 `investigation/{课题方向}/document/`（仅限该目录、仅 Markdown） |
@@ -377,7 +377,8 @@ done          终止标记，随后服务端关流
 ├── papers/     # research-agent 下载的论文原件（PaperDownloadTool）
 ├── analysis/   # analyst-agent 逐篇生成的精读结果（AnalysisWriteTool），一篇一个文件
 │   └── figures/  # 同一批论文里截出来的图（PaperFigureTool），{短名}_p{页}_{序}.png
-└── document/   # writer-agent 生成的调研文档（DocumentWriteTool）
+├── document/   # writer-agent 生成的调研文档（DocumentWriteTool）
+└── review/     # 审查记录（ReviewReport 由工作流追加），审查报告.md
 ```
 
 - **课题方向是目录的唯一键，且不区分 thread**：换个对话继续调研同一课题，只要课题方向一致即可复用已下载的论文**与已完成的精读结果**。
@@ -385,7 +386,8 @@ done          终止标记，随后服务端关流
 - **图的短名前缀与 analysis 文件名逐字节同源**（都取自 `AnalysisStore.nameFor`），因此"每张图都对应一份已存在的精读结果"是可机械校验的性质，而不是君子协定。文件名里的 `{序}` 是该页内按 XObject 名字顺序的 1-based 序号，同一 PDF 上稳定，所以重跑同名覆盖、不产生碎片。原始嵌入图**自身不带图号**——第几张对应 Fig. 几必须由读过图注的 analyst 确认。
 - 项目根目录由 `WorkspacePaths` 从工作目录向上查找 `.git` 确定，避免 IDE / `spring-boot:run` 从子模块启动时把产出散落到 `app/investigation/`。
 - 四个子 Agent 都**没有通用文件能力**：`research-agent` 只能通过 `downloadPaper` 下载，`analyst-agent` 只能读正文并写自己那一篇的精读结果，`writer-agent` 只能触发精读、读回精读结果并写 Markdown 文档，`reviewer-agent` 完全只读；四者都限定在对应课题目录内。
-- 论文 PDF 去重**按解析后的文件名**判定，因此**短名就是去重键**——同一篇论文换了短名会被重新下载。
+- 论文 PDF 去重**按论文身份**（arXiv ID / DOI / 标题）判定，短名只是文件标签：同一篇换了短名仍会命中；同名的另一篇另存为「短名-标识.pdf」，互不覆盖。
+- **每轮审查的结论、问题清单与处置会追加到 `review/审查报告.md`**（`ReviewReport`，由工作流写入，任何 agent 都不能写）：一轮一节，含 verdict、issues 七字段表格与工作流的处置；每次运行收尾再加一节（交付 / 未通过 / 审查未完成 / 异常终止），同一课题再次运行追加到同一文件，形成完整审查时间线。写失败只记日志，不影响运行。
 - **精读结果按短名跳过已完成项**：`analyzePapers` 发现某篇已有 analysis 文件就不重做。因此一次中断或失败的运行重跑时，已完成的精读不会白做。
 - `investigation/` 已在 `.gitignore` 中忽略。
 
@@ -604,16 +606,36 @@ DeepResearchAgent/
 
 ### 本地论文库与人工介入
 
+**下载顺序（Unpaywall 优先）**：research 阶段的 `downloadPaper` 按论文**标识**取文（`title` / `doi` / `arxivId`，
+`url` 可选），工具自己规划来源，任一步拿到可解析 PDF 即停：
+
+| 顺序 | 来源 | 条件 |
+|-----|------|-----|
+| 0 | 课题目录已有 / 本地论文库 | 总是（不联网） |
+| 1 | **Unpaywall 开放获取**（arXiv / PMC / 机构仓库的合法全文） | 有 DOI；没给 DOI 时用标题在 **Crossref** 精确查 DOI |
+| 2 | arXiv（`arxiv.org/pdf` → `export.arxiv.org`） | 有 arXiv ID（含 `10.48550/arXiv.*` 形式的 DOI） |
+| 3 | 给定链接（落地页自动解析 PDF 链接） | 有 `url`；只有 DOI 时用 `doi.org` 解析 |
+
+服务选型（2026-11 实测，均免 API key）：Unpaywall 100% 可用、约 1.1s；Unpaywall 的标题检索已于
+2026-09-18 下线（HTTP 410），title→DOI 改用 Crossref（100% 可用、约 1.3s，结果须**标题精确匹配**；短标题
+命中多个 DOI 视为歧义不取，避免下载错论文）。OpenAlex 免 key 时与同出口 IP 的所有人共享每天 $0.10 额度，
+不作为依赖。两者都只需联系邮箱 `UNPAYWALL_EMAIL`；未配置时第 1 步被跳过，其余步骤照常。
+
+失败时 `DOWNLOAD_FAILED` 报告列出用到的标识、按序尝试过的每个来源与失败原因，末行 `Next:` 写明缺什么
+（缺 DOI / 缺 arXiv ID / 全部来源失败），供 research-agent 至多补齐标识重试一次。
+
 **本地论文库** `paper-library/papers/`（项目根目录，与 `investigation/` 平级）是所有会话、所有课题共用的论文原件集合。
 
 - 下载论文时**先查论文库**：命中就复制进 `investigation/{课题}/papers/`，不联网；未命中才下载。
 - 下载成功后同时写入课题目录与论文库；课题目录里的副本被删除不影响论文库。
-- 命中判定按三层依次尝试：短名 → 记录的 arXiv ID / DOI → **从 PDF 自身读出的指纹**。
-  后一层是为人工下载准备的：`index.tsv` 追加 `title` / `fingerprintArxivId` / `fingerprintDoi` / `scanned`
-  四列，首次命中未果时扫描库内 PDF 的第 1 页（arXiv 水印章 `arXiv:2401.12345v2` 与 DOI 都印在首页），
-  结果缓存下来，此后不再解析。因此人工把文件随便命名（`2401.12345v2.pdf`、出版社默认名）也能被复用；
-  比对 arXiv 编号时忽略版本后缀，标题按去标点小写全等比对（宁可不中，也不误配另一篇）。
-  旧版 `index.tsv` 少这几列时按「未扫描」读取，首次用到时自动补齐，无需迁移。
+- **文件名只是标签，命中只看论文身份**（`PaperIdentity` / `PaperMatch`）：短名由模型在每次会话里自己起，
+  两篇不同的论文可以都叫 `Survey`。依据是首页的 arXiv 竖排水印、标题、DOI，以及当初按什么标识下载到的
+  （按文件内容哈希记录，改名或替换文件都不会张冠李戴）。
+  - 判为同一篇需要正面证据，只有文件名相同不算。唯一例外：首页读不出任何文字（扫描件）且是人工放进来的文件，按文件名认。
+  - 标识与标题矛盾时不信标识——模型给对标题、写错编号是常见情况。
+  - 同名的另一篇不会被当成命中，也不会被覆盖，另存为「短名-标识.pdf」（`PaperShelf`，课题目录与论文库共用同一套规则）。
+  - 下载到的 PDF 同样核对，首页明显是另一篇时丢弃并换下一个来源。
+- `index.tsv` 只是缓存，文件变化会自动重读。旧格式的索引按文件名记身份，可能已经对不上，首次使用时整体忽略、从 PDF 重新读取。
 - 论文只复制不移动；`paper-library/` 已加入 `.gitignore`。
 
 **下载失败 → 等待人工介入**：研究阶段结束后，工作流检查本次失败的下载清单（由
@@ -621,7 +643,7 @@ DeepResearchAgent/
 
 1. 推送 `progress` 事件，阶段为 `WAITING`（`等待人工补充论文`）；
 2. 以 `waiting` 事件终止本次流，携带 `topic` / `libraryPath` / `missingPapers[]` / `resumeUrl`；
-3. 用户把 PDF 放进 `paper-library/papers/`（文件名任意）后调用 `POST /api/chat/{threadId}/resume`。
+3. 用户把 PDF 放进 `paper-library/papers/`（文件名任意；认不出的按 `missingPapers[].fileName` 改名）后调用 `POST /api/chat/{threadId}/resume`。
 
 resume 以原课题方向与原始要求重跑同一工作流；已下载论文、论文库命中、已有精读结果都会跳过，
 因此只重做真正缺失的部分。若缺失依旧存在，会再次进入 `waiting` 并给出新清单（`ResearchResumeStore`，TTL 24 小时）。
@@ -703,6 +725,7 @@ SMTP_PASSWORD=xxxxxxxx          # 可选：邮箱 SMTP 密码（MCP Email Server
 #   MCP_ENABLED                          MCP 客户端开关（默认 true；false 时完全不连接 MCP）
 #   EMBEDDING_ENABLED                    向量能力开关（默认 false）
 #   EMBEDDING_KEY                        DashScope API 密钥；EMBEDDING_ENABLED=true 时必填
+#   UNPAYWALL_EMAIL                      开放获取解析的联系邮箱（非 API key）；留空则跳过 OA 解析
 #   MILVUS_HOST / MILVUS_PORT            Milvus 地址（默认 127.0.0.1:9090）
 #   MYSQL_ROOT_PASSWORD / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   docker-compose 基础设施凭据（见 .env.example）
 ```
@@ -710,6 +733,34 @@ SMTP_PASSWORD=xxxxxxxx          # 可选：邮箱 SMTP 密码（MCP Email Server
 **可选能力降级**：Embedding / Milvus 不是启动前提。默认不启用向量能力，RAG 仅使用
 BM25 关键字召回；配置 `EMBEDDING_ENABLED=true` + `EMBEDDING_KEY` 后启用向量检索，
 若运行时 Milvus 或 Embedding 服务不可达，向量路径自动跳过，BM25 继续工作。
+
+### 模型网关与非流式调用（排障必读）
+
+本项目默认经公司网关 `llm-gateway.momenta.works`（APISIX 之后）访问模型。该网关
+**放行流式请求，但对非流式（`"stream": false`）请求返回 `413 Request Entity Too Large`**，
+且与请求实际体积无关：
+
+| 调用方 | 方式 | 请求形状（实测） | 结果 |
+|--------|------|-----------------|------|
+| 主 Agent | 流式 | 26 个工具、17KB schema、5.6KB 消息 | ✅ 通过 |
+| 四个子 Agent | 非流式 | 4–6 个工具、3–5KB schema、2–6KB 消息 | ❌ 413 |
+
+调小 `max-tokens`、裁剪指令与工具描述都不改变结果，唯一稳定差异是 `stream` 字段。
+
+**这不是体积问题，却曾表现得像模型胡说**：子 Agent 的第一次模型调用就 413，
+框架把异常吞掉并按「无工具调用的空回答」结束运行，工作流拿到空文本——检索/精读/写作/审查
+四个阶段都在 ~130ms 内「成功」结束，最终产出一份没有任何事实依据的文档。
+
+**应对**：`config/ModelTransportConfig` 用一个 `@Primary` 的 `ChatModel` 装饰器把
+`call()` 实现为「订阅 `stream()` → 自己合并分片 → 返回完整响应」。合并必须自己做：
+Spring AI 2.0.0-M1 的 `MessageAggregator` 是**逐块透传**而非累积合并，直接取最后一块会
+丢掉绝大部分正文与工具参数（表现为 `writePaperAnalysis` 的
+`Unexpected end-of-input: was expecting closing quote`）。装饰器只包一层传输，
+不改任何提示词与业务逻辑；网关修复后可设 `agent.model.call-via-stream=false` 关闭。
+
+工具调用的分片合并规则：文本增量直接拼接；工具调用以「id 与上一个调用不同」为界开新调用
+（id 为空的片子视为续片），name 取第一个非空值，arguments 依次拼接——同时兼容
+「只有首片带 id」和「每片都带同一 id」两种供应商约定。
 
 **`app/application.yml` 关键配置**：
 

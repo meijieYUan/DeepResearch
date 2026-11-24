@@ -5,9 +5,7 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -27,10 +25,38 @@ public class DownloadFailureRegistry {
     /** 未处理条目保留多久。工作流等待本身有超时，这里只是防止内存无限增长。 */
     private static final Duration TTL = Duration.ofHours(24);
 
-    private final ConcurrentHashMap<String, Map<String, Failure>> failures = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, List<Failure>> failures = new ConcurrentHashMap<>();
 
-    /** 一篇拿不到全文的论文。 */
-    public record Failure(String shortName, String url, String reason, Instant at) {
+    /**
+     * 一篇拿不到全文的论文。
+     *
+     * @param identity 是哪一篇论文。短名只是标签：同名的另一篇下载成功，不代表这一篇拿到了
+     */
+    public record Failure(String shortName, String url, String reason, Instant at, PaperIdentity identity) {
+
+        /** 论文标题，可能为空。人工补论文时用户要按标题去找，短名本身（如 "LCPD2024"）不够。 */
+        public String title() {
+            return identity.title();
+        }
+
+        /** DOI，可能为空。用户可以直接拿它去出版社或图书馆下载。 */
+        public String doi() {
+            return identity.doi();
+        }
+
+        /** arXiv 编号，可能为空。续跑时靠它认回这一篇，用户也可以直接拿它去 arXiv 下载。 */
+        public String arxivId() {
+            return identity.arxivId();
+        }
+
+        /** 首页读不出身份时（扫描件、改过标题的预印本），按这个名字存进论文库就能认出来。 */
+        public String fileName() {
+            return PaperShelf.distinctName(shortName, identity) + ".pdf";
+        }
+
+        private boolean isFor(String name, PaperIdentity paper) {
+            return identity.isSameRequest(paper, shortName.equals(name));
+        }
     }
 
     /** 一次调研的等待上下文。 */
@@ -40,24 +66,29 @@ public class DownloadFailureRegistry {
         }
     }
 
-    /** Records that one paper could not be obtained. */
+    /** Records that one paper could not be obtained, known only by its name and source. */
     public void record(String threadId, String topic, String shortName, String url, String reason) {
-        String key = key(threadId, topic);
-        Map<String, Failure> map = failures.computeIfAbsent(key, k -> new LinkedHashMap<>());
-        synchronized (map) {
-            map.put(shortName, new Failure(shortName, url,
-                    reason == null ? "" : reason, Instant.now()));
+        record(threadId, topic, shortName, url, reason, PaperIdentity.fromReference(url));
+    }
+
+    /** Records that one paper could not be obtained; a repeated failure replaces the earlier entry. */
+    public void record(String threadId, String topic, String shortName, String url, String reason,
+                       PaperIdentity identity) {
+        List<Failure> list = failures.computeIfAbsent(key(threadId, topic), k -> new ArrayList<>());
+        synchronized (list) {
+            list.removeIf(failure -> failure.isFor(shortName, identity));
+            list.add(new Failure(shortName, url, reason == null ? "" : reason, Instant.now(), identity));
         }
     }
 
-    /** A later success for the same paper cancels its pending failure. */
-    public void resolved(String threadId, String topic, String shortName) {
-        Map<String, Failure> map = failures.get(key(threadId, topic));
-        if (map == null) {
+    /** A later success for the same paper cancels its pending failure — whatever name it got. */
+    public void resolved(String threadId, String topic, String shortName, PaperIdentity identity) {
+        List<Failure> list = failures.get(key(threadId, topic));
+        if (list == null) {
             return;
         }
-        synchronized (map) {
-            map.remove(shortName);
+        synchronized (list) {
+            list.removeIf(failure -> failure.isFor(shortName, identity));
         }
     }
 
@@ -69,25 +100,23 @@ public class DownloadFailureRegistry {
      * failed to get.</p>
      */
     public Snapshot drain(String threadId, String topic) {
-        Map<String, Failure> map = failures.remove(key(threadId, topic));
-        if (map == null) {
+        List<Failure> list = failures.remove(key(threadId, topic));
+        if (list == null) {
             return new Snapshot(topic, List.of());
         }
-        List<Failure> items;
-        synchronized (map) {
-            items = new ArrayList<>(map.values());
+        synchronized (list) {
+            return new Snapshot(topic, new ArrayList<>(list));
         }
-        return new Snapshot(topic, items);
     }
 
     /** Peeks without clearing, for reporting. */
     public Snapshot peek(String threadId, String topic) {
-        Map<String, Failure> map = failures.get(key(threadId, topic));
-        if (map == null) {
+        List<Failure> list = failures.get(key(threadId, topic));
+        if (list == null) {
             return new Snapshot(topic, List.of());
         }
-        synchronized (map) {
-            return new Snapshot(topic, new ArrayList<>(map.values()));
+        synchronized (list) {
+            return new Snapshot(topic, new ArrayList<>(list));
         }
     }
 
@@ -100,9 +129,9 @@ public class DownloadFailureRegistry {
     @org.springframework.scheduling.annotation.Scheduled(fixedDelay = 60 * 60 * 1000L)
     public void sweep() {
         Instant cutoff = Instant.now().minus(TTL);
-        failures.values().forEach(map -> {
-            synchronized (map) {
-                map.values().removeIf(failure -> failure.at().isBefore(cutoff));
+        failures.values().forEach(list -> {
+            synchronized (list) {
+                list.removeIf(failure -> failure.at().isBefore(cutoff));
             }
         });
         failures.entrySet().removeIf(e -> e.getValue().isEmpty());

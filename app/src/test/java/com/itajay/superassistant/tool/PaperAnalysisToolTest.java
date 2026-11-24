@@ -366,7 +366,11 @@ class PaperAnalysisToolTest {
         }
         assertThat(batch.get(5, TimeUnit.SECONDS)).startsWith(PaperAnalysisTool.FINAL_INDEX_MARKER);
         assertThat(maximum.get()).isEqualTo(4);
-        assertThat(started.get()).isEqualTo(6);
+        // Every paper fails in this seam (the analyst writes nothing), so each one is
+        // attempted twice: the batch pass plus the automatic retry. The retry runs
+        // serially, which is why the peak above is still the configured lane count
+        // rather than 8.
+        assertThat(started.get()).isEqualTo(12);
     }
 
     @Test
@@ -654,7 +658,18 @@ class PaperAnalysisToolTest {
         ToolCallback analyze = callback("analyzePapers");
 
         assertThat(analyze.call(toolInput(null, null), context)).contains("✗ Silent");
-        assertBriefs("首次精读", REQUIREMENTS, "Silent");
+        // The batch re-asks a failed paper once before reporting it, so the same paper
+        // appears twice: the first pass and the automatic retry. Both must carry the
+        // user's requirements — a retry that dropped them would silently re-read the
+        // paper against the wrong brief.
+        assertThat(analystInputs).hasSize(2);
+        assertThat(analystInputs).allSatisfy(input -> {
+            assertThat(valueAfter(input, "课题方向：")).isEqualTo(TOPIC);
+            assertThat(input).contains("用户精读要求：\n" + REQUIREMENTS + "\n");
+            assertThat(valueAfter(input, "论文短名：")).isEqualTo("Silent");
+        });
+        assertThat(analystInputs).anySatisfy(input ->
+                assertThat(valueAfter(input, "本次任务说明：")).isEqualTo("首次精读（失败重试）"));
         analystInputs.clear();
         silentPapers.remove("Silent");
 

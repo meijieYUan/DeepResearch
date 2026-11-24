@@ -61,6 +61,15 @@ public class PaperDeepReadWorkflow {
     private static final int MAX_ROUNDS = 2;
     private static final int MAX_CONTENT_REDOS = MAX_ROUNDS - 1;
 
+    /**
+     * A reviewer that answers with nothing gets this many attempts in total.
+     *
+     * <p>Same reasoning as the research workflow's blank guard: an empty answer must not be
+     * read as "no problems found". Here the wrong reading is especially damaging — the
+     * analysis would be reported as reviewed when nothing was checked.</p>
+     */
+    private static final int MAX_BLANK_ATTEMPTS = 2;
+
     private final PaperDownloadTool paperDownloadTool;
     private final PaperAnalysisTool paperAnalysisTool;
     private final WorkflowAgentRun reviewerAgent;
@@ -72,7 +81,7 @@ public class PaperDeepReadWorkflow {
                                  ReviewerAgent reviewerAgent,
                                  ProgressChannelRegistry progress) {
         this(paperDownloadTool, paperAnalysisTool,
-                (input, config) -> invoke(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
+                (input, config) -> invokeWithRetry(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
                 progress);
     }
 
@@ -184,6 +193,8 @@ public class PaperDeepReadWorkflow {
                 publish(activity, Operation.STAGE, Status.FAILED, "精读未产出分析文件");
                 publish(run.at(ProgressStage.FAILED, 1), Operation.WORKFLOW, Status.FAILED,
                         "精读未产出分析文件", "精读失败");
+                ReviewReport.ended(topicId, "deepReadPaper · " + paperShortName,
+                        "精读未产出可用分析文件，审查未执行。");
                 return report(acquired, null, rounds, redoCount,
                         analysisIndex + "\n（精读未产出可用分析文件，审查未执行。）");
             }
@@ -208,6 +219,13 @@ public class PaperDeepReadWorkflow {
                         : review.approved() ? Status.PASS : Status.REVISE;
                 publishReview(reviewContext, verdict, "审查结果：" + verdict, reviewAttempt.get());
                 publish(reviewContext, Operation.STAGE, verdict, "质量审查结束：" + verdict);
+                ReviewReport.round(topicId, "deepReadPaper · " + paperShortName, rounds,
+                        reviewAttempt.get(), review,
+                        review == null || review.executionFailed() ? "审查输出不可用，按未通过停止"
+                                : review.approved() ? "通过，精读交付"
+                                : revisionPlan(review) == RevisionAction.REANALYZE
+                                        && rounds < MAX_ROUNDS && redoCount < MAX_CONTENT_REDOS
+                                        ? "按审查意见重做精读后复审" : "不再重做，保留遗留问题");
                 if (review == null || review.executionFailed()) {
                     break;
                 }
@@ -244,6 +262,10 @@ public class PaperDeepReadWorkflow {
                     approved ? "精读通过审查" : reviewFailed
                             ? "审查未完成，精读质量未经验证" : "精读未通过审查，已输出遗留问题",
                     approved ? "精读完成" : "精读失败");
+            ReviewReport.ended(topicId, "deepReadPaper · " + paperShortName,
+                    approved ? "精读通过审查，已交付（共 " + rounds + " 轮审查、" + redoCount + " 次重做）"
+                            : reviewFailed ? "审查未完成，精读质量未经验证（共 " + rounds + " 轮审查）"
+                            : "精读未通过审查，遗留问题见上文（共 " + rounds + " 轮审查、" + redoCount + " 次重做）");
             log.info("PaperDeepRead workflow finished [paper={}, rounds={}, redos={}, approved={}]",
                     paperShortName, rounds, redoCount, approved);
             return report(acquired, review, rounds, redoCount, failureNote);
@@ -259,6 +281,8 @@ public class PaperDeepReadWorkflow {
             publish(activity, Operation.STAGE, Status.FAILED, "阶段异常终止");
             publish(run.at(ProgressStage.FAILED, rounds), Operation.WORKFLOW, Status.FAILED,
                     "工作流异常终止", "精读失败");
+            ReviewReport.ended(topicId, "deepReadPaper · " + paperShortName,
+                    "工作流异常终止：" + e.getMessage());
             return "Paper deep-read workflow failed: " + e.getMessage()
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)\n"
                     + report(acquired, review, rounds, redoCount, "工作流异常终止：" + e.getMessage());
@@ -508,6 +532,29 @@ public class PaperDeepReadWorkflow {
         String output = result.map(PaperDeepReadWorkflow::lastAnswer).orElse("");
         if (output.isBlank()) {
             log.warn("{} returned no output", name);
+        }
+        return output;
+    }
+
+    /**
+     * Runs the reviewer and refuses to treat silence as approval.
+     *
+     * <p>{@link ReviewResult#parse} already turns unusable output into an execution
+     * failure, but it can only do that once there is text to parse. Retrying here —
+     * before parsing — covers the transport-shaped case where every attempt comes back
+     * empty, and turns it into a failure that says so rather than a review that never
+     * happened.</p>
+     */
+    private static String invokeWithRetry(ReactAgent agent, String input, RunnableConfig config,
+                                          String name) {
+        String output = invoke(agent, input, config, name);
+        for (int attempt = 2; attempt <= MAX_BLANK_ATTEMPTS && output.isBlank(); attempt++) {
+            log.warn("{} returned no output; retrying ({}/{})", name, attempt, MAX_BLANK_ATTEMPTS);
+            output = invoke(agent, input, config, name);
+        }
+        if (output.isBlank()) {
+            throw new IllegalStateException(name + " 连续 " + MAX_BLANK_ATTEMPTS
+                    + " 次没有返回任何内容，无法完成审查。分析文件已落盘，可直接重跑本工作流。");
         }
         return output;
     }

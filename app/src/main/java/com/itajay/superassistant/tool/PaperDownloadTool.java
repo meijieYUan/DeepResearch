@@ -7,13 +7,12 @@ import com.itajay.superassistant.progress.ProgressChannelRegistry;
 import com.itajay.superassistant.progress.ProgressEvent;
 import com.itajay.superassistant.progress.ProgressStage;
 import com.itajay.superassistant.workspace.WorkspacePaths;
-import org.apache.pdfbox.Loader;
-import org.apache.pdfbox.pdmodel.PDDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -23,7 +22,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -81,7 +79,15 @@ public class PaperDownloadTool {
     private final PaperLibrary library;
     private final DownloadFailureRegistry downloadFailures;
     private final HttpClient httpClient;
+    /** Legal open-access copies by DOI. See {@link UnpaywallResolver}. */
+    private final UnpaywallResolver unpaywall;
+    /** Title → DOI, so a paper cited only by name still reaches Unpaywall. */
+    private final CrossrefTitleResolver crossref;
 
+    // Two constructors exist (the package-private one is a test seam), so Spring must be
+    // told which one to use — implicit single-constructor autowiring only applies when
+    // there is exactly one.
+    @Autowired
     public PaperDownloadTool(PaperDownloadProperties props,
                              ProgressChannelRegistry progress,
                              PaperLibrary library,
@@ -94,6 +100,28 @@ public class PaperDownloadTool {
                 .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
+        OpenAccessHttp http = OpenAccessHttp.over(httpClient, props.getUserAgent());
+        this.unpaywall = new UnpaywallResolver(props.getUnpaywallEmail(), props.getUnpaywallTimeoutMs(), http);
+        this.crossref = new CrossrefTitleResolver(props.getUnpaywallEmail(), props.getUnpaywallTimeoutMs(), http);
+    }
+
+    /** Test seam: the same tool with stubbed open-access resolvers. */
+    PaperDownloadTool(PaperDownloadProperties props,
+                      ProgressChannelRegistry progress,
+                      PaperLibrary library,
+                      DownloadFailureRegistry downloadFailures,
+                      UnpaywallResolver unpaywall,
+                      CrossrefTitleResolver crossref) {
+        this.props = props;
+        this.progress = progress;
+        this.library = library;
+        this.downloadFailures = downloadFailures;
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+        this.unpaywall = unpaywall;
+        this.crossref = crossref;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -101,20 +129,103 @@ public class PaperDownloadTool {
     // ──────────────────────────────────────────────────────────────────────
 
     @Tool(description = """
-            Download a paper PDF so it can be read later.
-            Saves to investigation/{课题方向}/papers/ inside the project root.
-            Accepts a direct PDF link, an arXiv abstract page, a DOI URL, or a publisher landing page —
-            if the URL is not already a PDF, the tool locates the actual PDF link on the page.
-            Retries transient network failures, verifies the file really is a PDF, and skips
-            re-downloading a paper that is already saved. Returns the saved path, page count and SHA-256.
+            Download a paper PDF so it can be read later. Saves to investigation/{课题方向}/papers/.
+            Pass what you know about the paper; the tool plans the sources itself, in this order:
+              1. the shared local paper library (no network);
+              2. Unpaywall — legal open-access copies found by DOI (arXiv, PubMed Central, institutional
+                 repositories). When you have no DOI but give the title, the DOI is looked up on Crossref first;
+              3. arXiv, when an arXiv ID is known;
+              4. the url you gave (direct PDF, landing page — the PDF link is located on the page).
+            So: ALWAYS pass title; pass doi for every published paper (venue/journal version) and arxivId for
+            every arXiv paper — give both when the paper has both. url is optional when doi or arxivId is given.
+            Retries transient network failures, verifies the file really is a PDF and really is the paper you
+            asked for, skips a paper already saved, and reports every source it tried. Returns the saved path,
+            page count, SHA-256 and the source used. shortName is only a label: when it is already taken by a
+            different paper, or this paper is already saved under another name, the reply carries the name to
+            use in a "shortName:" line — use that name for this paper from then on.
             Only call this for papers that already passed relevance screening.""")
     public String downloadPaper(
             @ToolParam(description = "课题方向, the research topic. Becomes the topic folder name — keep it identical across the whole investigation so the same topic reuses one folder.") String topic,
-            @ToolParam(description = "URL of the PDF, arXiv abs page, DOI, or publisher landing page") String url,
-            @ToolParam(description = "Short name used as the filename, e.g. 'MS-Diffusion'. Letters, digits, dash, underscore, dot only.") String shortName,
+            @ToolParam(required = false, description = "Any URL for the paper: direct PDF, arXiv abs page, DOI link, or publisher landing page. Optional when doi or arxivId is given.") String url,
+            @ToolParam(description = "Short name used as the filename, e.g. 'MS-Diffusion'. Letters, digits, dash, underscore, dot only. A label, not an identity: the paper is identified by title, doi and arxivId.") String shortName,
+            @ToolParam(required = false, description = "The paper's DOI, e.g. 10.1109/TPAMI.2016.2577031 (with or without https://doi.org/). The key that unlocks the Unpaywall open-access lookup — pass it for every published paper.") String doi,
+            @ToolParam(required = false, description = "arXiv identifier, e.g. 2304.03373 (with or without version suffix).") String arxivId,
+            @ToolParam(required = false, description = "The paper's exact full title. Used to find the DOI on Crossref when doi is not given, and to tell the user which paper is missing if every source fails.") String title,
+            @ToolParam(required = false, description = "Publication year, e.g. 2024. Narrows the Crossref title search; pass it whenever the title is passed without a doi.") Integer year,
             ToolContext toolContext) {
 
-        return downloadPaperInternal(topic, url, shortName, threadIdOf(toolContext));
+        return downloadPaperInternal(topic, PaperRef.of(url, doi, arxivId, title, year), shortName,
+                threadIdOf(toolContext));
+    }
+
+    /** Java callers with only a reference string (deep-read workflow, tests). */
+    public String downloadPaperInternal(String topic, String url, String shortName, String threadId) {
+        return downloadPaperInternal(topic, PaperRef.of(url, null, null, null), shortName, threadId);
+    }
+
+    /** Java convenience form of the tool call with only a URL, as it was before identifiers. */
+    String downloadPaper(String topic, String url, String shortName, ToolContext toolContext) {
+        return downloadPaper(topic, url, shortName, null, null, null, null, toolContext);
+    }
+
+    /**
+     * What the caller knows about one paper. Each field is optional on its own; at least one
+     * of {@code url}, {@code doi}, {@code arxivId} must be present for a network attempt.
+     *
+     * <p>Identifiers given separately win over ones extracted from the URL, but a URL that
+     * carries a DOI or arXiv ID still fills in the gap — a model that pastes
+     * {@code https://doi.org/10.x/y} as the url must not lose the open-access lookup just
+     * because it left the {@code doi} argument empty.</p>
+     */
+    record PaperRef(String url, String doi, String arxivId, String title, Integer year) {
+
+        static PaperRef of(String url, String doi, String arxivId, String title) {
+            return of(url, doi, arxivId, title, null);
+        }
+
+        static PaperRef of(String url, String doi, String arxivId, String title, Integer year) {
+            String normalizedUrl = url == null || url.isBlank() ? null : normalizeUrl(url.trim());
+            String cleanDoi = UnpaywallResolver.extractDoi(doi);
+            if (cleanDoi == null && normalizedUrl != null) {
+                cleanDoi = UnpaywallResolver.extractDoi(normalizedUrl);
+            }
+            String cleanArxiv = arxivIdOf(arxivId);
+            if (cleanArxiv == null && normalizedUrl != null) {
+                cleanArxiv = arxivIdOf(normalizedUrl);
+            }
+            // An arXiv DOI (10.48550/arXiv.NNNN) is an arXiv ID in disguise.
+            if (cleanArxiv == null && cleanDoi != null && UnpaywallResolver.isArxivDoi(cleanDoi)) {
+                cleanArxiv = arxivIdOf(cleanDoi.substring(cleanDoi.indexOf('/') + 1));
+            }
+            String cleanTitle = title == null || title.isBlank() ? null : title.strip();
+            Integer cleanYear = year == null || year < 1900 || year > 2200 ? null : year;
+            return new PaperRef(normalizedUrl, cleanDoi, cleanArxiv, cleanTitle, cleanYear);
+        }
+
+        boolean isEmpty() {
+            return url == null && doi == null && arxivId == null;
+        }
+
+        /** The most identifying reference, recorded with a failure and in the library index. */
+        String reference() {
+            if (url != null) {
+                return url;
+            }
+            if (doi != null) {
+                return "https://doi.org/" + doi;
+            }
+            return arxivId == null ? "" : "https://arxiv.org/abs/" + arxivId;
+        }
+
+        /** Which paper this is — everything the caller knows about it except the short name. */
+        PaperIdentity identity() {
+            return new PaperIdentity(arxivId, doi, title, url);
+        }
+    }
+
+    /** A bare or embedded arXiv identifier, version suffix dropped; null when there is none. */
+    static String arxivIdOf(String value) {
+        return PaperIdentity.arxivIdIn(value);
     }
 
     /**
@@ -123,69 +234,92 @@ public class PaperDownloadTool {
      * <p>Split out so workflows — which hold a thread id but are not inside a tool
      * call — can download with the same progress events. The {@code @Tool} form above
      * is a thin adapter over this.</p>
+     *
+     * <p>Order of attempts, cheapest and most reliable first:</p>
+     * <ol>
+     *   <li>the file already in this topic, then the shared library (no network);</li>
+     *   <li>Unpaywall's open-access copies for the DOI — resolving the DOI from the title on
+     *       Crossref when only a title is known;</li>
+     *   <li>arXiv, when an arXiv ID is known;</li>
+     *   <li>the caller's URL, following a landing page to its PDF link.</li>
+     * </ol>
+     * <p>Unpaywall is first among network sources because it is the one that is both legal
+     * and plain: its locations are repository PDFs (arXiv, PMC, institutional), not
+     * publisher pages behind bot protection. arXiv stays right after it — for an arXiv
+     * paper with no venue version it is the only source, and nothing is lost when Unpaywall
+     * already returned the same arXiv URL (the plan is deduplicated).</p>
      */
-    public String downloadPaperInternal(String topic, String url, String shortName, String threadId) {
-        if (url == null || url.isBlank()) {
-            return "Error: url is required.";
+    String downloadPaperInternal(String topic, PaperRef ref, String shortName, String threadId) {
+        return download(topic, ref, shortName, threadId).message();
+    }
+
+    /** @param pdf where the paper is now, or null when it could not be obtained */
+    private record DownloadResult(Path pdf, String message) {
+    }
+
+    private DownloadResult download(String topic, PaperRef ref, String shortName, String threadId) {
+        if (ref == null || (ref.isEmpty() && ref.title() == null)) {
+            return new DownloadResult(null,
+                    "Error: give at least one of url, doi, arxivId (or a title to look the DOI up).");
         }
         if (shortName == null || shortName.isBlank()) {
-            return "Error: shortName is required (used as the PDF filename).";
+            return new DownloadResult(null, "Error: shortName is required (used as the PDF filename).");
         }
 
         String safeName;
-        Path papersRoot;
+        PaperShelf shelf;
         try {
             safeName = WorkspacePaths.slugify(shortName, "论文短名");
-            papersRoot = WorkspacePaths.papersDir(topic);
+            shelf = PaperStore.shelf(topic, library);
         } catch (IllegalArgumentException e) {
-            return "Error: " + e.getMessage();
+            return new DownloadResult(null, "Error: " + e.getMessage());
         }
+        PaperIdentity wanted = ref.identity();
 
-        Path target = papersRoot.resolve(safeName + ".pdf").normalize();
-        if (!target.startsWith(papersRoot)) {
-            return "Error: resolved path escapes the papers directory: " + target;
-        }
-
-        // Already downloaded? Dedup is keyed on the resolved file name, so re-running
-        // the same paper under the same short name is a no-op. A different shortName
-        // for the same paper will fetch it again.
-        String normalizedUrl = normalizeUrl(url.trim());
-        if (Files.isRegularFile(target)) {
-            Integer pages = PaperStore.pageCount(target);
-            if (pages != null) {
-                publishDownload(threadId, "论文已存在，跳过下载：" + shortName);
-                return ok(target, pages, PaperStore.sha256(target), "already downloaded — skipped")
-                        + "\n(If this is a different paper, choose a different shortName.)";
-            }
+        // Already in this topic? Decided by which paper it is, not by the file name: the same
+        // paper under another name is reused, another paper under this name is not.
+        Optional<Path> inTopic = shelf.find(safeName, wanted);
+        if (inTopic.isPresent()) {
+            return reused(inTopic.get(), safeName, ref, topic, threadId, "论文已存在，跳过下载",
+                    "already downloaded — skipped");
         }
         publishDownload(threadId, "开始下载论文：" + shortName);
 
         // The shared library comes before the network: a paper any earlier conversation
         // already fetched is copied in, costing nothing. The copy — not a move — keeps
-        // the library intact for the next topic.
+        // the library intact for the next topic. A PDF a human dropped in under any file
+        // name is found by what it says it is.
         Optional<Path> fromLibrary = library == null ? Optional.empty()
-                : library.importInto(safeName, topic, normalizedUrl);
+                : library.importInto(safeName, topic, wanted);
         if (fromLibrary.isPresent()) {
-            Path copied = fromLibrary.get();
-            Integer pages = PaperStore.pageCount(copied);
-            if (pages != null) {
-                publishDownload(threadId, "本地论文库命中，已复制：" + shortName);
-                return ok(copied, pages, PaperStore.sha256(copied), "copied from local paper library");
-            }
+            return reused(fromLibrary.get(), safeName, ref, topic, threadId, "本地论文库命中，已复制",
+                    "copied from local paper library");
         }
 
-        List<String> candidates = buildCandidates(normalizedUrl);
         List<String> failures = new ArrayList<>();
+        SourcePlan plan = planSources(ref, failures);
+        if (plan.isEmpty()) {
+            failures.add("no source to try: no url or arXiv ID, and no DOI could be found"
+                    + (ref.title() == null ? "" : " for the title"));
+        }
+        // A DOI found by title is part of what we now know about this paper.
+        PaperIdentity identity = wanted.or(new PaperIdentity(null, plan.resolvedDoi(), null, null));
         String lastHtml = null;
         String lastHtmlUrl = null;
+        boolean otherPaper = false;
 
-        for (String candidate : candidates) {
-            FetchOutcome outcome = fetch(candidate, failures);
+        for (Source source : plan.sources()) {
+            FetchOutcome outcome = fetch(source.url(), failures);
             if (outcome == null) {
                 continue;
             }
             if (outcome.bytes() != null) {
-                return finish(outcome, target, failures, threadId, topic, shortName, normalizedUrl);
+                Landing landing = land(outcome, shelf, safeName, identity, failures, threadId, topic, ref, source);
+                if (landing.result() != null) {
+                    return landing.result();
+                }
+                otherPaper |= landing.otherPaper();
+                continue;
             }
             if (outcome.html() != null) {
                 lastHtml = outcome.html();
@@ -200,7 +334,12 @@ public class PaperDownloadTool {
             for (String link : discovered) {
                 FetchOutcome outcome = fetch(link, failures);
                 if (outcome != null && outcome.bytes() != null) {
-                    return finish(outcome, target, failures, threadId, topic, shortName, normalizedUrl);
+                    Landing landing = land(outcome, shelf, safeName, identity, failures, threadId, topic, ref,
+                            new Source(link, LABEL_PAGE_LINK));
+                    if (landing.result() != null) {
+                        return landing.result();
+                    }
+                    otherPaper |= landing.otherPaper();
                 }
             }
             if (!discovered.isEmpty()) {
@@ -210,37 +349,115 @@ public class PaperDownloadTool {
             }
         }
 
-        publishDownload(threadId, "下载失败：" + shortName + "（将尝试其他来源或降级为仅摘要）");
-        recordFailure(threadId, topic, shortName, normalizedUrl, failures);
-        return "DOWNLOAD_FAILED: " + normalizedUrl + "\n"
+        publishDownload(threadId, "下载失败：" + shortName + "（已尝试 " + plan.sources().size()
+                + " 个来源，将等待人工补充或降级为仅摘要）");
+        recordFailure(threadId, topic, shortName, ref, identity, failures);
+        return new DownloadResult(null, "DOWNLOAD_FAILED: " + shortName + "\n"
+                + "Identifiers: " + describe(ref, plan) + "\n"
+                + "Sources tried, in order:\n" + plan.describe() + "\n"
                 + "Attempts:\n" + formatFailures(failures) + "\n"
-                + "Next: try an alternative source (arXiv mirror, OpenReview, author homepage), "
-                + "or fall back to the abstract page and mark this paper SOURCE_LEVEL=ABSTRACT_ONLY.";
+                + (otherPaper
+                    ? "Next: a source returned a different paper, so the title and the identifiers do not belong "
+                        + "together. Open this paper's abstract page, copy the exact title and the DOI / arXiv ID "
+                        + "from it, and call downloadPaper once more."
+                    : nextStep(ref, plan)));
+    }
+
+    /** Reports a paper that needed no download, and settles any failure recorded for it earlier. */
+    private DownloadResult reused(Path pdf, String requested, PaperRef ref, String topic, String threadId,
+                                  String event, String action) {
+        if (downloadFailures != null) {
+            downloadFailures.resolved(threadId, topic, requested, ref.identity());
+        }
+        publishDownload(threadId, event + "：" + PaperStore.shortNameOf(pdf));
+        return new DownloadResult(pdf, ok(pdf, PaperStore.pageCount(pdf), PaperStore.sha256(pdf), action)
+                + nameNote(pdf, requested));
+    }
+
+    /**
+     * Says which name the paper is under when it is not the one that was asked for. Every
+     * later step finds the paper by that name, so the agent has to carry it.
+     */
+    private static String nameNote(Path pdf, String requested) {
+        String actual = PaperStore.shortNameOf(pdf);
+        return actual.equals(requested) ? "" : "\nshortName: " + actual
+                + "\nNOTE: this paper is saved as \"" + actual + "\", not \"" + requested
+                + "\" — it was already here under that name, or \"" + requested
+                + "\" belongs to a different paper. Use \"" + actual + "\" as its short name from now on.";
+    }
+
+    /**
+     * What the agent should do now — specific to what was missing, because the generic
+     * "try another source" sent the model looking for mirrors when the real gap was that
+     * it never passed a DOI.
+     */
+    private String nextStep(PaperRef ref, SourcePlan plan) {
+        if (!unpaywallEnabled()) {
+            return "Next: open-access lookup is disabled (agent.paper.unpaywall-email is not set). "
+                    + "Try the arXiv version or the author's homepage; if none works, mark this paper "
+                    + "SOURCE_LEVEL=ABSTRACT_ONLY — the workflow will ask the user to supply the PDF.";
+        }
+        if (ref.doi() == null && plan.resolvedDoi() == null) {
+            return "Next: no DOI was available, so the open-access lookup could not run. "
+                    + "Find the paper's DOI on its abstract page (arXiv shows it under \"DOI\" / journal-ref, "
+                    + "publishers in the citation block) and call downloadPaper again with doi=…; "
+                    + "otherwise mark it SOURCE_LEVEL=ABSTRACT_ONLY.";
+        }
+        if (ref.arxivId() == null) {
+            return "Next: Unpaywall has no open copy of this DOI. If the paper has an arXiv version, call "
+                    + "downloadPaper again with arxivId=…; otherwise mark it SOURCE_LEVEL=ABSTRACT_ONLY — "
+                    + "the workflow will ask the user to supply the PDF. Do not retry the same identifiers.";
+        }
+        return "Next: every known source failed. Do not retry the same identifiers. Mark this paper "
+                + "SOURCE_LEVEL=ABSTRACT_ONLY; the workflow will ask the user to supply the PDF.";
+    }
+
+    /** One identifier line for the failure report: what the plan was built from. */
+    private static String describe(PaperRef ref, SourcePlan plan) {
+        List<String> parts = new ArrayList<>();
+        if (ref.doi() != null) {
+            parts.add("doi=" + ref.doi());
+        } else if (plan.resolvedDoi() != null) {
+            parts.add("doi=" + plan.resolvedDoi() + " (found by title on Crossref)");
+        }
+        if (ref.arxivId() != null) {
+            parts.add("arxivId=" + ref.arxivId());
+        }
+        if (ref.url() != null) {
+            parts.add("url=" + ref.url());
+        }
+        if (ref.title() != null) {
+            parts.add("title=\"" + ref.title() + "\"" + (ref.year() == null ? "" : " (" + ref.year() + ")"));
+        }
+        return parts.isEmpty() ? "(none)" : String.join(", ", parts);
     }
 
     /**
      * Remembers that this paper is still missing, so the workflow can offer a manual
      * download instead of silently degrading the document. Best-effort: a run without a
      * thread id (direct invocation in tests) simply has nothing to report to.
+     *
+     * <p>The whole identity travels with the failure: the title is what the user searches
+     * for when asked to supply the PDF by hand, and the identifiers are what recognise the
+     * file they bring.</p>
      */
-    private void recordFailure(String threadId, String topic, String shortName, String url,
-                               List<String> failures) {
+    private void recordFailure(String threadId, String topic, String shortName, PaperRef ref,
+                               PaperIdentity identity, List<String> failures) {
         if (downloadFailures == null || threadId == null || topic == null) {
             return;
         }
         // The first line is the most specific reason; the full list goes to the tool reply.
         String reason = failures.isEmpty() ? "unknown" : failures.get(0);
-        downloadFailures.record(threadId, topic, shortName, url, reason);
+        downloadFailures.record(threadId, topic, shortName, ref.reference(), reason, identity);
     }
 
     /**
      * Lists what a topic already has.
      *
-     * <p>Kept here as well as on {@link PaperTextTool} because the downloader needs it
-     * to avoid re-fetching: dedup is keyed on the file name, so the agent has to see
-     * the existing names before choosing one.</p>
+     * <p>Kept here as well as on {@link PaperTextTool} because the agent has to see what is
+     * there, and under which name, before asking for a paper.</p>
      */
-    @Tool(description = "List papers already downloaded for a topic, with size and page count. Call this before downloading to avoid fetching a paper twice.")
+    @Tool(description = "List papers already downloaded for a topic, with size, page count and what each file says it is. Call this before downloading to avoid fetching a paper twice. Judge by identifier and title, not by name: different papers can carry similar names.")
     public String listDownloadedPapers(
             @ToolParam(description = "课题方向, the research topic whose papers should be listed") String topic) {
         return PaperStore.listPdfs(topic);
@@ -254,9 +471,10 @@ public class PaperDownloadTool {
      * name a library copy is stored under.</p>
      */
     @Tool(description = """
-            List the shared local paper library — PDFs every topic and conversation can reuse.
-            downloadPaper checks this library first and copies a hit into the topic without any
-            network access, so check here before hunting for a source.""")
+            List the shared local paper library — PDFs every topic and conversation can reuse, each
+            with what the file says it is. Names are labels from earlier conversations: the same name
+            does not mean the same paper. downloadPaper checks this library first, by identifier and
+            title, and copies a hit into the topic without any network access.""")
     public String listLibraryPapers() {
         return library == null ? "（本地论文库未启用）" : library.describe();
     }
@@ -266,29 +484,91 @@ public class PaperDownloadTool {
     // ──────────────────────────────────────────────────────────────────────
 
     /**
-     * Wraps {@link #saveAndReport} so the SSE channel learns the outcome either way.
-     * Downloads are the only visible heartbeat during the research stage — a search
-     * pass takes minutes, and without these events a frontend user has no way to
-     * tell progress from a hang.
+     * The part of a request that its source stands behind. A DOI the request merely claimed
+     * must not be remembered for a file that came from arXiv by its arXiv id: were the claim
+     * wrong, the next request for that DOI would be answered with this file. Likewise the
+     * title: it is kept when the page bears it out, or when it is how the DOI was found.
      */
-    private String finish(FetchOutcome outcome, Path target, List<String> failures,
-                          String threadId, String topic, String shortName, String reference) {
-        String result = saveAndReport(outcome, target, failures);
-        if (result.startsWith("DOWNLOAD_FAILED")) {
-            publishDownload(threadId, "下载失败：" + shortName + "（该来源不可用，换源或降级为仅摘要）");
-        } else {
+    private static PaperIdentity confirmed(PaperIdentity asked, PaperRef ref, Source source, PdfIdentity printed) {
+        boolean byDoi = asked.doi() != null && (LABEL_UNPAYWALL.equals(source.label())
+                || source.url().toLowerCase(Locale.ROOT).contains(asked.doi()));
+        boolean byArxiv = asked.arxivId() != null && asked.arxivId().equals(arxivIdOf(source.url()));
+        boolean byLink = !byDoi && !byArxiv && (LABEL_GIVEN_URL.equals(source.label())
+                || LABEL_PAGE_LINK.equals(source.label()));
+        boolean titleHolds = (byDoi && ref.doi() == null) || switch (printed.evidenceFor(asked.title())) {
+            case EXACT, PARTIAL -> true;
+            case CONTRADICTS, NONE -> false;
+        };
+        return new PaperIdentity(byArxiv ? asked.arxivId() : null, byDoi ? asked.doi() : null,
+                titleHolds ? asked.title() : null, byLink ? asked.url() : null);
+    }
+
+    /** What became of one fetched PDF: a final reply, or a reason to try the next source. */
+    private record Landing(DownloadResult result, boolean otherPaper) {
+        private static final Landing NEXT = new Landing(null, false);
+        private static final Landing OTHER_PAPER = new Landing(null, true);
+    }
+
+    /**
+     * Saves a fetched PDF into the topic and the library, unless it is unusable or visibly a
+     * different paper — then the reason is noted and the next source gets its turn.
+     *
+     * <p>Checked here as well as on lookup, because a wrong file can arrive over the network
+     * too: a cited arXiv id that belongs to another paper, a landing page whose first PDF
+     * link is the issue's editorial.</p>
+     */
+    private Landing land(FetchOutcome outcome, PaperShelf shelf, String safeName, PaperIdentity identity,
+                         List<String> failures, String threadId, String topic, PaperRef ref, Source source) {
+        Path temp = null;
+        try {
+            temp = Files.createTempFile("paper-download-", ".pdf");
+            Files.write(temp, outcome.bytes());
+            // A file that PDFBox cannot open is not a paper, whatever its first bytes say.
+            Optional<PdfIdentity> printed = PdfIdentityReader.read(temp);
+            if (printed.isEmpty()) {
+                failures.add(outcome.url() + ": downloaded bytes are not a parseable PDF");
+                return Landing.NEXT;
+            }
+            if (PaperMatch.contradicts(identity, printed.get())) {
+                log.warn("Rejected {}: asked for {}, the file is {} \"{}\"", outcome.url(), identity,
+                        printed.get().arxivId(), printed.get().heading());
+                failures.add(outcome.url() + ": this is a different paper — its first page says "
+                        + (printed.get().arxivId() == null ? "" : "arXiv " + printed.get().arxivId() + ", ")
+                        + "\"" + printed.get().heading() + "\"");
+                return Landing.OTHER_PAPER;
+            }
+
+            PaperIdentity fetchedBy = confirmed(identity, ref, source, printed.get());
+            Path saved = shelf.add(temp, safeName, fetchedBy);
             // Everything downloaded is shared forward: the library is what keeps the next
-            // topic from paying for this fetch again. Silent failure — the topic copy is
-            // what this run needs, the library only helps future ones.
+            // topic from paying for this fetch again. A failure there is silent — the topic
+            // copy is what this run needs. The fetched bytes are stored even when the topic
+            // already held the paper: that is how their identifiers become known.
             if (library != null) {
-                library.store(outcome.bytes(), shortName, reference);
+                library.store(temp, PaperStore.shortNameOf(saved), fetchedBy);
             }
             if (downloadFailures != null) {
-                downloadFailures.resolved(threadId, topic, shortName);
+                downloadFailures.resolved(threadId, topic, safeName, identity);
             }
-            publishDownload(threadId, "已下载论文：" + shortName);
+            Integer pages = PaperStore.pageCount(saved);
+            log.info("Downloaded paper: {} ({} pages, {} bytes)", saved.getFileName(), pages, outcome.bytes().length);
+            publishDownload(threadId, "已下载论文：" + PaperStore.shortNameOf(saved) + "（来源：" + source.label() + "）");
+            return new Landing(new DownloadResult(saved, ok(saved, pages, PaperStore.sha256(saved), "downloaded")
+                    + "\nsource: " + source.label() + " — " + outcome.url()
+                    + nameNote(saved, safeName)), false);
+        } catch (IOException | IllegalArgumentException e) {
+            log.error("Failed to save paper {}", safeName, e);
+            failures.add(outcome.url() + ": could not save file — " + e.getMessage());
+            return Landing.NEXT;
+        } finally {
+            if (temp != null) {
+                try {
+                    Files.deleteIfExists(temp);
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
         }
-        return result;
     }
 
     /** The conversation thread for SSE, or null when the caller carried no config. */
@@ -313,15 +593,17 @@ public class PaperDownloadTool {
     // ──────────────────────────────────────────────────────────────────────
 
     /** A fetch either produced PDF bytes or an HTML page; never both. */
-    private record FetchOutcome(String url, byte[] bytes, String html, Integer status) {
+    record FetchOutcome(String url, byte[] bytes, String html, Integer status) {
     }
 
     /**
      * Fetches one URL with retries. Returns null when the URL is unusable, otherwise
      * an outcome carrying either PDF bytes or the HTML body. Failure reasons are
      * appended to {@code failures} so the caller can report every attempt.
+     *
+     * <p>Package-private so tests can replace the network while everything else stays real.</p>
      */
-    private FetchOutcome fetch(String url, List<String> failures) {
+    FetchOutcome fetch(String url, List<String> failures) {
         String current = url;
         // Follow HTML redirect chains (publisher → CDN → file) a bounded number of times.
         for (int hop = 0; hop < 4; hop++) {
@@ -366,6 +648,7 @@ public class PaperDownloadTool {
         String lastError = null;
 
         for (int attempt = 1; attempt <= attempts; attempt++) {
+            log.info("Fetching {} (attempt {}/{})", url, attempt, attempts);
             try {
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(uri)
@@ -376,8 +659,11 @@ public class PaperDownloadTool {
                         .GET()
                         .build();
 
-                HttpResponse<byte[]> response = httpClient.send(
-                        request, HttpResponse.BodyHandlers.ofByteArray());
+                // The request's own timeout has been seen not to fire on a stalled response
+                // (a PDF host held a run for over half an hour); the outer deadline does.
+                HttpResponse<byte[]> response = HttpSend.send(httpClient, request,
+                        HttpResponse.BodyHandlers.ofByteArray(),
+                        Duration.ofMillis(props.getRequestTimeoutMs()));
                 int status = response.statusCode();
                 byte[] body = response.body();
 
@@ -415,6 +701,10 @@ public class PaperDownloadTool {
 
             } catch (java.net.http.HttpTimeoutException e) {
                 lastError = "timed out after " + props.getRequestTimeoutMs() + " ms";
+            } catch (java.util.concurrent.TimeoutException e) {
+                lastError = "no complete response within " + props.getRequestTimeoutMs() + " ms";
+                log.info("Fetch gave up on {} after {} ms (attempt {}/{})", url,
+                        props.getRequestTimeoutMs(), attempt, attempts);
             } catch (IOException e) {
                 lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             } catch (InterruptedException e) {
@@ -478,95 +768,125 @@ public class PaperDownloadTool {
     }
 
     /** Writes the downloaded bytes to a temp file, validates it, then moves it into place. */
-    private String saveAndReport(FetchOutcome outcome, Path target, List<String> failures) {
-        // The temp file must share a filesystem with the target for the move to be atomic.
-        Path papersRoot = target.getParent();
-        Path temp = null;
-        try {
-            Files.createDirectories(papersRoot);
-            temp = Files.createTempFile(papersRoot, ".download-", ".part");
-            Files.write(temp, outcome.bytes());
+    // ──────────────────────────────────────────────────────────────────────
+    // Source plan
+    // ──────────────────────────────────────────────────────────────────────
 
-            // Parse before publishing: a file that PDFBox cannot open is not a paper,
-            // and leaving it under the final name would poison later reads.
-            Integer pages;
-            try (PDDocument doc = Loader.loadPDF(temp.toFile())) {
-                pages = doc.getNumberOfPages();
-            } catch (IOException e) {
-                Files.deleteIfExists(temp);
-                failures.add(outcome.url() + ": downloaded bytes are not a parseable PDF (" + e.getMessage() + ")");
-                return "DOWNLOAD_FAILED: " + outcome.url() + "\n"
-                        + "Attempts:\n" + formatFailures(failures) + "\n"
-                        + "The response looked like a PDF but could not be parsed. "
-                        + "Try an alternative source, or mark this paper SOURCE_LEVEL=ABSTRACT_ONLY.";
+    /** One URL to try, labelled with where it came from — the label is what the user sees. */
+    record Source(String url, String label) {
+    }
+
+    /**
+     * The ordered sources for one paper, plus the DOI found on Crossref when the caller
+     * gave none (reported back so the agent can cite it).
+     */
+    record SourcePlan(List<Source> sources, String resolvedDoi) {
+
+        boolean isEmpty() {
+            return sources.isEmpty();
+        }
+
+        String describe() {
+            if (sources.isEmpty()) {
+                return "  (none)";
             }
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < sources.size(); i++) {
+                Source source = sources.get(i);
+                sb.append("  ").append(i + 1).append(". [").append(source.label()).append("] ")
+                        .append(source.url()).append('\n');
+            }
+            return sb.toString().stripTrailing();
+        }
+    }
 
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-            temp = null;
+    static final String LABEL_UNPAYWALL = "Unpaywall 开放获取";
+    static final String LABEL_ARXIV = "arXiv";
+    static final String LABEL_GIVEN_URL = "给定链接";
+    static final String LABEL_MIRROR = "镜像";
+    static final String LABEL_PAGE_LINK = "落地页链接";
 
-            String hash = PaperStore.sha256(target);
-            log.info("Downloaded paper: {} ({} pages, {} bytes)", target.getFileName(), pages, outcome.bytes().length);
-            return ok(target, pages, hash, "downloaded");
+    /** Package-private so the plan can be tested without a network call. */
+    List<String> candidateUrls(String url) {
+        return planSources(PaperRef.of(url, null, null, null), new ArrayList<>()).sources().stream()
+                .map(Source::url).toList();
+    }
 
-        } catch (IOException e) {
-            log.error("Failed to save paper to {}", target, e);
-            failures.add(outcome.url() + ": could not save file — " + e.getMessage());
-            return "DOWNLOAD_FAILED: " + outcome.url() + "\nAttempts:\n" + formatFailures(failures);
-        } finally {
-            if (temp != null) {
-                try {
-                    Files.deleteIfExists(temp);
-                } catch (IOException ignored) {
-                    // best effort
+    /** Package-private test entry with all identifiers. */
+    SourcePlan planFor(PaperRef ref) {
+        return planSources(ref, new ArrayList<>());
+    }
+
+    private boolean unpaywallEnabled() {
+        return unpaywall != null && unpaywall.isEnabled();
+    }
+
+    /**
+     * Orders every source this paper can come from: Unpaywall, then arXiv, then the given URL,
+     * then configured mirrors. Duplicates keep their first (highest-priority) position, so an
+     * Unpaywall location that is itself arxiv.org is tried once, as Unpaywall's.
+     *
+     * <p>Lookups that fail add a note to {@code failures} only when they explain a gap the
+     * agent can act on (no DOI found for the title). An Unpaywall answer of "no open copy"
+     * is the ordinary case and is not a failure.</p>
+     */
+    private SourcePlan planSources(PaperRef ref, List<String> failures) {
+        List<Source> sources = new ArrayList<>();
+        String resolvedDoi = null;
+
+        // 1. Unpaywall. A DOI from the caller, else one found on Crossref by exact title.
+        if (unpaywallEnabled()) {
+            String doi = ref.doi();
+            if (doi == null && ref.title() != null && crossref != null && crossref.isEnabled()) {
+                resolvedDoi = crossref.doiForTitle(ref.title(), ref.year()).orElse(null);
+                if (resolvedDoi == null && ref.arxivId() == null && ref.url() == null) {
+                    failures.add("Crossref: no unambiguous DOI for title \"" + ref.title() + "\"");
+                }
+                doi = resolvedDoi;
+            }
+            if (doi != null && !UnpaywallResolver.isArxivDoi(doi)) {
+                for (String pdf : unpaywall.pdfUrlsFor(doi)) {
+                    sources.add(new Source(pdf, LABEL_UNPAYWALL));
                 }
             }
         }
-    }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // Candidate URLs
-    // ──────────────────────────────────────────────────────────────────────
-
-    /**
-     * Expands one user-supplied URL into the concrete URLs worth trying, including
-     * normalisations (arXiv abs → pdf) and configured host mirrors.
-     */
-    /** Package-private so the URL-expansion rules can be tested without a network call. */
-    List<String> candidateUrls(String url) {
-        return buildCandidates(url);
-    }
-
-    private List<String> buildCandidates(String url) {
-        List<String> candidates = new ArrayList<>();
-
-        Matcher arxiv = ARXIV_ID.matcher(url);
-        if (arxiv.find()) {
-            String id = arxiv.group(1);
-            // The canonical PDF URL first, then the /pdf/ page (which redirects),
-            // then the export mirror for networks where arxiv.org is unreachable.
-            candidates.add("https://arxiv.org/pdf/" + id);
-            candidates.add("https://arxiv.org/pdf/" + id + ".pdf");
-            candidates.add("https://export.arxiv.org/pdf/" + id);
-            candidates.add(url);
-        } else {
-            candidates.add(url);
+        // 2. arXiv. The canonical PDF URL first, then the export mirror for networks where
+        //    arxiv.org itself is unreachable.
+        if (ref.arxivId() != null) {
+            sources.add(new Source("https://arxiv.org/pdf/" + ref.arxivId(), LABEL_ARXIV));
+            sources.add(new Source("https://export.arxiv.org/pdf/" + ref.arxivId(), LABEL_ARXIV));
         }
 
-        // Host-configured mirrors come last: they are a fallback, not the preference.
-        for (String candidate : List.copyOf(candidates)) {
-            String host = hostOf(candidate);
+        // 3. The caller's URL — a direct PDF, or a landing page whose PDF link is followed.
+        //    For a DOI with no URL, the resolver itself is that landing page.
+        if (ref.url() != null) {
+            sources.add(new Source(ref.url(), LABEL_GIVEN_URL));
+        } else if (ref.doi() != null && !UnpaywallResolver.isArxivDoi(ref.doi())) {
+            sources.add(new Source("https://doi.org/" + ref.doi(), LABEL_GIVEN_URL));
+        }
+
+        // 4. Host-configured mirrors come last: they are a fallback, not the preference.
+        for (Source source : List.copyOf(sources)) {
+            String host = hostOf(source.url());
             List<String> fallbacks = host == null ? null : props.getHostFallbacks().get(host);
             if (fallbacks != null) {
                 for (String fallback : fallbacks) {
-                    String mapped = applyFallback(candidate, fallback);
-                    if (mapped != null && !candidates.contains(mapped)) {
-                        candidates.add(mapped);
+                    String mapped = applyFallback(source.url(), fallback);
+                    if (mapped != null) {
+                        sources.add(new Source(mapped, LABEL_MIRROR));
                     }
                 }
             }
         }
 
-        return candidates.stream().distinct().toList();
+        // Deduplicate by URL, keeping the first label: an Unpaywall location on arxiv.org
+        // must count as Unpaywall's, not be tried a second time as plain arXiv.
+        Map<String, Source> unique = new LinkedHashMap<>();
+        for (Source source : sources) {
+            unique.putIfAbsent(source.url(), source);
+        }
+        return new SourcePlan(new ArrayList<>(unique.values()), resolvedDoi);
     }
 
     /**
@@ -794,14 +1114,17 @@ public class PaperDownloadTool {
     }
 
     /**
-     * Gets a PDF under {@code papers/{shortName}.pdf}, preferring what is already on disk
-     * over any fetch — the single-paper workflow's "local wins" rule in one place.
+     * Gets a paper's PDF under {@code papers/}, preferring what is already on disk over any
+     * fetch — the single-paper workflow's "local wins" rule in one place.
      *
-     * <p>Order: an already-in-topic file, then a local file the caller pointed at, then
-     * the same short name under another topic (copied, so topics stay isolated), and only
+     * <p>Order: a local file the caller pointed at, then the paper already in the topic, then
+     * the library, then another topic's copy (copied, so topics stay isolated), and only
      * then a download. When {@code topic} is omitted, an existing copy's topic is adopted
      * so a re-run lands beside the paper it reuses; otherwise the short name becomes the
      * topic.</p>
+     *
+     * <p>"The paper" is decided by identity, never by a matching file name; the returned
+     * short name is the one the file really has, which can differ from the requested one.</p>
      *
      * <p>Classification is re-derived from the source text rather than passed in: the
      * existence check at the heart of {@link SourceKind#LOCAL_FILE} is authoritative, and
@@ -816,91 +1139,93 @@ public class PaperDownloadTool {
             return new AcquireResult(false, topic, shortName, null, Origin.NOT_FOUND, e.getMessage());
         }
 
+        Path local = asLocalPdf(paper == null ? "" : paper.trim());
+        // A file's own content is its identity; a reference names a paper; a bare short name
+        // only labels one.
+        PaperIdentity wanted = switch (kind) {
+            case LOCAL_FILE -> PaperIdentity.NONE.confirmedBy(
+                    PdfIdentityReader.identityOf(local).orElse(PdfIdentity.NONE));
+            case URL -> PaperRef.of(paper, null, null, null).identity();
+            case SHORT_NAME -> PaperIdentity.fromReference(
+                    paper == null ? null : stripPdfExtension(paper.trim()));
+        };
+
         // Existing copies decide the topic when the caller did not name one: a paper
         // already under investigation/X/ belongs to X, and re-homing it would split the
         // PDF from analyses written against it.
+        List<Path> elsewhere = PaperStore.findAcrossTopics(
+                kind == SourceKind.LOCAL_FILE ? null : safeName, wanted, library);
         String effectiveTopic = topic;
-        Path elsewhere = null;
         if (effectiveTopic == null || effectiveTopic.isBlank()) {
-            elsewhere = PaperStore.findPdfAcrossTopics(safeName).orElse(null);
-            effectiveTopic = elsewhere == null ? safeName
-                    : elsewhere.getParent().getParent().getFileName().toString();
+            AcquireResult ambiguous = ambiguousName(kind, safeName, elsewhere);
+            if (ambiguous != null) {
+                return ambiguous;
+            }
+            effectiveTopic = local != null && topicOf(local) != null ? topicOf(local)
+                    : elsewhere.isEmpty() ? safeName : topicOf(elsewhere.get(0));
         }
 
-        Path papersRoot;
-        Path target;
+        PaperShelf shelf;
         try {
-            papersRoot = WorkspacePaths.papersDir(effectiveTopic);
-            target = papersRoot.resolve(safeName + ".pdf").normalize();
-            if (!target.startsWith(papersRoot)) {
-                return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
-                        "resolved path escapes the papers directory: " + target);
-            }
+            shelf = PaperStore.shelf(effectiveTopic, library);
         } catch (IllegalArgumentException e) {
             return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND, e.getMessage());
         }
-        String relative = WorkspacePaths.relative(target);
 
-        // 1. The target topic already has a parseable copy — nothing to fetch.
-        if (Files.isRegularFile(target) && PaperStore.pageCount(target) != null) {
-            return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.REUSED_IN_TOPIC,
-                    "课题下已有论文，跳过获取");
-        }
-
-        // 2. A local file the caller pointed at: import it. Existence was checked by
-        //    classifySource, but re-check — the file may have vanished since.
-        Path local = asLocalPdf(paper == null ? "" : paper.trim());
-        if (local != null) {
+        // 1. A local file the caller pointed at is the paper, whatever else has its name.
+        if (kind == SourceKind.LOCAL_FILE) {
             try {
-                PaperStore.importPdf(local, effectiveTopic, safeName, props.getMaxPdfBytes());
-                publishDownload(threadId, "已导入本地论文：" + safeName);
-                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.LOCAL_COPY,
-                        "已从本地复制：" + WorkspacePaths.relative(local));
+                List<Path> before = PaperStore.listPdfFiles(effectiveTopic);
+                Path saved = PaperStore.importPdf(local, effectiveTopic, safeName, wanted,
+                        props.getMaxPdfBytes(), library);
+                if (before.contains(saved)) {
+                    return acquired(saved, Origin.REUSED_IN_TOPIC, "课题下已有这篇论文，跳过获取");
+                }
+                publishDownload(threadId, "已导入本地论文：" + PaperStore.shortNameOf(saved));
+                return acquired(saved, Origin.LOCAL_COPY, "已从本地复制：" + WorkspacePaths.relative(local));
             } catch (IllegalArgumentException | IOException e) {
                 return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
                         "本地 PDF 导入失败：" + e.getMessage());
             }
         }
-        if (kind == SourceKind.LOCAL_FILE) {
-            // It looked like a local PDF when classified but is gone now — do not fall
-            // through to a cross-topic guess or a download under its name.
-            return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
-                    "本地 PDF 不存在或不可读：" + paper);
+
+        // 2. The topic already has this paper — nothing to fetch.
+        Optional<Path> inTopic = shelf.find(safeName, wanted);
+        if (inTopic.isPresent()) {
+            return acquired(inTopic.get(), Origin.REUSED_IN_TOPIC, "课题下已有这篇论文，跳过获取");
         }
 
         // 3. The shared library: the whole point of it is that this step usually hits.
-        //    Tried before other topics because the library is the canonical corpus, and
-        //    matched on identifiers as well as name — the same paper may have been saved
-        //    under a different short name by an earlier conversation.
-        if (library != null) {
-            Optional<Path> fromLibrary = library.find(safeName, paper);
-            if (fromLibrary.isPresent()) {
-                try {
-                    PaperStore.importPdf(fromLibrary.get(), effectiveTopic, safeName, props.getMaxPdfBytes());
-                    publishDownload(threadId, "本地论文库命中，已复制：" + safeName);
-                    return new AcquireResult(true, effectiveTopic, safeName, relative,
-                            Origin.COPIED_FROM_LIBRARY,
-                            "复用自本地论文库：" + WorkspacePaths.relative(fromLibrary.get()));
-                } catch (IllegalArgumentException | IOException e) {
-                    log.warn("从论文库复制失败 [{}]: {}", safeName, e.getMessage());
-                }
-            }
+        //    Tried before other topics because the library is the canonical corpus.
+        Optional<Path> fromLibrary = library == null ? Optional.empty() : library.find(safeName, wanted);
+        // 4. Another topic's copy: copied, never moved — that topic's analyses reference it.
+        Optional<Path> source = fromLibrary.isPresent() ? fromLibrary : elsewhere.stream().findFirst();
+        List<Path> copies = new ArrayList<>(elsewhere);
+        fromLibrary.ifPresent(copies::add);
+        AcquireResult ambiguous = ambiguousName(kind, safeName, copies);
+        if (ambiguous != null) {
+            return ambiguous;
         }
-
-        // 4. The same short name under another topic: copy it (never move — the other
-        //    topic's analyses reference it).
-        Path found = elsewhere != null ? elsewhere
-                : PaperStore.findPdfAcrossTopics(safeName).orElse(null);
-        if (found != null) {
+        if (source.isPresent()) {
             try {
-                PaperStore.importPdf(found, effectiveTopic, safeName, props.getMaxPdfBytes());
-                String sourceTopic = found.getParent().getParent().getFileName().toString();
-                publishDownload(threadId, "已复用其他课题的论文：" + safeName + "（来自 " + sourceTopic + "）");
-                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.COPIED_FROM_OTHER_TOPIC,
-                        "复用自课题 " + sourceTopic + "：" + WorkspacePaths.relative(found));
+                Path saved = PaperStore.importPdf(source.get(), effectiveTopic, safeName, wanted,
+                        props.getMaxPdfBytes(), library);
+                String name = PaperStore.shortNameOf(saved);
+                if (fromLibrary.isPresent()) {
+                    publishDownload(threadId, "本地论文库命中，已复制：" + name);
+                    return acquired(saved, Origin.COPIED_FROM_LIBRARY,
+                            "复用自本地论文库：" + WorkspacePaths.relative(source.get()));
+                }
+                String sourceTopic = topicOf(source.get());
+                publishDownload(threadId, "已复用其他课题的论文：" + name + "（来自 " + sourceTopic + "）");
+                return acquired(saved, Origin.COPIED_FROM_OTHER_TOPIC,
+                        "复用自课题 " + sourceTopic + "：" + WorkspacePaths.relative(source.get()));
             } catch (IllegalArgumentException | IOException e) {
-                return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
-                        "复用其他课题的论文失败：" + e.getMessage());
+                log.warn("复用已有论文失败 [{}]: {}", safeName, e.getMessage());
+                if (kind != SourceKind.URL) {
+                    return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
+                            "复用已有论文失败：" + e.getMessage());
+                }
             }
         }
 
@@ -908,17 +1233,48 @@ public class PaperDownloadTool {
         //    existing paper is a lookup miss, and inventing a download target is worse
         //    than saying so.
         if (kind == SourceKind.URL) {
-            String result = downloadPaperInternal(effectiveTopic, paper.trim(), safeName, threadId);
-            if (result.startsWith("OK:")) {
-                return new AcquireResult(true, effectiveTopic, safeName, relative, Origin.DOWNLOAD,
-                        "已下载");
-            }
-            return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND, result);
+            DownloadResult result = download(effectiveTopic, PaperRef.of(paper.trim(), null, null, null),
+                    safeName, threadId);
+            return result.pdf() != null ? acquired(result.pdf(), Origin.DOWNLOAD, "已下载")
+                    : new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND, result.message());
         }
 
         return new AcquireResult(false, effectiveTopic, safeName, null, Origin.NOT_FOUND,
-                "找不到论文 \"" + safeName + "\"：本地无此文件，各课题 papers/ 下也没有同名 PDF。"
+                "找不到论文 \"" + safeName + "\"：本地无此文件，各课题 papers/ 下也没有这篇论文。"
                         + "请给出 PDF 路径或 URL，或检查论文短名是否正确。");
+    }
+
+    /**
+     * A bare short name that different papers carry. Which one is meant is the caller's to
+     * say; picking one would close-read the wrong paper without anybody noticing.
+     */
+    private static AcquireResult ambiguousName(SourceKind kind, String name, List<Path> copies) {
+        List<Path> papers = kind == SourceKind.SHORT_NAME ? PaperStore.differentPapers(copies) : List.of();
+        if (papers.size() < 2) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder("短名 \"").append(name).append("\" 对应多篇不同的论文：\n");
+        for (Path pdf : papers) {
+            sb.append("- ").append(WorkspacePaths.relative(pdf))
+                    .append(PdfIdentityReader.identityOf(pdf)
+                            .map(printed -> PaperStore.identityNote(printed, PaperIdentity.NONE)).orElse(""))
+                    .append('\n');
+        }
+        sb.append("请指明课题方向，或改用 DOI / arXiv 编号 / PDF 路径。");
+        return new AcquireResult(false, null, name, null, Origin.NOT_FOUND, sb.toString());
+    }
+
+    private static AcquireResult acquired(Path pdf, Origin origin, String detail) {
+        return new AcquireResult(true, topicOf(pdf), PaperStore.shortNameOf(pdf), WorkspacePaths.relative(pdf),
+                origin, detail);
+    }
+
+    /** The topic a PDF lies in, or null when it is not under {@code investigation/{topic}/papers/}. */
+    private static String topicOf(Path pdf) {
+        Path papers = pdf.toAbsolutePath().normalize().getParent();
+        return papers != null && papers.endsWith(WorkspacePaths.PAPERS_SUBDIR)
+                && WorkspacePaths.investigationRoot().equals(papers.getParent().getParent())
+                ? papers.getParent().getFileName().toString() : null;
     }
 
     /** An existing PDF at this reference (absolute, working-dir, or project-root relative), or null. */

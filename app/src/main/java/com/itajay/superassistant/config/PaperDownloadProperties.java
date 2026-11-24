@@ -82,6 +82,20 @@ public class PaperDownloadProperties {
      */
     private java.util.Map<String, java.util.List<String>> hostFallbacks = new java.util.LinkedHashMap<>();
 
+    /**
+     * Contact email sent to the Unpaywall API ({@code ?email=}), the only credential it asks for.
+     *
+     * <p>Unpaywall maps a DOI to a legal open-access copy (arXiv, PubMed Central,
+     * institutional repositories). It is consulted before the publisher page because
+     * the publisher is exactly where downloads get stuck — paywalls and bot protection —
+     * while the open copy is usually a plain PDF on a cooperative host. Blank disables
+     * the lookup: the download then behaves exactly as it did without it.</p>
+     */
+    private String unpaywallEmail = "";
+
+    /** Timeout for one Unpaywall lookup; a slow answer must not hold up the download. */
+    private int unpaywallTimeoutMs = 10_000;
+
     public String getInvestigationDir() {
         return investigationDir;
     }
@@ -200,5 +214,21 @@ public class PaperDownloadProperties {
 
     public void setHostFallbacks(java.util.Map<String, java.util.List<String>> hostFallbacks) {
         this.hostFallbacks = hostFallbacks;
+    }
+
+    public String getUnpaywallEmail() {
+        return unpaywallEmail;
+    }
+
+    public void setUnpaywallEmail(String unpaywallEmail) {
+        this.unpaywallEmail = unpaywallEmail;
+    }
+
+    public int getUnpaywallTimeoutMs() {
+        return unpaywallTimeoutMs;
+    }
+
+    public void setUnpaywallTimeoutMs(int unpaywallTimeoutMs) {
+        this.unpaywallTimeoutMs = unpaywallTimeoutMs;
     }
 }

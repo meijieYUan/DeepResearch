@@ -9,10 +9,13 @@ import org.springframework.ai.chat.model.ToolContext;
 import java.util.Map;
 import com.itajay.superassistant.tool.DownloadFailureRegistry;
 import com.itajay.superassistant.tool.PaperAnalysisTool;
+import com.itajay.superassistant.tool.PaperIdentity;
 import com.itajay.superassistant.tool.PaperLibrary;
+import com.itajay.superassistant.tool.TestPdfs;
 import com.itajay.superassistant.workspace.WorkspacePaths;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -389,49 +392,71 @@ class ResearchWriteReviewWorkflowTest {
         });
     }
 
+    private static final PaperIdentity RESNET = new PaperIdentity("1512.03385", null,
+            "Deep Residual Learning for Image Recognition", null);
+
+    /** Runs the workflow after one paper, ResNet under the label "Survey", failed to download. */
+    private String runWithMissingResNet(PaperLibrary library, AtomicInteger reviews) {
+        DownloadFailureRegistry failures = new DownloadFailureRegistry();
+        var flow = new ResearchWriteReviewWorkflow((input, config) -> {
+            failures.record("library-thread", topic, "Survey", "https://arxiv.org/abs/1512.03385", "HTTP 403", RESNET);
+            return "本轮材料：Alpha";
+        }, (input, config) -> {
+            Files.createDirectories(document.getParent());
+            Files.writeString(document, "# 文档");
+            return "file: " + WorkspacePaths.relative(document);
+        }, (input, config) -> {
+            reviews.incrementAndGet();
+            return PASS;
+        }, analysis, new ProgressChannelRegistry(), library, failures, null);
+        when(analysis.analyzeTopicSync(any(), any(), anyInt(), any(), any(ProgressContext.class)))
+                .thenReturn("论文精读完成：");
+        return flow.researchWriteReview(brief, threadContext("library-thread"));
+    }
+
+    private static PaperLibrary libraryIn(Path root) {
+        return new PaperLibrary(new com.itajay.superassistant.config.PaperDownloadProperties(), root);
+    }
+
     /**
-     * The whole point of re-checking the library at pause time: a paper the user has
-     * since supplied is no longer missing, so the run continues instead of asking again.
+     * The whole point of re-checking the library at pause time: a paper the user has since
+     * supplied is no longer missing, under whatever name they saved it — and it has to reach
+     * the topic, where close reading looks for it.
      */
     @Test
-    void aPaperAlreadyInTheLibraryDoesNotPauseTheRun() throws IOException {
-        DownloadFailureRegistry failures = new DownloadFailureRegistry();
-        PaperLibrary library = new PaperLibrary(new com.itajay.superassistant.config.PaperDownloadProperties());
-        Path libraryDir = WorkspacePaths.paperLibraryDir();
-        Path libraryPdf = libraryDir.resolve("Library-Paper.pdf");
+    void aPaperTheUserSuppliedUnderAnyNameContinuesTheRun(@TempDir Path libraryRoot) throws IOException {
+        TestPdfs.paper(libraryRoot.resolve("papers/download (3).pdf"), "1512.03385",
+                "Deep Residual Learning for Image Recognition");
         AtomicInteger reviews = new AtomicInteger();
 
-        Files.createDirectories(libraryDir);
-        try (org.apache.pdfbox.pdmodel.PDDocument doc = new org.apache.pdfbox.pdmodel.PDDocument()) {
-            doc.addPage(new org.apache.pdfbox.pdmodel.PDPage());
-            doc.save(libraryPdf.toFile());
-        }
+        String result = runWithMissingResNet(libraryIn(libraryRoot), reviews);
 
-        try {
-            var flow = new ResearchWriteReviewWorkflow((input, config) -> {
-                // Fails to download, but the same paper is already in the library.
-                failures.record("library-thread", topic, "Library-Paper",
-                        "https://example.com/x.pdf", "HTTP 403");
-                return "本轮材料：Alpha";
-            }, (input, config) -> {
-                Files.createDirectories(document.getParent());
-                Files.writeString(document, "# 文档");
-                return "file: " + WorkspacePaths.relative(document);
-            }, (input, config) -> {
-                reviews.incrementAndGet();
-                return PASS;
-            }, analysis, new ProgressChannelRegistry(), library, failures, null);
+        assertThat(result).doesNotContain("WORKFLOW_WAITING_FOR_PAPERS");
+        assertThat(reviews).hasValue(1);
+        assertThat(WorkspacePaths.papersDir(topic).resolve("Survey.pdf")).exists();
+    }
 
-            when(analysis.analyzeTopicSync(any(), any(), anyInt(), any(), any(ProgressContext.class)))
-                    .thenReturn("论文精读完成：");
+    /** The same name used to be enough, and the run went on without the paper. */
+    @Test
+    void anotherPaperUnderTheSameNameStillPausesTheRun(@TempDir Path libraryRoot) throws IOException {
+        TestPdfs.paper(libraryRoot.resolve("papers/Survey.pdf"), "1706.03762", "Attention Is All You Need");
+        AtomicInteger reviews = new AtomicInteger();
 
-            String result = flow.researchWriteReview(brief, threadContext("library-thread"));
+        String result = runWithMissingResNet(libraryIn(libraryRoot), reviews);
 
-            assertThat(result).doesNotContain("WORKFLOW_WAITING_FOR_PAPERS");
-            assertThat(reviews).hasValue(1);
-        } finally {
-            Files.deleteIfExists(libraryPdf);
-        }
+        // Tells the user a name that works even when the page cannot be read.
+        assertThat(result).contains("WORKFLOW_WAITING_FOR_PAPERS", "Survey-1512.03385.pdf");
+        assertThat(reviews).hasValue(0);
+    }
+
+    /** A scan says nothing about itself; the name the user was told settles it. */
+    @Test
+    void aScanSavedUnderTheSuggestedNameContinuesTheRun(@TempDir Path libraryRoot) throws IOException {
+        TestPdfs.blank(libraryRoot.resolve("papers/Survey-1512.03385.pdf"));
+        AtomicInteger reviews = new AtomicInteger();
+
+        assertThat(runWithMissingResNet(libraryIn(libraryRoot), reviews)).doesNotContain("WORKFLOW_WAITING_FOR_PAPERS");
+        assertThat(reviews).hasValue(1);
     }
 
     private static ToolContext threadContext(String threadId) {

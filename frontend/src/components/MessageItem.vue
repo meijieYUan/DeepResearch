@@ -31,12 +31,17 @@
           缺少 {{ msg.waiting.missingPapers.length }} 篇论文全文，调研已暂停
         </p>
         <p v-if="msg.waiting.libraryPath" class="waiting-note">
-          把 PDF 放进本地论文库（文件名用「论文短名.pdf」）：<code>{{ msg.waiting.libraryPath }}</code>
+          把 PDF 放进本地论文库（文件名任意，系统按 PDF 里的标题与 DOI 识别）：<code>{{ msg.waiting.libraryPath }}</code>
         </p>
         <ul v-if="msg.waiting.missingPapers.length" class="waiting-list">
-          <li v-for="paper in msg.waiting.missingPapers" :key="paper.shortName">
+          <!-- By position: two different papers can carry one short name. -->
+          <li v-for="(paper, index) in msg.waiting.missingPapers" :key="index">
             <strong>{{ paper.shortName }}</strong>
+            <span v-if="paper.title"> · {{ paper.title }}</span>
+            <span v-if="paper.doi" class="muted"> · DOI {{ paper.doi }}</span>
+            <span v-if="paper.arxivId" class="muted"> · arXiv {{ paper.arxivId }}</span>
             <span v-if="paper.reason" class="muted"> · {{ paper.reason }}</span>
+            <span v-if="paper.fileName" class="muted"> · 认不出时改名为 <code>{{ paper.fileName }}</code></span>
           </li>
         </ul>
         <button type="button" class="waiting-resume" @click="$emit('resume-research', msg)">

@@ -8,11 +8,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -140,7 +142,11 @@ final class PaperStore {
                 Integer pages = pageCount(pdf);
                 sb.append("- ").append(pdf.getFileName())
                         .append("  (").append(bytes / 1024).append(" KB")
-                        .append(", ").append(pages == null ? "unparseable" : pages + " pages").append(")\n");
+                        .append(", ").append(pages == null ? "unparseable" : pages + " pages").append(")")
+                        // A name alone has misled callers into treating another paper as this one.
+                        .append(PdfIdentityReader.identityOf(pdf)
+                                .map(printed -> identityNote(printed, PaperIdentity.NONE)).orElse(""))
+                        .append("\n");
             }
             return sb.toString().trim();
         } catch (IOException e) {
@@ -158,24 +164,25 @@ final class PaperStore {
     }
 
     /**
-     * Copies a locally available PDF into the topic's {@code papers/}, the same place a
-     * download would have landed it. Used by the single-paper deep-read workflow, which
-     * must not re-download a paper the user already has on disk.
+     * Copies a PDF into the topic's {@code papers/}, unless the topic already has that paper.
      *
      * <p>Holds the same bar as a download: the file must carry the {@code %PDF-} magic,
      * parse under PDFBox, and fit the size ceiling. A local file is no more trustworthy
      * than a fetched one — it may be an error page saved with a {@code .pdf} name.</p>
      *
-     * <p>If the target already exists <em>and parses</em>, nothing is copied: same dedup
-     * stance as {@code downloadPaper}. A target that exists but does not parse is
-     * replaced — it cannot be read anyway, and keeping it would poison every later step.</p>
+     * <p>The short name is a preference, not a key: when the topic already uses it for another
+     * paper, the copy gets a distinct name, and when the topic already has this paper under
+     * any name, that file is returned and nothing is copied (see {@link PaperShelf}).</p>
      *
+     * @param wanted   the paper being asked for
      * @param maxBytes size ceiling; the caller takes it from {@code PaperDownloadProperties}
-     * @return the target path in {@code papers/}, always parseable
+     * @param library  knows what each content was fetched by; may be null
+     * @return the paper's path in {@code papers/}, always parseable
      * @throws IOException when the source is unreadable or the copy fails
      * @throws IllegalArgumentException when the source is not a usable PDF or exceeds the ceiling
      */
-    static Path importPdf(Path source, String topic, String shortName, long maxBytes) throws IOException {
+    static Path importPdf(Path source, String topic, String shortName, PaperIdentity wanted,
+                          long maxBytes, PaperLibrary library) throws IOException {
         if (source == null || !Files.isRegularFile(source)) {
             throw new IllegalArgumentException("本地 PDF 不存在：" + source);
         }
@@ -185,69 +192,84 @@ final class PaperStore {
         if (!hasPdfMagic(source) || pageCount(source) == null) {
             throw new IllegalArgumentException("本地文件不是可解析的 PDF：" + source);
         }
+        PaperShelf shelf = shelf(topic, library);
+        Optional<Path> held = shelf.find(null, wanted);
+        return held.isPresent() ? held.get()
+                : shelf.add(source, WorkspacePaths.slugify(shortName, "论文短名"),
+                        library == null ? PaperIdentity.NONE : library.recordedFor(source));
+    }
 
-        Path papersRoot = papersRoot(topic);
-        String safeName = WorkspacePaths.slugify(shortName, "论文短名");
-        Path target = papersRoot.resolve(safeName + ".pdf").normalize();
-        if (!target.startsWith(papersRoot)) {
-            throw new IllegalArgumentException("resolved path escapes the papers directory: " + target);
-        }
+    /** The topic's papers as a shelf, told apart by identity. */
+    static PaperShelf shelf(String topic, PaperLibrary library) {
+        return shelf(papersRoot(topic), library);
+    }
 
-        if (Files.isRegularFile(target) && pageCount(target) != null) {
-            return target;
-        }
-
-        // Temp + move keeps an interrupted copy from leaving a half-written PDF under the
-        // final name — same discipline as saveAndReport in the downloader.
-        Files.createDirectories(papersRoot);
-        Path temp = Files.createTempFile(papersRoot, ".import-", ".part");
-        try {
-            Files.copy(source, temp, StandardCopyOption.REPLACE_EXISTING);
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-            temp = null;
-        } finally {
-            if (temp != null) {
-                Files.deleteIfExists(temp);
-            }
-        }
-        return target;
+    private static PaperShelf shelf(Path papersDir, PaperLibrary library) {
+        return new PaperShelf(papersDir, pdf -> PdfIdentityReader.identityOf(pdf)
+                .map(printed -> new PaperShelf.Known(printed,
+                        library == null ? PaperIdentity.NONE : library.recordedFor(pdf))));
     }
 
     /**
-     * Finds a PDF with this short name under any topic's {@code papers/}, so the
-     * deep-read workflow can reuse a paper a previous investigation already downloaded
-     * instead of fetching it again.
+     * Finds the wanted paper under every topic's {@code papers/}, so the deep-read workflow can
+     * reuse a paper a previous investigation already downloaded instead of fetching it again.
      *
-     * <p>Topics are scanned in directory-name order so the pick is deterministic when
-     * several topics hold the same file name. Only parseable PDFs count — a corrupt
-     * leftover is not a paper worth reusing.</p>
+     * <p>In directory-name order, so that a pick is deterministic. A file that merely has the
+     * same name is not a hit.</p>
      */
-    static Optional<Path> findPdfAcrossTopics(String shortName) {
-        String fileName;
+    static List<Path> findAcrossTopics(String shortName, PaperIdentity wanted, PaperLibrary library) {
+        String name;
         try {
-            fileName = WorkspacePaths.slugify(shortName, "论文短名") + ".pdf";
+            name = shortName == null ? null : WorkspacePaths.slugify(shortName, "论文短名");
         } catch (IllegalArgumentException e) {
-            return Optional.empty();
+            return List.of();
         }
         Path root = WorkspacePaths.investigationRoot();
         if (!Files.isDirectory(root)) {
-            return Optional.empty();
+            return List.of();
         }
         try (var stream = Files.list(root)) {
             return stream
                     .filter(Files::isDirectory)
                     .sorted()
-                    .map(topicDir -> topicDir.resolve(WorkspacePaths.PAPERS_SUBDIR).resolve(fileName))
-                    .filter(Files::isRegularFile)
-                    .filter(p -> pageCount(p) != null)
-                    .findFirst();
+                    .map(topicDir -> shelf(topicDir.resolve(WorkspacePaths.PAPERS_SUBDIR), library).find(name, wanted))
+                    .flatMap(Optional::stream)
+                    .toList();
         } catch (IOException e) {
-            return Optional.empty();
+            return List.of();
         }
     }
 
+    /** One file per different paper: copies and versions of one paper count once. */
+    static List<Path> differentPapers(List<Path> pdfs) {
+        Map<String, Path> byPaper = new LinkedHashMap<>();
+        for (Path pdf : pdfs) {
+            String arxiv = PdfIdentityReader.identityOf(pdf).map(PdfIdentity::arxivId).orElse(null);
+            byPaper.putIfAbsent(arxiv != null ? arxiv : String.valueOf(sha256(pdf)), pdf);
+        }
+        return new ArrayList<>(byPaper.values());
+    }
+
+    /** What a paper is, for listings: {@code  — arXiv 2304.03373, "Training-Free Layout …"}. */
+    static String identityNote(PdfIdentity printed, PaperIdentity recorded) {
+        List<String> parts = new ArrayList<>();
+        String arxiv = printed.arxivId() != null ? printed.arxivId() : recorded.arxivId();
+        if (arxiv != null) {
+            parts.add("arXiv " + arxiv);
+        }
+        String doi = recorded.doi() != null ? recorded.doi() : printed.doi();
+        if (doi != null) {
+            parts.add("DOI " + doi);
+        }
+        String heading = recorded.title() != null ? recorded.title() : printed.heading();
+        if (!heading.isBlank()) {
+            parts.add("\"" + (heading.length() > 120 ? heading.substring(0, 120) + "…" : heading) + "\"");
+        }
+        return parts.isEmpty() ? "" : " — " + String.join(", ", parts);
+    }
+
     /** Every valid PDF starts with this — same check the downloader applies to fetched bytes. */
-    private static boolean hasPdfMagic(Path file) throws IOException {
+    static boolean hasPdfMagic(Path file) throws IOException {
         byte[] head;
         try (InputStream in = Files.newInputStream(file)) {
             head = in.readNBytes(5);
