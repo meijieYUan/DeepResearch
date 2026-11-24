@@ -100,6 +100,14 @@ public class ModelCallGuardInterceptor extends ModelInterceptor {
 
     @Override
     public ModelResponse interceptModel(ModelRequest request, ModelCallHandler handler) {
+        // Request shape, not content: when a call is rejected by an intermediary (the
+        // gateway answers 413 for bodies over its limit, 431 for oversized headers), the
+        // only actionable question is "how big was what we sent". Logged before the call
+        // so the failing request is on record even though the exception carries only the
+        // response.
+        if (log.isDebugEnabled()) {
+            log.debug("Model request shape: {}", describeRequest(request));
+        }
         ModelResponse response = callWithRetry(request, handler);
 
         // 流式响应：handler 已经成功返回，真正的失败还在后面等着，把同一套
@@ -109,6 +117,65 @@ public class ModelCallGuardInterceptor extends ModelInterceptor {
             return ModelResponse.of(guardStream(flux.cast(ChatResponse.class), request, handler));
         }
         return response;
+    }
+
+    /** Sizes that make a rejected request diagnosable: what was sent, and how much of it. */
+    static String describeRequest(ModelRequest request) {
+        if (request == null) {
+            return "null request";
+        }
+        int systemChars = textChars(request.getSystemMessage());
+        int messageChars = 0;
+        if (request.getMessages() != null) {
+            for (org.springframework.ai.chat.messages.Message message : request.getMessages()) {
+                messageChars += textChars(message);
+            }
+        }
+        int toolNames = request.getTools() == null ? 0 : request.getTools().size();
+        int schemaChars = 0;
+        if (request.getDynamicToolCallbacks() != null) {
+            for (org.springframework.ai.tool.ToolCallback callback : request.getDynamicToolCallbacks()) {
+                schemaChars += definitionChars(callback);
+            }
+        }
+        // Tools usually arrive through the options rather than as dynamic callbacks;
+        // leaving them out reported "toolSchema=0" and hid the bulk of the body.
+        if (request.getOptions() instanceof org.springframework.ai.model.tool.ToolCallingChatOptions options
+                && options.getToolCallbacks() != null) {
+            for (org.springframework.ai.tool.ToolCallback callback : options.getToolCallbacks()) {
+                schemaChars += definitionChars(callback);
+            }
+        }
+        return "system=" + systemChars + "ch, messages=" + messageChars + "ch, tools="
+                + toolNames + ", toolSchema=" + schemaChars + "ch";
+    }
+
+    private static int definitionChars(org.springframework.ai.tool.ToolCallback callback) {
+        if (callback == null) {
+            return 0;
+        }
+        var definition = callback.getToolDefinition();
+        if (definition == null) {
+            return 0;
+        }
+        int total = 0;
+        if (definition.name() != null) {
+            total += definition.name().length();
+        }
+        if (definition.description() != null) {
+            total += definition.description().length();
+        }
+        if (definition.inputSchema() != null) {
+            total += definition.inputSchema().length();
+        }
+        return total;
+    }
+
+    private static int textChars(org.springframework.ai.chat.messages.Message message) {
+        if (message == null || message.getText() == null) {
+            return 0;
+        }
+        return message.getText().length();
     }
 
     /** 非流式路径：同步抛出的异常在这里重试，耗尽后返回兜底回答。 */

@@ -66,6 +66,18 @@ public class ResearchWriteReviewWorkflow {
     /** Two content-review rounds allow at most one content revision. */
     private static final int MAX_REVIEW_ROUNDS = 2;
 
+    /**
+     * A stage that returns no text is retried this many times in total before the run
+     * fails loudly.
+     *
+     * <p>Silence is the worst failure mode this workflow can have: a blank research or
+     * writer output used to flow straight into the next stage, producing a document built
+     * on nothing while every progress event said SUCCEEDED. Re-asking is cheap next to
+     * that, and when the retries also come back blank the run stops instead of pretending
+     * to have produced work.</p>
+     */
+    private static final int MAX_BLANK_ATTEMPTS = 2;
+
     /** Guard against a pathological research output being fed straight back in. */
     private static final int MAX_MATERIAL_CHARS = 200_000;
 
@@ -110,9 +122,9 @@ public class ResearchWriteReviewWorkflow {
                                        PaperLibrary paperLibrary,
                                        DownloadFailureRegistry downloadFailures,
                                        ResearchResumeStore resumeStore) {
-        this((input, config) -> invoke(researchAgent.reactAgent, input, config, "research-agent"),
-                (input, config) -> invoke(writerAgent.reactAgent, input, config, "writer-agent"),
-                (input, config) -> invoke(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
+        this((input, config) -> invokeWithRetry(researchAgent.reactAgent, input, config, "research-agent"),
+                (input, config) -> invokeWithRetry(writerAgent.reactAgent, input, config, "writer-agent"),
+                (input, config) -> invokeWithRetry(reviewerAgent.reactAgent, input, config, "reviewer-agent"),
                 paperAnalysisTool, progress, paperLibrary, downloadFailures, resumeStore);
     }
 
@@ -294,6 +306,12 @@ public class ResearchWriteReviewWorkflow {
                         : review.approved() ? Status.PASS : Status.REVISE;
                 publishReview(reviewContext, verdict, "审查结果：" + verdict, reviewAttempt.get());
                 publish(reviewContext, Operation.STAGE, verdict, "质量审查结束：" + verdict);
+                ReviewReport.round(topicId, "researchWriteReview", rounds, reviewAttempt.get(), review,
+                        review.approved() ? "通过，流程交付"
+                                : review.executionFailed() ? "审查输出不可用（PARSE），按未通过停止"
+                                : rounds >= MAX_REVIEW_ROUNDS ? "修订额度已用完，保留遗留问题并如实上报"
+                                : review.needsResearcher() ? "回到检索补充材料，下一轮重写文档"
+                                : "按问题归属进入下一轮修订（重做精读 / 修改文档）");
 
                 if (review.executionFailed() || review.approved()) {
                     break;
@@ -321,6 +339,11 @@ public class ResearchWriteReviewWorkflow {
                     review != null && review.approved() ? "文档通过审查"
                             : review != null && review.executionFailed() ? "审查未完成，文档质量未经验证"
                             : "文档未通过审查，已输出遗留问题");
+            ReviewReport.ended(topicId, "researchWriteReview",
+                    review != null && review.approved() ? "文档通过审查，已交付（共 " + rounds + " 轮审查）"
+                            : review != null && review.executionFailed()
+                                    ? "审查未完成，文档质量未经验证（共 " + rounds + " 轮审查）"
+                                    : "文档未通过审查，遗留问题见上文（共 " + rounds + " 轮审查）");
 
             log.info("ResearchWriteReview workflow finished [topic={}, rounds={}, approved={}]",
                     topicId, rounds, review != null && review.approved());
@@ -338,6 +361,7 @@ public class ResearchWriteReviewWorkflow {
             }
             publish(activity, Operation.STAGE, Status.FAILED, "阶段异常终止");
             publish(run.at(ProgressStage.FAILED, rounds), Operation.WORKFLOW, Status.FAILED, "工作流异常终止");
+            ReviewReport.ended(topicId, "researchWriteReview", "工作流异常终止：" + e.getMessage());
             return "Research-write-review workflow failed: " + e.getMessage()
                     + (documentOutput == null ? "" : "\n(An earlier draft may still have been written.)")
                     + "\n(Per-paper analyses already saved under investigation/ are kept — a re-run will reuse them.)";
@@ -388,10 +412,13 @@ public class ResearchWriteReviewWorkflow {
 
         // A paper that has since appeared in the library is no longer missing. Checked
         // here so an interrupted run resumed after the user dropped files in does not
-        // pause again on papers it now has.
+        // pause again on papers it now has. Matched by what the paper is: a PDF the user
+        // saved under any file name counts, another paper under this name does not. Copied
+        // into the topic right here — being in the library alone would let the run go on
+        // and close-read a topic folder that does not have it.
         List<DownloadFailureRegistry.Failure> stillMissing = snapshot.items().stream()
                 .filter(failure -> paperLibrary == null
-                        || paperLibrary.find(failure.shortName(), failure.url()).isEmpty())
+                        || paperLibrary.importInto(failure.shortName(), topicId, failure.identity()).isEmpty())
                 .toList();
         if (stillMissing.isEmpty()) {
             log.info("Research stage reported failures, but all are present in the paper library [topic={}]",
@@ -409,7 +436,8 @@ public class ResearchWriteReviewWorkflow {
         // topic folder is what makes every already-downloaded paper free.
         if (resumeStore != null) {
             resumeStore.put(threadId, topicId, brief, stillMissing.stream()
-                    .map(f -> new ResearchResumeStore.MissingPaper(f.shortName(), f.reason()))
+                    .map(f -> new ResearchResumeStore.MissingPaper(
+                            f.shortName(), f.reason(), f.title(), f.doi(), f.arxivId(), f.url(), f.fileName()))
                     .toList());
         }
         return new Waiting(waitingReport(topicId, brief, stillMissing));
@@ -422,23 +450,35 @@ public class ResearchWriteReviewWorkflow {
         sb.append("WORKFLOW_WAITING_FOR_PAPERS\n");
         sb.append("课题方向: ").append(topicId).append('\n');
         sb.append("状态: 研究阶段已暂停，等待人工补充论文全文（未进入精读与写作）。\n\n");
-        sb.append("以下 ").append(missing.size()).append(" 篇论文自动下载失败：\n");
+        sb.append("以下 ").append(missing.size())
+                .append(" 篇论文在本地论文库、Unpaywall 开放获取、arXiv 与给定链接中都没有拿到全文：\n");
         for (DownloadFailureRegistry.Failure failure : missing) {
             sb.append("- ").append(failure.shortName());
-            if (failure.url() != null && !failure.url().isBlank()) {
-                sb.append("  (").append(failure.url()).append(')');
-            }
-            if (failure.reason() != null && !failure.reason().isBlank()) {
-                sb.append("\n  原因: ").append(failure.reason());
+            if (failure.title() != null) {
+                sb.append("：").append(failure.title());
             }
             sb.append('\n');
+            if (failure.doi() != null) {
+                sb.append("  DOI: ").append(failure.doi()).append('\n');
+            }
+            if (failure.arxivId() != null) {
+                sb.append("  arXiv: ").append(failure.arxivId()).append('\n');
+            }
+            if (failure.url() != null && !failure.url().isBlank()) {
+                sb.append("  链接: ").append(failure.url()).append('\n');
+            }
+            if (failure.reason() != null && !failure.reason().isBlank()) {
+                sb.append("  原因: ").append(failure.reason()).append('\n');
+            }
+            sb.append("  认不出时的文件名: ").append(failure.fileName()).append('\n');
         }
         sb.append("""
 
                 请向用户说明：
                 1. 上述论文需要手动下载 PDF，放进本地论文库：paper-library/papers/
-                   文件名**不必**精确匹配短名——系统会读取 PDF 首页的 arXiv 编号 / DOI / 标题来识别。
-                   若某篇识别不出来，再把它改名为「上面列出的短名.pdf」即可。
+                   文件名**任意**——系统读取 PDF 首页的 arXiv 编号 / DOI / 标题来识别是哪一篇。
+                   若某篇识别不出来（扫描件，或标题与发表版不同的预印本），把它改名为上面
+                   「认不出时的文件名」。只叫短名不够：短名可能与另一篇论文重名。
                    已下载的一律保持原名也可以，不要为了改名而重复下载。
                 2. 放好后调用 resume 接口继续本次调研：
                    POST /api/chat/{threadId}/resume          （接着本次会话继续）
@@ -998,6 +1038,39 @@ public class ResearchWriteReviewWorkflow {
         String output = result.map(ResearchWriteReviewWorkflow::lastAnswer).orElse("");
         if (output.isBlank()) {
             log.warn("{} returned no output", name);
+        }
+        return output;
+    }
+
+    /**
+     * Runs one stage and refuses to hand an empty answer to the next one.
+     *
+     * <p>A blank answer is re-asked once, then turned into an exception naming the stage.
+     * The alternative — what this used to do — was to log a warning and pass the empty
+     * string on: the writer then composed a document from no material and the reviewer
+     * judged that document, so a run that produced nothing reported every stage as
+     * successful until the very end. Transport-level failures that arrive as an empty
+     * answer (a gateway refusing every call, a model that returns only tool-call frames
+     * and then stops) are indistinguishable from a genuinely empty reply at this level,
+     * so the retry is the cheap discriminator: a transient one succeeds, a systematic one
+     * fails twice and stops the run with a message the user can act on.</p>
+     *
+     * <p>The duplicate prompt is deliberate. Re-asking with different wording would make
+     * the second attempt measure the prompt instead of the condition, and a stage that
+     * works only under one phrasing is not a stage worth trusting.</p>
+     */
+    private static String invokeWithRetry(ReactAgent agent, String input, RunnableConfig config,
+                                          String name) {
+        String output = invoke(agent, input, config, name);
+        for (int attempt = 2; attempt <= MAX_BLANK_ATTEMPTS && output.isBlank(); attempt++) {
+            log.warn("{} returned no output; retrying ({}/{})", name, attempt, MAX_BLANK_ATTEMPTS);
+            output = invoke(agent, input, config, name);
+        }
+        if (output.isBlank()) {
+            throw new IllegalStateException(name + " 连续 " + MAX_BLANK_ATTEMPTS
+                    + " 次没有返回任何内容，已停止本次运行。"
+                    + "这不是正常的空回答：通常是模型调用全部失败（网络、鉴权、额度）"
+                    + "或被上游按请求形状拒绝。已下载的论文与已完成的精读结果都保留，可直接重跑。");
         }
         return output;
     }

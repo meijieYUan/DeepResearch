@@ -32,7 +32,8 @@ class PaperDownloadToolAcquireTest {
 
     private static final String TOPIC = "unit-test-acquire-topic";
     private static final String OTHER_TOPIC = "unit-test-acquire-other";
-    private static final long MAX_BYTES = 50L * 1024 * 1024;
+    /** Becomes a topic of its own, so it is named like a test and cleaned up like one. */
+    private static final String FRESH = "unit-test-acquire-fresh";
 
     private final List<ProgressEvent> progressEvents = new ArrayList<>();
     private final PaperDownloadTool tool = new PaperDownloadTool(
@@ -48,7 +49,7 @@ class PaperDownloadToolAcquireTest {
 
     @AfterEach
     void cleanUp() throws IOException {
-        for (String topic : List.of(TOPIC, OTHER_TOPIC)) {
+        for (String topic : List.of(TOPIC, OTHER_TOPIC, FRESH)) {
             Path topicDir = WorkspacePaths.topicDir(topic);
             if (!Files.isDirectory(topicDir)) {
                 continue;
@@ -162,12 +163,52 @@ class PaperDownloadToolAcquireTest {
 
     @Test
     void defaultTopicForANewLandingIsTheShortName() throws Exception {
-        Path source = writeRealPdf(Files.createTempDirectory("unit-test-acquire-"), "Fresh-Paper.pdf");
+        Path source = writeRealPdf(Files.createTempDirectory("unit-test-acquire-"), FRESH + ".pdf");
 
         PaperDownloadTool.AcquireResult result =
                 tool.acquirePaper(null, source.toString(), null, null);
 
         assertThat(result.ok()).isTrue();
-        assertThat(result.topic()).isEqualTo("Fresh-Paper");
+        assertThat(result.topic()).isEqualTo(FRESH);
+    }
+
+    /** The old order answered with whatever the topic already had under that name. */
+    @Test
+    void theFileTheCallerPointedAtWinsOverAnotherPaperWithItsName() throws Exception {
+        TestPdfs.paper(WorkspacePaths.papersDir(TOPIC).resolve("Survey.pdf"), "1706.03762", "Attention Is All You Need");
+        Path source = TestPdfs.paper(Files.createTempDirectory("unit-test-acquire-").resolve("Survey.pdf"),
+                "1512.03385", "Deep Residual Learning for Image Recognition");
+
+        PaperDownloadTool.AcquireResult result = tool.acquirePaper(TOPIC, source.toString(), null, null);
+
+        assertThat(result.ok()).isTrue();
+        assertThat(result.origin()).isEqualTo(PaperDownloadTool.Origin.LOCAL_COPY);
+        assertThat(result.shortName()).isEqualTo("Survey-1512.03385");
+        assertThat(result.pdfRelativePath()).endsWith("papers/Survey-1512.03385.pdf");
+    }
+
+    /** Picking one would close-read the wrong paper without anybody noticing. */
+    @Test
+    void aShortNameThatSeveralPapersCarryIsAQuestion() throws IOException {
+        TestPdfs.paper(WorkspacePaths.papersDir(TOPIC).resolve("Dup-Name.pdf"), "1706.03762", "Attention Is All You Need");
+        TestPdfs.paper(WorkspacePaths.papersDir(OTHER_TOPIC).resolve("Dup-Name.pdf"), "1512.03385",
+                "Deep Residual Learning for Image Recognition");
+
+        PaperDownloadTool.AcquireResult unclear = tool.acquirePaper(null, "Dup-Name", null, null);
+        assertThat(unclear.ok()).isFalse();
+        assertThat(unclear.detail()).contains(TOPIC, OTHER_TOPIC, "1706.03762", "1512.03385");
+
+        PaperDownloadTool.AcquireResult clear = tool.acquirePaper(OTHER_TOPIC, "Dup-Name", null, null);
+        assertThat(clear.ok()).isTrue();
+        assertThat(clear.topic()).isEqualTo(OTHER_TOPIC);
+    }
+
+    @Test
+    void aShortNameMayCarryItsExtension() throws IOException {
+        TestPdfs.paper(WorkspacePaths.papersDir(TOPIC).resolve("A-Rather-Long-Label.pdf"), null,
+                "Deep Residual Learning for Image Recognition");
+
+        assertThat(tool.acquirePaper(TOPIC, "A-Rather-Long-Label.pdf", null, null).ok()).isTrue();
+        assertThat(tool.acquirePaper(TOPIC, "A-Rather-Long-Label", null, null).ok()).isTrue();
     }
 }

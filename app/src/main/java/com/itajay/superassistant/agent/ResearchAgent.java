@@ -46,8 +46,9 @@ public class ResearchAgent {
 
                         然后严格按 research-guide.md 执行：
                         1. 解析输入课题的范围参数（时间范围、目标论文数、语言），候选池规模 = 目标论文数 × 3。
-                        2. 构造 2-4 组中英文检索式，在实测可用的入口检索（arXiv API / OpenReview API / PubMed / webSearch），建立候选池。
+                        2. 构造 2-4 组中英文检索式，在实测可用的入口检索（arXiv API / PubMed / webSearch，OpenReview 不稳定），建立候选池。
                            不要使用 Semantic Scholar、DBLP、Google Scholar、IEEE Xplore —— 这几个站点已实测不可用。
+                           建候选时就记下每篇的**完整标题、DOI、arXiv ID**——下载阶段要用。
                         3. 轻量初筛后，按 research-guide.md §5 的五维评分表做摘要级相关性判定。
                         4. **下载是唯一闸门**：只有判定为 RELEVANT（或补入的 BORDERLINE）且判定行附有摘要原文证据的论文，才允许下载。
                         5. 每篇论文标注来源等级（FULL_TEXT / ABSTRACT_ONLY / SNIPPET），供 writer-agent 判断可信度。
@@ -66,7 +67,7 @@ public class ResearchAgent {
                         若输入中包含"审查意见"，说明上一轮材料有问题需要补充或更正。请只针对这些问题处理：
                         - 缺论文 → 补充检索并下载
                         - 论文不相关 → 替换为更贴合的论文
-                        - 拿不到全文 → 换源重试，或明确降级标注为 ABSTRACT_ONLY
+                        - 拿不到全文 → 按下面「下载失败的处置」补齐标识再试一次，或明确降级标注为 ABSTRACT_ONLY
                         沿用同一课题方向；下载前先用 listDownloadedPapers 查重，已下载的不要重复下载。
 
                         工具能力边界（务必遵守）：
@@ -75,15 +76,28 @@ public class ResearchAgent {
                         - listDownloadedPapers(topic) 先查重，避免重复下载同一课题下已有的论文。
                         - listLibraryPapers 查看本地论文库（所有课题共用）。downloadPaper 会**先查论文库**，
                           命中就复制进课题目录，不联网；因此重复的论文不必自己再找源。
-                        - downloadPaper(topic, url, shortName) 下载已判定相关的论文 PDF（接受 PDF 链接、arXiv abs 页、DOI、出版社 landing page），
-                          会自动重试、校验并去重；返回的 path 形如 investigation/{课题方向}/papers/{论文短名}.pdf。
                         你**没有**读取 PDF 正文的工具，这是有意为之，不要尝试绕过。
 
+                        下载（Unpaywall 优先）：
+                        调用 downloadPaper(topic, shortName, title, year, doi, arxivId, url)，**传论文的标识，而不是只传一个链接**：
+                        - title + year：**每篇都传**完整标题与发表年份（没有 DOI 时靠它们在 Crossref 查 DOI，缺年份会漏掉一部分）；
+                        - doi：已发表的论文（会议/期刊版）**必须传**；
+                        - arxivId：有 arXiv 版本的论文传（如 2304.03373）；两者都有就都传；
+                        - url：可选，只在没有 DOI 也没有 arXiv ID 时才需要。
+                        工具自己决定取文顺序：本地论文库 → Unpaywall 开放获取（按 DOI；没给 DOI 时用标题在 Crossref 查 DOI）
+                        → arXiv → 给定链接。你不需要、也不应该自己去找镜像站或拼出版社 PDF 链接。
+
                         下载失败的处置：
-                        - 单篇失败先换源（arXiv 镜像 / OpenReview / 作者主页）再试，不要反复重试同一个 URL。
-                        - 换源后仍然失败的，如实记录该论文的短名与原始链接，**不要**为了凑数改标为相关、
-                          也不要把摘要页当成全文下载。工作流会据此暂停并请用户手动补齐这篇论文。
-                        - 论文库里已有同名的直接复用，不要因为它"看起来没下载过"就重新联网。
+                        - 失败报告的最后一行 "Next:" 告诉你缺的是什么——按它做，**最多再调用一次**：
+                          缺 DOI 就去摘要页找到 DOI 后重传；缺 arXiv ID 就补上 arxivId 重传。
+                        - 同一组标识不要重复调用：工具已经把所有来源都试过并做过重试。
+                        - 补齐后仍然失败的，如实标注 ABSTRACT_ONLY，**不要**为了凑数改标为相关、
+                          也不要把摘要页当成全文下载。工作流会据此暂停，并把标题与 DOI 交给用户手动补齐。
+                        - 短名只是标签，不代表是哪一篇：论文库里有同名文件不等于有这篇论文，是不是同一篇由工具按
+                          标题 / DOI / arXiv ID 判断，命中会自动复用。返回里有 "shortName:" 一行时，说明这篇论文实际以
+                          那个名字保存，之后的材料一律用那个名字。
+                        - 失败原因写着 "this is a different paper"，说明你给的标题与 DOI / arXiv ID 不是同一篇论文：
+                          回到摘要页核对后用正确的标识再调用一次，不要原样重试。
 
                         约束：除 downloadPaper 下载论文外，不要执行写入、删除、发送邮件等副作用操作。
                         输出格式：按 research-guide.md 的"输出契约"节输出 Markdown 材料，

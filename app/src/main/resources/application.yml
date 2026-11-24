@@ -15,13 +15,6 @@ spring:
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioSpeechAutoConfiguration
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioTranscriptionAutoConfiguration
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeRerankAutoConfiguration
-      # 排除 Spring AI 的 JDBC 会话记忆自动配置。
-      # 原因：它的 @ConditionalOnMissingBean 推断的是自己的 JdbcChatMemoryRepository 类型，
-      # 而本项目的 CustomJdbcChatMemoryRepository 是实现同一接口的另一个类，无法满足该条件，
-      # 于是两个 Bean 同时注册，ChatMemoryAutoConfiguration.chatMemory(ChatMemoryRepository)
-      # 因"找到 2 个候选"而启动失败。
-      # 本项目不使用框架的 ChatMemory：会话上下文由 graph checkpoint 持有，
-      # CustomJdbcChatMemoryRepository 仅用于前端渲染历史，故直接排除。
       - org.springframework.ai.model.chat.memory.repository.jdbc.autoconfigure.JdbcChatMemoryRepositoryAutoConfiguration
 
   ai:
@@ -35,18 +28,12 @@ spring:
 
     deepseek:
       api-key: ${DEEPSEEK_API_KEY}
-      base-url: https://llm-gateway.momenta.works
+      base-url: https://api.deepseek.com
       chat:
         options:
-          model: deepseek-v4.1-flash
+          model: deepseek-flash
           temperature: 0.7
-          # 输出上限，显式固定而非依赖供应商默认值。8192 已是 deepseek-chat 的上限。
-          # writer-agent 把整篇文档作为 writeResearchDocument 的单个参数一次输出，因此文档越大越
-          # 容易在 JSON 字符串中途被截断（Unexpected end-of-input），框架解析失败并终止本次运行。
-          # 现状：文档不再复述四维正文（那些落在 analysis/ 里），体量从「论文数 × 四维全文」降到
-          # 「论文数 × 一句话 + 对比表」，触发点因此后移了一个量级——但**上限本身没有消除**，
-          # 论文数很多时仍可能触及。真触及时要改的是分段写入，不是这个数字。
-          max-tokens: 8192
+          max-tokens: 163840
 
     mcp:
       client:
@@ -118,11 +105,11 @@ agent:
   compact:
     # 上下文压缩：动态阈值 = (模型窗口 - 输出预留 - 系统/工具/用户上下文预留) × 比例
     # 模型上下文窗口（tokens），deepseek-chat 默认 128K
-    model-context-window-tokens: 128000
+    model-context-window-tokens: 1280000
     # 为模型输出预留的窗口（tokens）
-    output-reserve-tokens: 8000
+    output-reserve-tokens: 80000
     # 为系统提示词 + 工具定义 + 注入的用户上下文/记忆/MCP 说明预留的窗口（tokens）
-    system-prompt-reserve-tokens: 12000
+    system-prompt-reserve-tokens: 120000
     # 触发 L1-L3 压缩的可用预算比例（0~1）
     warning-ratio: 0.70
     # 触发全量 LLM 压缩的可用预算比例（0~1，需大于 warning-ratio）
@@ -181,6 +168,11 @@ agent:
     # host-fallbacks:
     #   arxiv.org:
     #     - https://export.arxiv.org
+    # 开放获取（OA）解析：DOI → 合法免费全文地址（arXiv / PMC / 机构仓库），排在出版社页面之前尝试。
+    # Unpaywall 只要求一个联系邮箱，不需要 API key；实测 100% 可用、约 1.1s/次。
+    # 留空则跳过 OA 解析，下载行为与未接入时完全一致。邮箱走环境变量，不写进仓库。
+    unpaywall-email: ${UNPAYWALL_EMAIL:}
+    unpaywall-timeout-ms: 10000
   guard:
     # 模型调用异常兜底（重试 + 兜底回答）
     model-retry:

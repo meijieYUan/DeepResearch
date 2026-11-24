@@ -46,8 +46,22 @@ public class ResearchResumeStore {
                              List<MissingPaper> missing, Instant createdAt) {
     }
 
-    /** 一篇没拿到全文的论文。 */
-    public record MissingPaper(String shortName, String reason) {
+    /**
+     * 一篇没拿到全文的论文。
+     *
+     * @param title 论文标题，可能为空。前端展示给用户、作为人工检索依据
+     * @param doi   DOI，可能为空
+     * @param arxivId arXiv 编号，可能为空。短名可能重名，续跑时要靠标识认回这一篇
+     * @param url   最后尝试的引用（可能是 arXiv、DOI 或出版社链接），可能为空
+     * @param fileName 系统认不出用户放进来的 PDF 时，按这个文件名存就一定能对上
+     */
+    public record MissingPaper(String shortName, String reason, String title, String doi, String arxivId,
+                               String url, String fileName) {
+
+        /** Short form kept for callers that only know the name and the reason. */
+        public MissingPaper(String shortName, String reason) {
+            this(shortName, reason, null, null, null, null, null);
+        }
     }
 
     public void put(String threadId, String topic, String brief, List<MissingPaper> missing) {

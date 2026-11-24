@@ -27,6 +27,7 @@ class PaperStoreAcquireTest {
 
     private static final String TOPIC = "unit-test-store-acquire";
     private static final String OTHER_TOPIC = "unit-test-store-acquire-other";
+    private static final long MAX_BYTES = 50L * 1024 * 1024;
 
     @AfterEach
     void cleanUp() throws IOException {
@@ -61,7 +62,7 @@ class PaperStoreAcquireTest {
     void importPdfCopiesAValidLocalFileIntoPapers() throws IOException {
         Path source = writeRealPdf(Files.createTempDirectory("unit-test-import-"), "Local-Paper.pdf");
 
-        Path target = PaperStore.importPdf(source, TOPIC, "Local-Paper", 50L * 1024 * 1024);
+        Path target = importPdf(source, "Local-Paper", MAX_BYTES);
 
         assertThat(target).exists();
         assertThat(WorkspacePaths.relative(target))
@@ -74,7 +75,7 @@ class PaperStoreAcquireTest {
         Path fake = dir.resolve("fake.pdf");
         Files.writeString(fake, "<html>404</html>");
 
-        assertThatThrownBy(() -> PaperStore.importPdf(fake, TOPIC, "Fake", 50L * 1024 * 1024))
+        assertThatThrownBy(() -> importPdf(fake, "Fake", MAX_BYTES))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("不是可解析的 PDF");
     }
@@ -83,46 +84,79 @@ class PaperStoreAcquireTest {
     void importPdfRefusesAnOversizedFile() throws IOException {
         Path source = writeRealPdf(Files.createTempDirectory("unit-test-import-"), "Big.pdf");
 
-        assertThatThrownBy(() -> PaperStore.importPdf(source, TOPIC, "Big", 1))
+        assertThatThrownBy(() -> importPdf(source, "Big", 1))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("大小上限");
     }
 
     @Test
-    void importPdfSkipsWhenTheTargetAlreadyParses() throws IOException {
+    void importingTheSameFileAgainChangesNothing() throws IOException {
         Path source = writeRealPdf(Files.createTempDirectory("unit-test-import-"), "Shared.pdf");
-        Path target = PaperStore.importPdf(source, TOPIC, "Shared", 50L * 1024 * 1024);
+        Path target = importPdf(source, "Shared", MAX_BYTES);
         long sizeAfterFirst = Files.size(target);
 
-        // The second import must be a no-op: same dedup stance as downloadPaper.
-        Path again = PaperStore.importPdf(source, TOPIC, "Shared", 50L * 1024 * 1024);
+        Path again = importPdf(source, "Shared", MAX_BYTES);
 
         assertThat(again).isEqualTo(target);
         assertThat(Files.size(target)).isEqualTo(sizeAfterFirst);
+        assertThat(PaperStore.listPdfFiles(TOPIC)).hasSize(1);
+    }
+
+    /** The old rule returned whatever already had the name, and called it the imported paper. */
+    @Test
+    void importingAnotherPaperUnderATakenNameKeepsBoth() throws IOException {
+        Path temp = Files.createTempDirectory("unit-test-import-");
+        Path first = importPdf(TestPdfs.paper(temp.resolve("a.pdf"), "1706.03762", "Attention Is All You Need"),
+                "Survey", MAX_BYTES);
+        Path second = importPdf(TestPdfs.paper(temp.resolve("b.pdf"), "1512.03385",
+                "Deep Residual Learning for Image Recognition"), "Survey", MAX_BYTES);
+
+        assertThat(second).isNotEqualTo(first);
+        assertThat(second.getFileName().toString()).isEqualTo("Survey-1512.03385.pdf");
+        assertThat(PdfIdentityReader.identityOf(first).orElseThrow().arxivId()).isEqualTo("1706.03762");
+        assertThat(PdfIdentityReader.identityOf(second).orElseThrow().arxivId()).isEqualTo("1512.03385");
     }
 
     @Test
-    void findPdfAcrossTopicsLandsOnAParseableCopy() throws IOException {
+    void aPaperInAnotherTopicIsFoundByIdentityNotByName() throws IOException {
+        TestPdfs.paper(WorkspacePaths.papersDir(OTHER_TOPIC).resolve("unit-test-label.pdf"), "1706.03762",
+                "Attention Is All You Need");
+
+        assertThat(PaperStore.findAcrossTopics("unit-test-label",
+                new PaperIdentity("1512.03385", null, "Deep Residual Learning for Image Recognition", null), null))
+                .noneMatch(p -> p.toString().contains(OTHER_TOPIC));
+        assertThat(PaperStore.findAcrossTopics("some-other-label",
+                new PaperIdentity("1706.03762", null, null, null), null))
+                .anyMatch(p -> p.toString().contains(OTHER_TOPIC));
+    }
+
+    @Test
+    void aBareNameFindsTheFileThatCarriesIt() throws IOException {
         writeRealPdf(WorkspacePaths.papersDir(OTHER_TOPIC), "Reusable.pdf");
 
-        assertThat(PaperStore.findPdfAcrossTopics("Reusable"))
-                .isPresent()
-                .get()
+        assertThat(PaperStore.findAcrossTopics("Reusable", PaperIdentity.NONE, null))
+                .singleElement()
                 .satisfies(p -> assertThat(WorkspacePaths.relative(p))
                         .isEqualTo("investigation/" + OTHER_TOPIC + "/papers/Reusable.pdf"));
     }
 
+    private Path importPdf(Path source, String shortName, long maxBytes) throws IOException {
+        PaperIdentity identity = PaperIdentity.NONE.confirmedBy(
+                PdfIdentityReader.identityOf(source).orElse(PdfIdentity.NONE));
+        return PaperStore.importPdf(source, TOPIC, shortName, identity, maxBytes, null);
+    }
+
     @Test
-    void findPdfAcrossTopicsIgnoresFilesThatDoNotParse() throws IOException {
+    void searchingAcrossTopicsIgnoresFilesThatDoNotParse() throws IOException {
         Path dir = WorkspacePaths.papersDir(OTHER_TOPIC);
         Files.createDirectories(dir);
         Files.writeString(dir.resolve("Broken.pdf"), "not a pdf");
 
-        assertThat(PaperStore.findPdfAcrossTopics("Broken")).isEmpty();
+        assertThat(PaperStore.findAcrossTopics("Broken", PaperIdentity.NONE, null)).isEmpty();
     }
 
     @Test
-    void findPdfAcrossTopicsReturnsNothingForAnUnknownName() {
-        assertThat(PaperStore.findPdfAcrossTopics("Never-Downloaded")).isEmpty();
+    void searchingAcrossTopicsReturnsNothingForAnUnknownName() {
+        assertThat(PaperStore.findAcrossTopics("Never-Downloaded", PaperIdentity.NONE, null)).isEmpty();
     }
 }

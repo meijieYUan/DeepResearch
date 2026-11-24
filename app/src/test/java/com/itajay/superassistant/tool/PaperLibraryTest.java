@@ -2,234 +2,242 @@ package com.itajay.superassistant.tool;
 
 import com.itajay.superassistant.config.PaperDownloadProperties;
 import com.itajay.superassistant.workspace.WorkspacePaths;
-import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.PDPage;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
-import java.util.Optional;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The shared paper library: what it stores, and when a lookup counts as a hit.
+ * The shared paper library: a file name is a label, and only a paper's identity is a hit.
  *
- * <p>Real one-page PDFs stand in for papers because every code path gates on a
- * PDFBox parse — a file that cannot be opened is not a paper, and the tests pin
- * that boundary rather than bypass it.</p>
+ * <p>Always on a library of its own. An earlier version cleaned up the project's real
+ * {@code paper-library/} after every test and deleted the user's papers with it.</p>
  */
 class PaperLibraryTest {
 
     private static final String TOPIC = "unit-test-paper-library";
+    private static final PaperIdentity ATTENTION =
+            new PaperIdentity("1706.03762", null, "Attention Is All You Need", null);
+    private static final PaperIdentity RESNET =
+            new PaperIdentity("1512.03385", null, "Deep Residual Learning for Image Recognition", null);
+    private static final PaperIdentity OPTUNA = new PaperIdentity(null, "10.1145/3292500.3330701",
+            "Optuna: A Next-generation Hyperparameter Optimization Framework", null);
 
-    private final PaperLibrary library = new PaperLibrary(new PaperDownloadProperties());
+    @TempDir
+    Path root;
+
+    @TempDir
+    Path downloads;
+
+    private PaperLibrary library;
+
+    @BeforeEach
+    void setUp() {
+        library = reopen();
+    }
 
     @AfterEach
     void cleanUp() throws IOException {
-        for (Path dir : new Path[]{WorkspacePaths.topicDir(TOPIC),
-                WorkspacePaths.root().resolve(WorkspacePaths.PAPER_LIBRARY_DIR)}) {
-            if (!Files.isDirectory(dir)) {
-                continue;
-            }
-            try (var paths = Files.walk(dir)) {
-                paths.sorted(Comparator.reverseOrder()).forEach(p -> {
-                    try {
-                        Files.deleteIfExists(p);
-                    } catch (IOException ignored) {
-                        // best effort
-                    }
-                });
-            }
-        }
-    }
-
-    @Test
-    void aStoredPaperIsFoundByName() throws IOException {
-        assertThat(library.store(pdfBytes(), "Library-Hit", "https://arxiv.org/abs/2401.00001")).isTrue();
-
-        Optional<Path> found = library.find("Library-Hit", null);
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getFileName().toString()).isEqualTo("Library-Hit.pdf");
-    }
-
-    @Test
-    void aPaperStoredUnderAnotherNameIsFoundByIdentifier() throws IOException {
-        library.store(pdfBytes(), "Original-Name", "https://arxiv.org/abs/2401.00002");
-
-        // The same paper referenced later with a different short name still hits:
-        // otherwise the library would silently collect duplicates while every run
-        // kept downloading it again.
-        Optional<Path> found = library.find("Different-Name", "https://arxiv.org/pdf/2401.00002");
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getFileName().toString()).isEqualTo("Original-Name.pdf");
-    }
-
-    @Test
-    void unparseableBytesAreRejected() {
-        assertThat(library.store("not a pdf".getBytes(), "Broken", null)).isFalse();
-        assertThat(library.find("Broken", null)).isEmpty();
-    }
-
-    @Test
-    void missingPaperIsNotAHit() {
-        assertThat(library.find("Never-Stored", "https://example.com/x.pdf")).isEmpty();
-    }
-
-    @Test
-    void importingIntoATopicCopiesRatherThanMoves() throws IOException {
-        library.store(pdfBytes(), "Copy-Me", null);
-
-        Optional<Path> inTopic = library.importInto("Copy-Me", TOPIC);
-
-        assertThat(inTopic).isPresent();
-        assertThat(Files.isRegularFile(inTopic.get())).isTrue();
-        // The library copy must survive: other topics still need it.
-        assertThat(library.find("Copy-Me", null)).isPresent();
-    }
-
-    @Test
-    void arxivIdAndDoiAreExtractedFromReferences() {
-        assertThat(PaperLibrary.extractArxivId("https://arxiv.org/abs/1706.03762v2"))
-                .isEqualTo("1706.03762v2");
-        assertThat(PaperLibrary.extractDoi("https://doi.org/10.1145/3292500.3330701."))
-                .isEqualTo("10.1145/3292500.3330701");
-        assertThat(PaperLibrary.extractDoi("see 10.1000/xyz, then")).isEqualTo("10.1000/xyz");
-        assertThat(PaperLibrary.extractArxivId("https://example.com/paper.pdf")).isNull();
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
-    // Hand-dropped papers: the file name is not the short name
-    // ──────────────────────────────────────────────────────────────────────
-
-    /**
-     * The case the fallback exists for: a human downloads a paper during a pause and the
-     * file lands with the publisher's name. The paper is still findable, because the PDF
-     * itself says which paper it is.
-     */
-    @Test
-    void aHandDroppedFileIsFoundByTheDoiPrintedInsideIt() throws IOException {
-        givenHandDroppedFile("Publisher-Download.pdf",
-                "Attention Is All You Need\n\nhttps://doi.org/10.5555/3295222.3295349\n");
-
-        Optional<Path> found = library.find("Totally-Different-Name",
-                "https://doi.org/10.5555/3295222.3295349");
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getFileName().toString()).isEqualTo("Publisher-Download.pdf");
-    }
-
-    /** The arXiv stamp in a paper's margin is the identifier, even with no reference at all. */
-    @Test
-    void aHandDroppedFileIsFoundByTheArxivStampWithNoReference() throws IOException {
-        givenHandDroppedFile("2401.12345v2.pdf",
-                "arXiv:2401.12345v2 [cs.CV] 12 Jan 2024\n\nLayout Control For Multi-Subject Images\n");
-
-        Optional<Path> found = library.find("Some-New-Short-Name", "https://arxiv.org/abs/2401.12345");
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getFileName().toString()).isEqualTo("2401.12345v2.pdf");
-    }
-
-    /** A version suffix must not defeat the match: the model quotes v1, the file was v3. */
-    @Test
-    void arxivVersionsAreIgnoredWhenMatching() throws IOException {
-        givenHandDroppedFile("Versioned.pdf",
-                "arXiv:2401.99999v3 [cs.LG] 3 Mar 2024\n\nA Paper About Versioning\n");
-
-        assertThat(library.find("Other", "https://arxiv.org/abs/2401.99999v1")).isPresent();
-    }
-
-    /** No identifier anywhere: the title still identifies the paper. */
-    @Test
-    void aHandDroppedFileWithNoIdentifierIsFoundByTitle() throws IOException {
-        givenHandDroppedFile("scan.pdf",
-                "Training-Free Layout Guidance for Multi-Subject Image Generation\n\nAbstract\n");
-
-        Optional<Path> found = library.find("x",
-                "Training-Free Layout Guidance for Multi-Subject Image Generation");
-
-        assertThat(found).isPresent();
-        assertThat(found.get().getFileName().toString()).isEqualTo("scan.pdf");
-    }
-
-    /**
-     * A file with nothing identifying in it must not become a wildcard: an empty
-     * fingerprint matches nothing, and the miss stays a miss.
-     */
-    @Test
-    void anUnidentifiableFileIsNeverAMatch() throws IOException {
-        givenHandDroppedFile("opaque.pdf", "x\n");
-
-        assertThat(library.find("elsewhere", "Some Unrelated Long Title Of A Paper")).isEmpty();
-    }
-
-    @Test
-    void stampAndTitleParsingHandleAwkwardInput() {
-        assertThat(PaperLibrary.arxivIdFromStamp("arXiv:2401.12345v2 [cs.CV]")).isEqualTo("2401.12345v2");
-        assertThat(PaperLibrary.arxivIdFromStamp("arXiv:cs.CV/0701001")).isEqualTo("cs.CV/0701001");
-        // A URL is not a stamp; the url-shaped pattern must not fire on body text.
-        assertThat(PaperLibrary.arxivIdFromStamp("see arxiv.org/abs/2401.1")).isNull();
-        assertThat(PaperLibrary.arxivIdFromStamp(null)).isNull();
-
-        // The stamp line and the DOI footer are never the title.
-        assertThat(PaperLibrary.titleFromBody(
-                "arXiv:2401.12345v1 [cs.CV]\nhttps://doi.org/10.1/2\nReal Title Goes Here Now\n"))
-                .isEqualTo("realtitlegoesherenow");
-
-        assertThat(PaperLibrary.normaliseTitle("  A  Title: With, Punctuation! "))
-                .isEqualTo("atitlewithpunctuation");
-    }
-
-    /** The index is a cache: whatever a scan learned must survive a reload from disk. */
-    @Test
-    void fingerprintsSurviveAnIndexReload() throws IOException {
-        givenHandDroppedFile("Reload-Me.pdf",
-                "arXiv:2401.77777v1 [cs.AI]\n\nA Title Worth Remembering Here\n");
-
-        PaperDownloadProperties props = new PaperDownloadProperties();
-        PaperLibrary first = new PaperLibrary(props);
-        assertThat(first.find("nothing", "https://arxiv.org/abs/2401.77777")).isPresent();
-
-        // A fresh instance reads the index instead of the PDF; the lookup must still hit.
-        PaperLibrary reloaded = new PaperLibrary(props);
-        assertThat(reloaded.find("nothing", "https://arxiv.org/abs/2401.77777")).isPresent();
-        assertThat(reloaded.find("nothing", "A Title Worth Remembering Here")).isPresent();
-    }
-
-    /** Writes a real one-page PDF whose text a scanner can read back. */
-    private void givenHandDroppedFile(String fileName, String pageText) throws IOException {
-        Path dir = WorkspacePaths.paperLibraryDir();
-        Files.createDirectories(dir);
-        try (PDDocument doc = new PDDocument()) {
-            var page = new PDPage();
-            doc.addPage(page);
-            try (var stream = new org.apache.pdfbox.pdmodel.PDPageContentStream(doc, page)) {
-                stream.beginText();
-                stream.setFont(new org.apache.pdfbox.pdmodel.font.PDType1Font(
-                        org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA), 12);
-                stream.newLineAtOffset(40, 700);
-                for (String line : pageText.split("\\R")) {
-                    stream.showText(line);
-                    stream.newLineAtOffset(0, -20);
+        Path topic = WorkspacePaths.topicDir(TOPIC);
+        if (Files.isDirectory(topic)) {
+            try (var paths = Files.walk(topic)) {
+                for (Path p : paths.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(p);
                 }
-                stream.endText();
             }
-            doc.save(dir.resolve(fileName).toFile());
         }
     }
 
-    private static byte[] pdfBytes() throws IOException {
-        try (PDDocument doc = new PDDocument()) {
-            doc.addPage(new PDPage());
-            var out = new java.io.ByteArrayOutputStream();
-            doc.save(out);
-            return out.toByteArray();
+    private PaperLibrary reopen() {
+        return new PaperLibrary(new PaperDownloadProperties(), root);
+    }
+
+    private Path attention() throws IOException {
+        return TestPdfs.paper(downloads.resolve("attention.pdf"), "1706.03762", "Attention Is All You Need");
+    }
+
+    private Path resnet() throws IOException {
+        return TestPdfs.paper(downloads.resolve("resnet.pdf"), "1512.03385",
+                "Deep Residual Learning for Image Recognition");
+    }
+
+    private Path inLibrary(String fileName) {
+        return root.resolve("papers").resolve(fileName);
+    }
+
+    private List<String> files() throws IOException {
+        try (var stream = Files.list(root.resolve("papers"))) {
+            return stream.map(p -> p.getFileName().toString()).sorted().toList();
         }
+    }
+
+    // ── the reported defect ───────────────────────────────────────────────
+
+    @Test
+    void theSameNameIsNotAHitForAnotherPaper() throws IOException {
+        library.store(attention(), "arxiv-abs-url", ATTENTION);
+
+        assertThat(library.find("arxiv-abs-url", RESNET)).isEmpty();
+        assertThat(library.importInto("arxiv-abs-url", TOPIC, RESNET)).isEmpty();
+        assertThat(library.find("arxiv-abs-url", ATTENTION)).isPresent();
+    }
+
+    /** Storing used to replace the file, so the first paper was gone and its entry lied. */
+    @Test
+    void storingAnotherPaperUnderATakenNameKeepsBoth() throws IOException {
+        library.store(attention(), "Survey", ATTENTION);
+        byte[] before = Files.readAllBytes(inLibrary("Survey.pdf"));
+        library.store(resnet(), "Survey", RESNET);
+
+        assertThat(files()).containsExactly("Survey-1512.03385.pdf", "Survey.pdf");
+        assertThat(Files.readAllBytes(inLibrary("Survey.pdf"))).isEqualTo(before);
+        assertThat(library.find("Survey", ATTENTION)).hasValue(inLibrary("Survey.pdf"));
+        assertThat(library.find("Survey", RESNET)).hasValue(inLibrary("Survey-1512.03385.pdf"));
+    }
+
+    @Test
+    void aPaperIsFoundWhateverItsFileIsCalled() throws IOException {
+        library.store(attention(), "Survey", ATTENTION);
+
+        assertThat(library.find("Completely-Different", new PaperIdentity("1706.03762", null, null, null))).isPresent();
+        assertThat(library.find(null, new PaperIdentity(null, null, "ATTENTION is all you need", null))).isPresent();
+    }
+
+    @Test
+    void theSamePaperIsKeptOnce() throws IOException {
+        library.store(attention(), "First", ATTENTION);
+        library.store(attention(), "Second", ATTENTION);
+
+        assertThat(files()).containsExactly("First.pdf");
+    }
+
+    /** A model that pairs the right title with another paper's id must not get that other paper. */
+    @Test
+    void aWrongIdentifierDoesNotLeadToAnotherPaper() throws IOException {
+        library.store(attention(), "Survey", ATTENTION);
+
+        assertThat(library.find("Survey", new PaperIdentity("1706.03762", null, RESNET.title(), null))).isEmpty();
+    }
+
+    // ── papers a human put there ──────────────────────────────────────────
+
+    @Test
+    void aHandDroppedFileIsFoundByWhatItsPageSays() throws IOException {
+        TestPdfs.paper(inLibrary("1706.03762v7 (1).pdf"), "1706.03762", "Provided proper attribution is provided",
+                "Attention Is All You Need");
+        TestPdfs.paper(inLibrary("下载.pdf"), null, "This ICCV paper is the Open Access version",
+                "Deep Residual Learning for", "Image Recognition");
+
+        assertThat(library.find("x", ATTENTION)).hasValue(inLibrary("1706.03762v7 (1).pdf"));
+        assertThat(library.find("x", RESNET)).hasValue(inLibrary("下载.pdf"));
+    }
+
+    @Test
+    void aScanIsFoundByTheNameItWasGiven() throws IOException {
+        TestPdfs.blank(inLibrary("Optuna-10.1145-3292500.3330701.pdf"));
+        TestPdfs.page(inLibrary("ResNet.pdf"), "scan");
+
+        assertThat(library.find("Optuna", OPTUNA)).hasValue(inLibrary("Optuna-10.1145-3292500.3330701.pdf"));
+        // Nothing on the page contradicts the name, and a human chose it.
+        assertThat(library.find("ResNet", RESNET)).hasValue(inLibrary("ResNet.pdf"));
+        assertThat(library.find("Survey", ATTENTION)).isEmpty();
+    }
+
+    // ── what a file was fetched by ────────────────────────────────────────
+
+    @Test
+    void theDoiAPaperWasFetchedByIsRememberedAcrossRestartsAndRenames() throws IOException {
+        Path pdf = TestPdfs.paper(downloads.resolve("o.pdf"), null, "Optuna: A Next-generation Hyperparameter",
+                "Optimization Framework");
+        library.store(pdf, "Optuna", OPTUNA);
+        Files.move(inLibrary("Optuna.pdf"), inLibrary("renamed.pdf"));
+
+        assertThat(reopen().find(null, new PaperIdentity(null, "10.1145/3292500.3330701", null, null)))
+                .hasValue(inLibrary("renamed.pdf"));
+    }
+
+    @Test
+    void aReplacedFileDoesNotInheritTheOldPapersIdentity() throws IOException {
+        library.store(TestPdfs.paper(downloads.resolve("o.pdf"), null, "Optuna: A Next-generation Hyperparameter",
+                "Optimization Framework"), "Optuna", OPTUNA);
+        Files.copy(attention(), inLibrary("Optuna.pdf"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+        assertThat(library.find("Optuna", OPTUNA)).isEmpty();
+        assertThat(library.find("Optuna", ATTENTION)).hasValue(inLibrary("Optuna.pdf"));
+    }
+
+    /** Old rows tied identifiers to file names, so they can describe a paper that was overwritten. */
+    @Test
+    void anIndexInTheOldLayoutIsIgnored() throws IOException {
+        Files.createDirectories(root.resolve("papers"));
+        Files.copy(attention(), inLibrary("Survey.pdf"));
+        Files.writeString(root.resolve("index.tsv"),
+                "# shortName\tarxivId\tdoi\tsourceUrl\ttitle\tfingerprintArxivId\tfingerprintDoi\tscanned\n"
+                        + "Survey\t1512.03385\t\thttps://arxiv.org/abs/1512.03385\t\t\t\t1\n");
+
+        assertThat(library.find("Survey", RESNET)).isEmpty();
+        assertThat(library.find("Survey", ATTENTION)).isPresent();
+    }
+
+    // ── into a topic ──────────────────────────────────────────────────────
+
+    @Test
+    void importingCopiesRatherThanMoves() throws IOException {
+        library.store(attention(), "Copy-Me", ATTENTION);
+
+        assertThat(library.importInto("My-Name", TOPIC, ATTENTION))
+                .hasValue(WorkspacePaths.papersDir(TOPIC).resolve("My-Name.pdf"));
+        // The library copy must survive: other topics still need it.
+        assertThat(library.find("Copy-Me", ATTENTION)).isPresent();
+    }
+
+    @Test
+    void importingUnderANameAnotherPaperHasKeepsBoth() throws IOException {
+        library.store(attention(), "A", ATTENTION);
+        library.store(resnet(), "B", RESNET);
+        library.importInto("Survey", TOPIC, ATTENTION);
+
+        assertThat(library.importInto("Survey", TOPIC, RESNET))
+                .hasValue(WorkspacePaths.papersDir(TOPIC).resolve("Survey-1512.03385.pdf"));
+    }
+
+    @Test
+    void importingAPaperTheTopicAlreadyHasReturnsThatFile() throws IOException {
+        library.store(attention(), "A", ATTENTION);
+        library.importInto("First", TOPIC, ATTENTION);
+
+        assertThat(library.importInto("Second", TOPIC, ATTENTION))
+                .hasValue(WorkspacePaths.papersDir(TOPIC).resolve("First.pdf"));
+    }
+
+    // ── the rest ──────────────────────────────────────────────────────────
+
+    @Test
+    void aFileThatIsNotAPdfIsRefused() throws IOException {
+        Path fake = Files.writeString(downloads.resolve("fake.pdf"), "<html>404</html>");
+
+        assertThat(library.store(fake, "Broken", RESNET)).isFalse();
+        assertThat(library.find("Broken", RESNET)).isEmpty();
+    }
+
+    @Test
+    void theInventorySaysWhatEachFileIs() throws IOException {
+        library.store(attention(), "Survey", ATTENTION);
+
+        assertThat(library.describe()).contains("Survey", "arXiv 1706.03762", "Attention Is All You Need");
+    }
+
+    @Test
+    void anEmptyLibraryIsReadable() {
+        assertThat(library.describe()).contains("为空");
+        assertThat(library.find("Anything", RESNET)).isEmpty();
     }
 }

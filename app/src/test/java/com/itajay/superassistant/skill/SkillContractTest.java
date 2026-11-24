@@ -176,6 +176,30 @@ class SkillContractTest {
                 .contains("不适用", "原因", "不要增删章节");
     }
 
+    /**
+     * The guide teaches the call shape — identifiers in, honest results out — and leaves
+     * retrieval mechanics (source order, retries, verification, dedup) to the tool that
+     * enforces them; re-teaching them would only rot. What must not rot is the shape of
+     * the call and the ban on hunting mirrors around the tool.
+     */
+    @Test
+    void theResearchGuideTeachesTheCallShapeAndLeavesTheMechanicsToTheTool() throws IOException {
+        String guide = resource("references/research-guide.md");
+        String download = section(guide, "## 6. 下载与来源等级", "## 7.");
+
+        // The call shape: identifiers, not a lone URL.
+        assertThat(download).contains("title", "doi", "arxivId");
+        // The tool's own hint is followed; mirrors are not hunted.
+        assertThat(download).contains("Next:", "镜像");
+        assertThat(download).doesNotContain("换镜像站或聚合站");
+        // The mechanics the tool enforces stay out of the guide.
+        assertThat(guide).doesNotContain("落地页解析", "指数退避", "Retry-After", "真实性校验", "路径安全");
+        // The candidate record captures the identifiers the call needs.
+        assertThat(section(guide, "## 3. 建立候选池", "## 4.")).contains("**DOI**", "**arXiv ID**");
+        assertThat(section(resource("SKILL.md"), "## 第二步", "## 第三步"))
+                .contains("downloadPaper", "标题、DOI、arXiv ID");
+    }
+
     private static String resource(String path) throws IOException {
         try (InputStream stream = SkillContractTest.class.getResourceAsStream(ROOT + path)) {
             assertThat(stream).as("classpath resource %s", path).isNotNull();
